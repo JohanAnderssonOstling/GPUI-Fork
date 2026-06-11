@@ -40,6 +40,9 @@ gpui = { workspace = true, features = ["windows-manifest"] }
 gpui_linux.workspace = true
 gpui_wgpu = { workspace = true, optional = true, features = ["font-kit"] }
 
+[target.'cfg(target_os = "android")'.dependencies]
+gpui_android.workspace = true
+
 [target.'cfg(target_family = "wasm")'.dependencies]
 gpui_web.workspace = true
 console_error_panic_hook.workspace = true
