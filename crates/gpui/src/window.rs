@@ -4036,6 +4036,41 @@ impl Window {
         });
     }
 
+    /// Returns the maximum distance that a painted glyph extends past its
+    /// horizontal advance, in local logical pixels.
+    ///
+    /// This uses the window's active scale, transform, text-rendering mode,
+    /// and color-dependent dilation so the measurement matches painting.
+    pub fn glyph_right_overhang(
+        &self,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+        is_emoji: bool,
+    ) -> Result<Pixels> {
+        let current_transform = self.current_transform();
+        let subpixel_rendering =
+            !is_emoji && self.should_use_subpixel_rendering(font_id, font_size);
+        let dilation = if is_emoji {
+            0
+        } else {
+            self.text_system().glyph_dilation_for_color(color)
+        };
+        let params = RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size,
+            subpixel_variant: Point::default(),
+            scale_factor: glyph_raster_scale_factor(self.scale_factor(), current_transform),
+            is_emoji,
+            subpixel_rendering,
+            dilation,
+        };
+
+        self.text_system().glyph_right_overhang(&params)
+    }
+
     /// Paints a monochrome (non-emoji) glyph into the scene for the next frame at the current z-index.
     ///
     /// The y component of the origin is the baseline of the glyph.

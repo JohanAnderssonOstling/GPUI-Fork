@@ -203,6 +203,44 @@ impl TextSystem {
         Ok(result * font_size)
     }
 
+    /// Returns how far the rasterized glyph extends past its horizontal advance.
+    ///
+    /// The supplied render parameters must match those used to paint the glyph.
+    /// All horizontal subpixel variants are considered so callers can reserve a
+    /// stable amount of trailing space independently of the glyph's origin.
+    pub fn glyph_right_overhang(&self, params: &RenderGlyphParams) -> Result<Pixels> {
+        anyhow::ensure!(
+            params.scale_factor.is_finite() && params.scale_factor > 0.0,
+            "glyph scale factor must be finite and positive"
+        );
+
+        let units_per_em = self.units_per_em(params.font_id) as f32;
+        let advance = self
+            .platform_text_system
+            .advance(params.font_id, params.glyph_id)?
+            .width
+            / units_per_em
+            * params.font_size.0;
+        let variant_count = if params.is_emoji {
+            1
+        } else {
+            SUBPIXEL_VARIANTS_X
+        };
+        let mut max_overhang = px(0.0);
+
+        for variant in 0..variant_count {
+            let mut variant_params = params.clone();
+            variant_params.subpixel_variant.x = variant;
+            let bounds = self.raster_bounds(&variant_params)?;
+            let device_right = (bounds.origin.x.0 + bounds.size.width.0) as f32
+                - variant as f32 / SUBPIXEL_VARIANTS_X as f32;
+            let rasterized_right = device_right / params.scale_factor;
+            max_overhang = max_overhang.max(px(rasterized_right - advance));
+        }
+
+        Ok(max_overhang)
+    }
+
     // Consider removing this?
     /// Returns the shaped layout width of for the given character, in the given font and size.
     pub fn layout_width(&self, font_id: FontId, font_size: Pixels, ch: char) -> Pixels {
