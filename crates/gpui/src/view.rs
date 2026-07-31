@@ -1,7 +1,8 @@
 use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, ContentMask, Context, Element, ElementId,
     Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintIndex,
-    Pixels, PrepaintStateIndex, Render, Style, StyleRefinement, TextStyle, WeakEntity,
+    Pixels, PrepaintStateIndex, Render, Style, StyleRefinement, TextStyle, TransformationMatrix,
+    WeakEntity,
 };
 use crate::{Empty, Window};
 use anyhow::Result;
@@ -18,11 +19,12 @@ struct AnyViewState {
     accessed_entities: FxHashSet<EntityId>,
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq)]
 struct ViewCacheKey {
     bounds: Bounds<Pixels>,
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
+    transform: TransformationMatrix,
 }
 
 /// A dynamically-typed handle to a view, which can be downcast to a [Entity] for a specific type.
@@ -151,11 +153,13 @@ impl Element for AnyView {
                 |element_state, window| {
                     let content_mask = window.content_mask();
                     let text_style = window.text_style();
+                    let transform = window.current_transform();
 
                     if let Some(mut element_state) = element_state
                         && element_state.cache_key.bounds == bounds
                         && element_state.cache_key.content_mask == content_mask
                         && element_state.cache_key.text_style == text_style
+                        && element_state.cache_key.transform == transform
                         && !window.dirty_views.contains(&self.entity_id())
                         && !window.refreshing
                     {
@@ -191,6 +195,7 @@ impl Element for AnyView {
                                 bounds,
                                 content_mask,
                                 text_style,
+                                transform,
                             },
                         },
                     )
@@ -245,6 +250,58 @@ impl<V: 'static + Render> IntoElement for Entity<V> {
 
     fn into_element(self) -> Self::Element {
         self.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ScaledPixels, TransformationMatrix, point, px, size};
+
+    #[test]
+    fn cached_view_key_includes_current_transform() {
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(10.), px(10.)));
+        let content_mask = ContentMask { bounds };
+        let text_style = TextStyle::default();
+
+        let untransformed = ViewCacheKey {
+            bounds,
+            content_mask,
+            text_style: text_style.clone(),
+            transform: TransformationMatrix::unit(),
+        };
+        let translated = ViewCacheKey {
+            bounds,
+            content_mask,
+            text_style,
+            transform: TransformationMatrix::unit()
+                .translate(point(ScaledPixels(10.), ScaledPixels(0.))),
+        };
+
+        assert!(untransformed != translated);
+    }
+
+    #[test]
+    fn cached_view_key_matches_when_transform_is_unchanged() {
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(10.), px(10.)));
+        let content_mask = ContentMask { bounds };
+        let transform =
+            TransformationMatrix::unit().translate(point(ScaledPixels(10.), ScaledPixels(0.)));
+
+        let first = ViewCacheKey {
+            bounds,
+            content_mask,
+            text_style: TextStyle::default(),
+            transform,
+        };
+        let second = ViewCacheKey {
+            bounds,
+            content_mask,
+            text_style: TextStyle::default(),
+            transform,
+        };
+
+        assert!(first == second);
     }
 }
 

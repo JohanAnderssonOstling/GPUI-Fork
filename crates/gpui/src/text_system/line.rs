@@ -1,7 +1,8 @@
 use crate::{
     App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
-    ShapedGlyph, ShapedRun, SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window,
-    WrapBoundary, WrappedLineLayout, black, fill, point, px, size,
+    ScaledPixels, ShapedGlyph, ShapedRun, SharedString, StrikethroughStyle, TextAlign,
+    TransformationMatrix, UnderlineStyle, Window, WrapBoundary, WrappedLineLayout, black, fill,
+    point, px, size,
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
@@ -522,7 +523,12 @@ fn paint_line(
                 };
 
                 let content_mask = window.content_mask();
-                if max_glyph_bounds.intersects(&content_mask.bounds) {
+                if glyph_bounds_intersects_content_mask(
+                    max_glyph_bounds,
+                    content_mask.bounds,
+                    window.current_transform(),
+                    window.scale_factor(),
+                ) {
                     let vertical_offset = point(px(0.0), glyph.position.y);
                     if glyph.is_emoji {
                         window.paint_emoji(
@@ -747,6 +753,22 @@ fn aligned_origin_x(
         TextAlign::Center => (origin.x * 2.0 + align_width - line_width) / 2.0,
         TextAlign::Right => origin.x + align_width - line_width,
     }
+}
+
+fn glyph_bounds_intersects_content_mask(
+    glyph_bounds: Bounds<Pixels>,
+    content_mask_bounds: Bounds<Pixels>,
+    transform: TransformationMatrix,
+    scale_factor: f32,
+) -> bool {
+    let visual_bounds = if transform == TransformationMatrix::unit() {
+        glyph_bounds
+    } else {
+        crate::scene::transform_bounds(glyph_bounds.scale(scale_factor), transform)
+            .map(|coordinate: ScaledPixels| px(coordinate.0 / scale_factor))
+    };
+
+    visual_bounds.intersects(&content_mask_bounds)
 }
 
 #[cfg(test)]
@@ -1011,5 +1033,34 @@ mod tests {
         assert_eq!(right.decoration_runs[0].color, green);
         assert_eq!(right.decoration_runs[1].len, 1);
         assert_eq!(right.decoration_runs[1].color, blue);
+    }
+
+    #[test]
+    fn translated_glyph_culling_uses_visual_bounds() {
+        let glyph_bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(10.0), px(10.0)));
+        let content_mask = Bounds::new(point(px(100.0), px(0.0)), size(px(10.0), px(10.0)));
+        let transform =
+            TransformationMatrix::unit().translate(point(ScaledPixels(100.0), ScaledPixels(0.0)));
+
+        assert!(glyph_bounds_intersects_content_mask(
+            glyph_bounds,
+            content_mask,
+            transform,
+            1.0
+        ));
+    }
+
+    #[test]
+    fn scaled_glyph_culling_uses_visual_bounds() {
+        let glyph_bounds = Bounds::new(point(px(10.0), px(10.0)), size(px(10.0), px(10.0)));
+        let content_mask = Bounds::new(point(px(20.0), px(20.0)), size(px(20.0), px(20.0)));
+        let transform = TransformationMatrix::unit().scale(size(2.0, 2.0));
+
+        assert!(glyph_bounds_intersects_content_mask(
+            glyph_bounds,
+            content_mask,
+            transform,
+            1.0
+        ));
     }
 }

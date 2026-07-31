@@ -33,8 +33,8 @@
 
 use crate::{
     A11ySubtreeBuilder, App, ArenaBox, AvailableSpace, Bounds, Context, DispatchNodeId, ElementId,
-    FocusHandle, InspectorElementId, LayoutId, Pixels, Point, SharedString, Size, Style, Window,
-    util::FluentBuilder, window::with_element_arena,
+    FocusHandle, InspectorElementId, LayoutId, Pixels, Point, ScaledPixels, SharedString, Size,
+    Style, Window, px, util::FluentBuilder, window::with_element_arena,
 };
 use derive_more::{Deref, DerefMut};
 use std::{
@@ -479,14 +479,20 @@ impl<E: Element> Drawable<E> {
                             let node_id = global_id.accesskit_node_id();
                             let mut node = accesskit::Node::new(role);
                             let scale = window.scale_factor();
+                            let transformed_bounds = crate::scene::transform_bounds(
+                                bounds.scale(scale),
+                                window.current_transform(),
+                            );
+                            let node_bounds = transformed_bounds
+                                .map(|coordinate: ScaledPixels| px(coordinate.0 / scale));
                             node.set_bounds(accesskit::Rect {
-                                x0: (bounds.origin.x.0 * scale) as f64,
-                                y0: (bounds.origin.y.0 * scale) as f64,
-                                x1: ((bounds.origin.x.0 + bounds.size.width.0) * scale) as f64,
-                                y1: ((bounds.origin.y.0 + bounds.size.height.0) * scale) as f64,
+                                x0: transformed_bounds.origin.x.0 as f64,
+                                y0: transformed_bounds.origin.y.0 as f64,
+                                x1: transformed_bounds.right().0 as f64,
+                                y1: transformed_bounds.bottom().0 as f64,
                             });
                             self.element.write_a11y_info(&mut node);
-                            window.a11y.node_bounds.insert(node_id, bounds);
+                            window.a11y.node_bounds.insert(node_id, node_bounds);
                             pushed_a11y_node = window.a11y.nodes.push(node_id, node);
                         }
                     }
