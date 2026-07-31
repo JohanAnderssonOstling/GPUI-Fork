@@ -1,10 +1,10 @@
 use std::rc::Rc;
 
 use gpui::{
-    Capslock, DispatchEventResult, ExternalPaths, FileDropEvent, KeyDownEvent, KeyUpEvent,
-    Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent,
-    MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformInput, Point, ScrollDelta,
-    ScrollWheelEvent, TouchPhase, point, px,
+    Capslock, DispatchEventResult, ExternalPaths, FileDropEvent, KeyDownEvent, KeyLocation,
+    KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformInput,
+    Point, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px,
 };
 use smallvec::smallvec;
 use wasm_bindgen::prelude::*;
@@ -364,6 +364,7 @@ impl WebWindowInner {
 
             let result = this.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
                 keystroke,
+                key_location: key_location_from_keyboard_event(&event),
                 is_held,
                 prefer_character_input: false,
             }));
@@ -423,7 +424,10 @@ impl WebWindowInner {
                 key_char,
             };
 
-            this.dispatch_input(PlatformInput::KeyUp(KeyUpEvent { keystroke }));
+            this.dispatch_input(PlatformInput::KeyUp(KeyUpEvent {
+                keystroke,
+                key_location: key_location_from_keyboard_event(&event),
+            }));
         })
     }
 
@@ -598,6 +602,17 @@ fn modifiers_from_wheel_event(event: &web_sys::MouseEvent, _is_mac: bool) -> Mod
 fn capslock_from_keyboard_event(event: &web_sys::KeyboardEvent) -> Capslock {
     Capslock {
         on: event.get_modifier_state("CapsLock"),
+    }
+}
+
+fn key_location_from_keyboard_event(event: &web_sys::KeyboardEvent) -> KeyLocation {
+    // DOM_KEY_LOCATION_NUMPAD is 3. Left and right modifier locations are
+    // currently represented as standard because GPUI only distinguishes the
+    // numeric keypad.
+    if event.location() == 3 {
+        KeyLocation::Numpad
+    } else {
+        KeyLocation::Standard
     }
 }
 

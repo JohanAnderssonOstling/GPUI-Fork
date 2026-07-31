@@ -4429,6 +4429,7 @@ mod tests {
             window.dispatch_event(
                 KeyDownEvent {
                     keystroke,
+                    key_location: crate::KeyLocation::Standard,
                     is_held: false,
                     prefer_character_input: false,
                 }
@@ -4442,7 +4443,14 @@ mod tests {
     fn key_up(cx: &mut TestAppContext, window: AnyWindowHandle, key: &str) {
         let keystroke = Keystroke::parse(key).unwrap();
         cx.update_window(window, |_, window, cx| {
-            window.dispatch_event(KeyUpEvent { keystroke }.to_platform_input(), cx);
+            window.dispatch_event(
+                KeyUpEvent {
+                    keystroke,
+                    key_location: crate::KeyLocation::Standard,
+                }
+                .to_platform_input(),
+                cx,
+            );
         })
         .unwrap();
     }

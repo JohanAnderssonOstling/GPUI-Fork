@@ -80,8 +80,9 @@ use super::{
 use crate::linux::{
     DOUBLE_CLICK_INTERVAL, LinuxClient, LinuxCommon, LinuxKeyboardLayout, PIPE_READ_TIMEOUT,
     SCROLL_LINES, capslock_from_xkb, cursor_style_to_icon_names, get_xkb_compose_state,
-    is_within_click_distance, keystroke_from_xkb, keystroke_underlying_dead_key,
-    modifiers_from_xkb, open_uri_internal, read_fd_with_timeout, reveal_path_internal,
+    is_within_click_distance, key_location_from_xkb, keystroke_from_xkb,
+    keystroke_underlying_dead_key, modifiers_from_xkb, open_uri_internal, read_fd_with_timeout,
+    reveal_path_internal,
     wayland::{
         clipboard::{Clipboard, DataOffer, FILE_LIST_MIME_TYPE, TEXT_MIME_TYPES},
         cursor::Cursor,
@@ -1599,6 +1600,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 let keymap_state = state.keymap_state.as_ref().unwrap();
                 let keycode = Keycode::from(key + MIN_KEYCODE);
                 let keysym = keymap_state.key_get_one_sym(keycode);
+                let key_location = key_location_from_xkb(keymap_state, keycode);
 
                 match key_state {
                     wl_keyboard::KeyState::Pressed if !keysym.is_modifier_key() => {
@@ -1646,6 +1648,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                         }
                         let input = PlatformInput::KeyDown(KeyDownEvent {
                             keystroke: keystroke.clone(),
+                            key_location,
                             is_held: false,
                             prefer_character_input: false,
                         });
@@ -1661,6 +1664,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                             .insert_source(Timer::from_duration(state.repeat.delay), {
                                 let input = PlatformInput::KeyDown(KeyDownEvent {
                                     keystroke,
+                                    key_location,
                                     is_held: true,
                                     prefer_character_input: false,
                                 });
@@ -1693,6 +1697,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                     wl_keyboard::KeyState::Released if !keysym.is_modifier_key() => {
                         let input = PlatformInput::KeyUp(KeyUpEvent {
                             keystroke: keystroke_from_xkb(keymap_state, state.modifiers, keycode),
+                            key_location,
                         });
 
                         if state.repeat.current_keycode == Some(keycode) {
@@ -1747,6 +1752,7 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                                 key: commit_text.clone(),
                                 key_char: Some(commit_text),
                             },
+                            key_location: gpui::KeyLocation::Standard,
                             is_held: false,
                             prefer_character_input: false,
                         }));

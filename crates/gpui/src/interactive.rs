@@ -26,6 +26,9 @@ pub struct KeyDownEvent {
     /// The keystroke that was generated.
     pub keystroke: Keystroke,
 
+    /// The physical location of the key that generated the event.
+    pub key_location: KeyLocation,
+
     /// Whether the key is currently held down.
     pub is_held: bool,
 
@@ -47,6 +50,9 @@ impl KeyEvent for KeyDownEvent {}
 pub struct KeyUpEvent {
     /// The keystroke that was released.
     pub keystroke: Keystroke,
+
+    /// The physical location of the key that generated the event.
+    pub key_location: KeyLocation,
 }
 
 impl Sealed for KeyUpEvent {}
@@ -56,6 +62,16 @@ impl InputEvent for KeyUpEvent {
     }
 }
 impl KeyEvent for KeyUpEvent {}
+
+/// The physical location of a key on the keyboard.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum KeyLocation {
+    /// A key that is not in a specialized location.
+    #[default]
+    Standard,
+    /// A key on the numeric keypad.
+    Numpad,
+}
 
 /// The modifiers changed event equivalent for the platform.
 #[derive(Clone, Debug, Default)]

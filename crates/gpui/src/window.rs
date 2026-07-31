@@ -4756,6 +4756,7 @@ impl Window {
         let result = self.dispatch_event(
             PlatformInput::KeyDown(KeyDownEvent {
                 keystroke: keystroke.clone(),
+                key_location: crate::KeyLocation::Standard,
                 is_held: false,
                 prefer_character_input: false,
             }),
@@ -5248,6 +5249,7 @@ impl Window {
         'replay: for replay in replays {
             let event = KeyDownEvent {
                 keystroke: replay.keystroke.clone(),
+                key_location: crate::KeyLocation::Standard,
                 is_held: false,
                 prefer_character_input: true,
             };

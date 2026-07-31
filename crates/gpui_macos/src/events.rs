@@ -1,6 +1,6 @@
 use gpui::{
-    Capslock, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
-    MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
+    Capslock, KeyDownEvent, KeyLocation, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
+    MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
     NavigationDirection, PinchEvent, Pixels, PlatformInput, PressureStage, ScrollDelta,
     ScrollWheelEvent, TouchPhase, point, px,
 };
@@ -22,6 +22,24 @@ const BACKSPACE_KEY: u16 = 0x7f;
 const SPACE_KEY: u16 = b' ' as u16;
 const ENTER_KEY: u16 = 0x0d;
 const NUMPAD_ENTER_KEY: u16 = 0x03;
+const NUMPAD_EQUALS_KEY_CODE: CGKeyCode = 0x51;
+const NUMPAD_0_KEY_CODE: CGKeyCode = 0x52;
+const NUMPAD_1_KEY_CODE: CGKeyCode = 0x53;
+const NUMPAD_2_KEY_CODE: CGKeyCode = 0x54;
+const NUMPAD_3_KEY_CODE: CGKeyCode = 0x55;
+const NUMPAD_4_KEY_CODE: CGKeyCode = 0x56;
+const NUMPAD_5_KEY_CODE: CGKeyCode = 0x57;
+const NUMPAD_6_KEY_CODE: CGKeyCode = 0x58;
+const NUMPAD_7_KEY_CODE: CGKeyCode = 0x59;
+const NUMPAD_8_KEY_CODE: CGKeyCode = 0x5b;
+const NUMPAD_9_KEY_CODE: CGKeyCode = 0x5c;
+const NUMPAD_DECIMAL_KEY_CODE: CGKeyCode = 0x41;
+const NUMPAD_MULTIPLY_KEY_CODE: CGKeyCode = 0x43;
+const NUMPAD_PLUS_KEY_CODE: CGKeyCode = 0x45;
+const NUMPAD_CLEAR_KEY_CODE: CGKeyCode = 0x47;
+const NUMPAD_DIVIDE_KEY_CODE: CGKeyCode = 0x4b;
+const NUMPAD_ENTER_KEY_CODE: CGKeyCode = 0x4c;
+const NUMPAD_MINUS_KEY_CODE: CGKeyCode = 0x4e;
 pub(crate) const ESCAPE_KEY: u16 = 0x1b;
 const TAB_KEY: u16 = 0x09;
 const SHIFT_TAB_KEY: u16 = 0x19;
@@ -130,11 +148,13 @@ pub(crate) unsafe fn platform_input_from_native(
             }
             NSEventType::NSKeyDown => Some(PlatformInput::KeyDown(KeyDownEvent {
                 keystroke: parse_keystroke(native_event),
+                key_location: key_location(native_event),
                 is_held: native_event.isARepeat() == YES,
                 prefer_character_input: false,
             })),
             NSEventType::NSKeyUp => Some(PlatformInput::KeyUp(KeyUpEvent {
                 keystroke: parse_keystroke(native_event),
+                key_location: key_location(native_event),
             })),
             NSEventType::NSLeftMouseDown
             | NSEventType::NSRightMouseDown
@@ -331,6 +351,32 @@ pub(crate) unsafe fn platform_input_from_native(
                 })
             }),
             _ => None,
+        }
+    }
+}
+
+unsafe fn key_location(native_event: id) -> KeyLocation {
+    unsafe {
+        match native_event.keyCode() {
+            NUMPAD_DECIMAL_KEY_CODE
+            | NUMPAD_MULTIPLY_KEY_CODE
+            | NUMPAD_PLUS_KEY_CODE
+            | NUMPAD_CLEAR_KEY_CODE
+            | NUMPAD_DIVIDE_KEY_CODE
+            | NUMPAD_ENTER_KEY_CODE
+            | NUMPAD_MINUS_KEY_CODE
+            | NUMPAD_EQUALS_KEY_CODE
+            | NUMPAD_0_KEY_CODE
+            | NUMPAD_1_KEY_CODE
+            | NUMPAD_2_KEY_CODE
+            | NUMPAD_3_KEY_CODE
+            | NUMPAD_4_KEY_CODE
+            | NUMPAD_5_KEY_CODE
+            | NUMPAD_6_KEY_CODE
+            | NUMPAD_7_KEY_CODE
+            | NUMPAD_8_KEY_CODE
+            | NUMPAD_9_KEY_CODE => KeyLocation::Numpad,
+            _ => KeyLocation::Standard,
         }
     }
 }

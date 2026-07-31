@@ -347,8 +347,11 @@ impl WindowsWindowInner {
     }
 
     fn handle_syskeyup_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
-        let input = handle_key_event(wparam, lparam, &self.state, |keystroke, _| {
-            PlatformInput::KeyUp(KeyUpEvent { keystroke })
+        let input = handle_key_event(wparam, lparam, &self.state, |keystroke, _, key_location| {
+            PlatformInput::KeyUp(KeyUpEvent {
+                keystroke,
+                key_location,
+            })
         })?;
         let mut func = self.state.callbacks.input.take()?;
 
@@ -366,9 +369,10 @@ impl WindowsWindowInner {
             wparam,
             lparam,
             &self.state,
-            |keystroke, prefer_character_input| {
+            |keystroke, prefer_character_input, key_location| {
                 PlatformInput::KeyDown(KeyDownEvent {
                     keystroke,
+                    key_location,
                     is_held: lparam.0 & (0x1 << 30) > 0,
                     prefer_character_input,
                 })
@@ -389,9 +393,14 @@ impl WindowsWindowInner {
     }
 
     fn handle_keyup_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
-        let Some(input) = handle_key_event(wparam, lparam, &self.state, |keystroke, _| {
-            PlatformInput::KeyUp(KeyUpEvent { keystroke })
-        }) else {
+        let Some(input) =
+            handle_key_event(wparam, lparam, &self.state, |keystroke, _, key_location| {
+                PlatformInput::KeyUp(KeyUpEvent {
+                    keystroke,
+                    key_location,
+                })
+            })
+        else {
             return Some(1);
         };
 
@@ -1370,7 +1379,7 @@ fn handle_key_event<F>(
     f: F,
 ) -> Option<PlatformInput>
 where
-    F: FnOnce(Keystroke, bool) -> PlatformInput,
+    F: FnOnce(Keystroke, bool, KeyLocation) -> PlatformInput,
 {
     let virtual_key = VIRTUAL_KEY(wparam.loword());
     let modifiers = current_modifiers();
@@ -1408,8 +1417,25 @@ where
         }
         vkey => {
             let keystroke = parse_normal_key(vkey, lparam, modifiers)?;
-            Some(f(keystroke.0, keystroke.1))
+            Some(f(keystroke.0, keystroke.1, key_location(vkey, lparam)))
         }
+    }
+}
+
+fn key_location(vkey: VIRTUAL_KEY, lparam: LPARAM) -> KeyLocation {
+    let is_extended = lparam.0 & (0x1 << 24) != 0;
+    match vkey {
+        VK_NUMPAD0 | VK_NUMPAD1 | VK_NUMPAD2 | VK_NUMPAD3 | VK_NUMPAD4 | VK_NUMPAD5
+        | VK_NUMPAD6 | VK_NUMPAD7 | VK_NUMPAD8 | VK_NUMPAD9 | VK_MULTIPLY | VK_ADD
+        | VK_SEPARATOR | VK_SUBTRACT | VK_DECIMAL | VK_DIVIDE => KeyLocation::Numpad,
+        VK_RETURN if is_extended => KeyLocation::Numpad,
+        VK_INSERT | VK_DELETE | VK_HOME | VK_END | VK_PRIOR | VK_NEXT | VK_LEFT | VK_RIGHT
+        | VK_UP | VK_DOWN
+            if !is_extended =>
+        {
+            KeyLocation::Numpad
+        }
+        _ => KeyLocation::Standard,
     }
 }
 

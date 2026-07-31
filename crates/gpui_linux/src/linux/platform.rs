@@ -981,6 +981,15 @@ fn guess_ascii(keycode: Keycode, shift: bool) -> Option<char> {
 }
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
+pub(super) fn key_location_from_xkb(state: &State, keycode: Keycode) -> gpui::KeyLocation {
+    if state.key_get_one_sym(keycode).is_keypad_key() {
+        gpui::KeyLocation::Numpad
+    } else {
+        gpui::KeyLocation::Standard
+    }
+}
+
+#[cfg(any(feature = "wayland", feature = "x11"))]
 pub(super) fn keystroke_from_xkb(
     state: &State,
     mut modifiers: gpui::Modifiers,
