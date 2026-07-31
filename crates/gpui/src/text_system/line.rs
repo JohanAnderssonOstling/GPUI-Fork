@@ -594,6 +594,16 @@ fn paint_line_background(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
+    // Most editor text only changes foreground color (for example term hits).
+    // Avoid walking every glyph when none of the decoration runs can paint a
+    // background.
+    if decoration_runs
+        .iter()
+        .all(|run| run.background_color.is_none())
+    {
+        return Ok(());
+    }
+
     let line_bounds = Bounds::new(
         origin,
         size(
