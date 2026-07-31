@@ -6,9 +6,9 @@ use anyhow::Result;
 use futures::channel::oneshot;
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DummyKeyboardMapper,
-    ForegroundExecutor, Keymap, Menu, MenuItem, PathPromptOptions, Platform, PlatformDisplay,
-    PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, Task,
-    ThermalState, WindowAppearance, WindowParams,
+    FileDialogFilter, ForegroundExecutor, Keymap, Menu, MenuItem, PathPromptOptions, Platform,
+    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    PlatformWindow, Task, ThermalState, WindowAppearance, WindowParams,
 };
 use gpui_wgpu::WgpuContext;
 use std::{
@@ -207,6 +207,7 @@ impl Platform for WebPlatform {
     fn prompt_for_paths(
         &self,
         _options: PathPromptOptions,
+        _filters: Vec<FileDialogFilter>,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
         let (tx, rx) = oneshot::channel();
         tx.send(Err(anyhow::anyhow!(
@@ -220,6 +221,7 @@ impl Platform for WebPlatform {
         &self,
         _directory: &Path,
         _suggested_name: Option<&str>,
+        _filters: Vec<FileDialogFilter>,
     ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
         let (sender, receiver) = oneshot::channel();
         sender

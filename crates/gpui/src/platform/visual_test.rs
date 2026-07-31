@@ -144,6 +144,7 @@ impl Platform for VisualTestPlatform {
     fn prompt_for_paths(
         &self,
         _options: PathPromptOptions,
+        _filters: Vec<crate::FileDialogFilter>,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
         let (tx, rx) = oneshot::channel();
         tx.send(Ok(None)).ok();
@@ -154,6 +155,7 @@ impl Platform for VisualTestPlatform {
         &self,
         _directory: &Path,
         _suggested_name: Option<&str>,
+        _filters: Vec<crate::FileDialogFilter>,
     ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
         let (tx, rx) = oneshot::channel();
         tx.send(Ok(None)).ok();

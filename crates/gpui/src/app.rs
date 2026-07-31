@@ -45,14 +45,14 @@ use crate::InspectorElementRegistry;
 use crate::{
     Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Arena,
     ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem, CursorStyle,
-    DispatchPhase, DisplayId, EventEmitter, FocusHandle, FocusMap, ForegroundExecutor, Global,
-    KeyBinding, KeyContext, Keymap, Keystroke, LayoutId, Menu, MenuItem, OwnedMenu,
-    PathPromptOptions, Pixels, Platform, PlatformDisplay, PlatformKeyboardLayout,
-    PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton, PromptHandle,
-    PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation, ScreenCaptureSource,
-    SharedString, SubscriberSet, Subscription, SvgRenderer, Task, TextRenderingMode, TextSystem,
-    ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
-    WindowInvalidator,
+    DispatchPhase, DisplayId, EventEmitter, FileDialogFilter, FocusHandle, FocusMap,
+    ForegroundExecutor, Global, KeyBinding, KeyContext, Keymap, Keystroke, LayoutId, Menu,
+    MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay,
+    PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton,
+    PromptHandle, PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation,
+    ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer, Task,
+    TextRenderingMode, TextSystem, ThermalState, Window, WindowAppearance, WindowButtonLayout,
+    WindowHandle, WindowId, WindowInvalidator,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
 };
@@ -1383,7 +1383,17 @@ impl App {
         &self,
         options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
-        self.platform.prompt_for_paths(options)
+        self.platform.prompt_for_paths(options, Vec::new())
+    }
+
+    /// Displays a platform modal for selecting paths restricted by the given
+    /// named extension filters.
+    pub fn prompt_for_paths_with_filters(
+        &self,
+        options: PathPromptOptions,
+        filters: Vec<FileDialogFilter>,
+    ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
+        self.platform.prompt_for_paths(options, filters)
     }
 
     /// Displays a platform modal for selecting a new path where a file can be saved.
@@ -1397,7 +1407,20 @@ impl App {
         directory: &Path,
         suggested_name: Option<&str>,
     ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
-        self.platform.prompt_for_new_path(directory, suggested_name)
+        self.platform
+            .prompt_for_new_path(directory, suggested_name, Vec::new())
+    }
+
+    /// Displays a platform save dialog restricted by the given named
+    /// extension filters.
+    pub fn prompt_for_new_path_with_filters(
+        &self,
+        directory: &Path,
+        suggested_name: Option<&str>,
+        filters: Vec<FileDialogFilter>,
+    ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
+        self.platform
+            .prompt_for_new_path(directory, suggested_name, filters)
     }
 
     /// Reveals the specified path at the platform level, such as in Finder on macOS.

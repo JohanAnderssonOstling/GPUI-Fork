@@ -176,11 +176,13 @@ pub trait Platform: 'static {
     fn prompt_for_paths(
         &self,
         options: PathPromptOptions,
+        filters: Vec<FileDialogFilter>,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>>;
     fn prompt_for_new_path(
         &self,
         directory: &Path,
         suggested_name: Option<&str>,
+        filters: Vec<FileDialogFilter>,
     ) -> oneshot::Receiver<Result<Option<PathBuf>>>;
     fn can_select_mixed_files_and_dirs(&self) -> bool;
     fn reveal_path(&self, path: &Path);
@@ -1765,6 +1767,15 @@ pub struct PathPromptOptions {
     pub multiple: bool,
     /// The prompt to show to a user when selecting a path
     pub prompt: Option<SharedString>,
+}
+
+/// A named set of filename extensions accepted by a native file dialog.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FileDialogFilter {
+    /// User-visible name of the file type.
+    pub name: String,
+    /// Extensions without a leading dot, for example `html` or `htm`.
+    pub extensions: Vec<String>,
 }
 
 /// What kind of prompt styling to show

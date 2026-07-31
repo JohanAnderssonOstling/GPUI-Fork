@@ -381,6 +381,7 @@ impl Platform for TestPlatform {
     fn prompt_for_paths(
         &self,
         options: crate::PathPromptOptions,
+        _filters: Vec<crate::FileDialogFilter>,
     ) -> oneshot::Receiver<Result<Option<Vec<std::path::PathBuf>>>> {
         let (tx, rx) = oneshot::channel();
         self.prompts.borrow_mut().paths.push_back((options, tx));
@@ -391,6 +392,7 @@ impl Platform for TestPlatform {
         &self,
         directory: &std::path::Path,
         _suggested_name: Option<&str>,
+        _filters: Vec<crate::FileDialogFilter>,
     ) -> oneshot::Receiver<Result<Option<std::path::PathBuf>>> {
         let (tx, rx) = oneshot::channel();
         self.prompts

@@ -23,8 +23,8 @@ use xkbcommon::xkb::{self, Keycode, Keysym, State};
 use crate::linux::{LinuxDispatcher, PriorityQueueCalloopReceiver};
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DisplayId,
-    ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    FileDialogFilter, ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions,
+    Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
     PlatformWindow, Result, RunnableVariant, Task, ThermalState, WindowAppearance,
     WindowButtonLayout, WindowParams,
 };
@@ -391,11 +391,12 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
     fn prompt_for_paths(
         &self,
         options: PathPromptOptions,
+        filters: Vec<FileDialogFilter>,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
         let (done_tx, done_rx) = oneshot::channel();
 
         #[cfg(not(any(feature = "wayland", feature = "x11")))]
-        let _ = (done_tx.send(Ok(None)), options);
+        let _ = (done_tx.send(Ok(None)), options, filters);
 
         #[cfg(any(feature = "wayland", feature = "x11"))]
         let identifier = self.inner.window_identifier();
@@ -409,16 +410,24 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
                     "Open File"
                 };
 
-                let request = match ashpd::desktop::file_chooser::OpenFileRequest::default()
+                let mut request_builder = ashpd::desktop::file_chooser::OpenFileRequest::default()
                     .identifier(identifier.await)
                     .modal(true)
                     .title(title)
                     .accept_label(options.prompt.as_ref().map(gpui::SharedString::as_str))
                     .multiple(options.multiple)
-                    .directory(options.directories)
-                    .send()
-                    .await
-                {
+                    .directory(options.directories);
+
+                for filter in &filters {
+                    let mut portal_filter =
+                        ashpd::desktop::file_chooser::FileFilter::new(filter.name.as_str());
+                    for extension in &filter.extensions {
+                        portal_filter = portal_filter.glob(format!("*.{extension}").as_str());
+                    }
+                    request_builder = request_builder.filter(portal_filter);
+                }
+
+                let request = match request_builder.send().await {
                     Ok(request) => request,
                     Err(err) => {
                         let result = match err {
@@ -452,11 +461,12 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
         &self,
         directory: &Path,
         suggested_name: Option<&str>,
+        filters: Vec<FileDialogFilter>,
     ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
         let (done_tx, done_rx) = oneshot::channel();
 
         #[cfg(not(any(feature = "wayland", feature = "x11")))]
-        let _ = (done_tx.send(Ok(None)), directory, suggested_name);
+        let _ = (done_tx.send(Ok(None)), directory, suggested_name, filters);
 
         #[cfg(any(feature = "wayland", feature = "x11"))]
         let identifier = self.inner.window_identifier();
@@ -478,6 +488,15 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
 
                     if let Some(suggested_name) = suggested_name {
                         request_builder = request_builder.current_name(suggested_name.as_str());
+                    }
+
+                    for filter in &filters {
+                        let mut portal_filter =
+                            ashpd::desktop::file_chooser::FileFilter::new(filter.name.as_str());
+                        for extension in &filter.extensions {
+                            portal_filter = portal_filter.glob(format!("*.{extension}").as_str());
+                        }
+                        request_builder = request_builder.filter(portal_filter);
                     }
 
                     let request = match request_builder.send().await {

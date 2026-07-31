@@ -560,12 +560,13 @@ impl Platform for WindowsPlatform {
     fn prompt_for_paths(
         &self,
         options: PathPromptOptions,
+        filters: Vec<FileDialogFilter>,
     ) -> Receiver<Result<Option<Vec<PathBuf>>>> {
         let (tx, rx) = oneshot::channel();
         let window = self.find_current_active_window();
         self.foreground_executor()
             .spawn(async move {
-                let _ = tx.send(file_open_dialog(options, window));
+                let _ = tx.send(file_open_dialog(options, filters, window));
             })
             .detach();
 
@@ -576,6 +577,7 @@ impl Platform for WindowsPlatform {
         &self,
         directory: &Path,
         suggested_name: Option<&str>,
+        filters: Vec<FileDialogFilter>,
     ) -> Receiver<Result<Option<PathBuf>>> {
         let directory = directory.to_owned();
         let suggested_name = suggested_name.map(|s| s.to_owned());
@@ -583,7 +585,7 @@ impl Platform for WindowsPlatform {
         let window = self.find_current_active_window();
         self.foreground_executor()
             .spawn(async move {
-                let _ = tx.send(file_save_dialog(directory, suggested_name, window));
+                let _ = tx.send(file_save_dialog(directory, suggested_name, filters, window));
             })
             .detach();
 
@@ -1158,8 +1160,44 @@ fn open_target_in_explorer(target: &Path) -> Result<()> {
     })
 }
 
+fn file_dialog_filter_strings(filters: &[FileDialogFilter]) -> (Vec<HSTRING>, Vec<HSTRING>) {
+    let names = filters
+        .iter()
+        .map(|filter| HSTRING::from(filter.name.as_str()))
+        .collect();
+    let patterns = filters
+        .iter()
+        .map(|filter| {
+            HSTRING::from(
+                filter
+                    .extensions
+                    .iter()
+                    .map(|extension| format!("*.{extension}"))
+                    .collect::<Vec<_>>()
+                    .join(";"),
+            )
+        })
+        .collect();
+    (names, patterns)
+}
+
+fn file_dialog_filter_specs(
+    names: &[HSTRING],
+    patterns: &[HSTRING],
+) -> Vec<Common::COMDLG_FILTERSPEC> {
+    names
+        .iter()
+        .zip(patterns)
+        .map(|(name, pattern)| Common::COMDLG_FILTERSPEC {
+            pszName: PCWSTR(name.as_ptr()),
+            pszSpec: PCWSTR(pattern.as_ptr()),
+        })
+        .collect()
+}
+
 fn file_open_dialog(
     options: PathPromptOptions,
+    filters: Vec<FileDialogFilter>,
     window: Option<HWND>,
 ) -> Result<Option<Vec<PathBuf>>> {
     let folder_dialog: IFileOpenDialog =
@@ -1173,8 +1211,15 @@ fn file_open_dialog(
         dialog_options |= FOS_PICKFOLDERS;
     }
 
+    let (filter_names, filter_patterns) = file_dialog_filter_strings(&filters);
+    let filter_specs = file_dialog_filter_specs(&filter_names, &filter_patterns);
+
     unsafe {
         folder_dialog.SetOptions(dialog_options)?;
+
+        if !filter_specs.is_empty() {
+            folder_dialog.SetFileTypes(&filter_specs)?;
+        }
 
         if let Some(prompt) = options.prompt {
             let prompt: &str = &prompt;
@@ -1206,6 +1251,7 @@ fn file_open_dialog(
 fn file_save_dialog(
     directory: PathBuf,
     suggested_name: Option<String>,
+    filters: Vec<FileDialogFilter>,
     window: Option<HWND>,
 ) -> Result<Option<PathBuf>> {
     let dialog: IFileSaveDialog = unsafe { CoCreateInstance(&FileSaveDialog, None, CLSCTX_ALL)? };
@@ -1236,11 +1282,19 @@ fn file_save_dialog(
         };
     }
 
+    let (filter_names, filter_patterns) = file_dialog_filter_strings(&filters);
+    let filter_specs = file_dialog_filter_specs(&filter_names, &filter_patterns);
+    let all_files = [Common::COMDLG_FILTERSPEC {
+        pszName: windows::core::w!("All files"),
+        pszSpec: windows::core::w!("*.*"),
+    }];
+
     unsafe {
-        dialog.SetFileTypes(&[Common::COMDLG_FILTERSPEC {
-            pszName: windows::core::w!("All files"),
-            pszSpec: windows::core::w!("*.*"),
-        }])?;
+        dialog.SetFileTypes(if filter_specs.is_empty() {
+            &all_files
+        } else {
+            &filter_specs
+        })?;
         if dialog.Show(window).is_err() {
             // User cancelled
             return Ok(None);
