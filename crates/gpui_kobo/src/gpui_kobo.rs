@@ -1,17 +1,22 @@
 //! Experimental CPU rendering pieces for a future Kobo GPUI backend.
 //!
-//! This crate currently proves only that a GPUI scene containing a simple
-//! button can be rasterized without a GPU. It is not a production platform.
+//! This crate proves that a GPUI scene containing a simple button can be
+//! rasterized without a GPU and handed to FBInk on a Kobo device. It remains a
+//! deliberately narrow feasibility backend, not a production GPUI platform.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use gpui::{
-    AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds, ContentMask, DevicePixels,
-    Hsla, MonochromeSprite, PlatformAtlas, PlatformHeadlessRenderer, PrimitiveBatch, Rgba,
-    Scene, Size, SubpixelSprite, TileId, TransformationMatrix,
+    App, AppContext, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds, ContentMask,
+    Context, DevicePixels, HeadlessAppContext, Hsla, IntoElement, MonochromeSprite,
+    NoopTextSystem, ParentElement, PlatformAtlas, PlatformHeadlessRenderer, PrimitiveBatch, Render,
+    Rgba, Scene, Size, Styled, SubpixelSprite, TileId, TransformationMatrix, Window, div, px, rgb, size,
 };
 use image::{Rgba as ImageRgba, RgbaImage};
 use parking_lot::Mutex;
@@ -111,6 +116,8 @@ pub struct KoboRenderer {
     atlas: Arc<KoboAtlas>,
 }
 
+const TEST_CANVAS: Size<gpui::Pixels> = size(px(300.0), px(400.0));
+
 impl Default for KoboRenderer {
     fn default() -> Self {
         Self::new()
@@ -129,7 +136,8 @@ impl KoboRenderer {
         if width == 0 || height == 0 {
             bail!("Kobo render target must be non-empty");
         }
-        let mut target = RgbaImage::from_pixel(width, height, ImageRgba([255, 255, 255, 255]));
+        let mut target =
+            RgbaImage::from_pixel(width, height, ImageRgba([255, 255, 255, 255]));
 
         for batch in scene.batches() {
             match batch {
@@ -138,12 +146,7 @@ impl KoboRenderer {
                         let Some(color) = quad.background.as_solid() else {
                             bail!("Kobo spike only supports solid quad backgrounds");
                         };
-                        fill_rect(
-                            &mut target,
-                            quad.bounds,
-                            quad.content_mask,
-                            color,
-                        );
+                        fill_rect(&mut target, quad.bounds, quad.content_mask, color);
                     }
                 }
                 PrimitiveBatch::MonochromeSprites { range, .. } => {
@@ -228,6 +231,72 @@ impl PlatformHeadlessRenderer for KoboRenderer {
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.atlas.clone()
+    }
+}
+
+/// Render the deployable one-button feasibility scene through GPUI.
+///
+/// The logical 300 by 400 canvas is rendered at GPUI's test display scale,
+/// producing a 600 by 800 grayscale image that FBInk can scale to the device's
+/// current viewport. The label is made from quads so the device binary does not
+/// depend on a desktop font stack or GPU renderer.
+pub fn render_button_test_image() -> Result<RgbaImage> {
+    let mut app = HeadlessAppContext::with_platform(
+        Arc::new(NoopTextSystem::new()),
+        Arc::new(()),
+        || Some(Box::new(KoboRenderer::new())),
+    );
+    let window = app.open_window(TEST_CANVAS, |_window, cx: &mut App| {
+        cx.new(|_| ButtonTestView)
+    })?;
+    app.run_until_parked();
+    app.capture_screenshot(window.into())
+}
+
+/// Write an RGBA grayscale render as a binary PGM image.
+///
+/// PGM keeps the on-device executable independent from an image encoder and is
+/// one of the image formats accepted by image-enabled FBInk builds.
+pub fn write_pgm(image: &RgbaImage, path: impl AsRef<Path>) -> Result<()> {
+    let mut writer = BufWriter::new(File::create(path.as_ref())?);
+    write!(writer, "P5\n{} {}\n255\n", image.width(), image.height())?;
+    let mut pixels = Vec::with_capacity((image.width() * image.height()) as usize);
+    pixels.extend(image.pixels().map(|pixel| pixel.0[0]));
+    writer.write_all(&pixels)?;
+    writer.flush()?;
+    Ok(())
+}
+
+struct ButtonTestView;
+
+impl Render for ButtonTestView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let white = rgb(0xffffff);
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w_full()
+            .h_full()
+            .bg(white)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(180.0))
+                    .h(px(64.0))
+                    .bg(rgb(0x181818))
+                    .child(
+                        div()
+                            .flex()
+                            .items_end()
+                            .gap(px(5.0))
+                            .child(div().w(px(10.0)).h(px(16.0)).bg(white))
+                            .child(div().w(px(10.0)).h(px(25.0)).bg(white))
+                            .child(div().w(px(10.0)).h(px(34.0)).bg(white)),
+                    ),
+            )
     }
 }
 

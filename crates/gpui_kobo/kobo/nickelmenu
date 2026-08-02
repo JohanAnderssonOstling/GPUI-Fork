@@ -1,0 +1,1 @@
+menu_item :main :GPUI Kobo test :cmd_spawn :quiet:/mnt/onboard/.adds/gpui-kobo/run.sh

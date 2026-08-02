@@ -2620,6 +2620,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui_kobo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "gpui_wgpu",
+ "image",
+ "parking_lot",
+]
+
+[[package]]
 name = "gpui_linux"
 version = "0.1.0"
 dependencies = [
