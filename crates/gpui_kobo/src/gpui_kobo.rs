@@ -13,10 +13,11 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use gpui::{
-    App, AppContext, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds, ContentMask,
-    Context, DevicePixels, HeadlessAppContext, Hsla, IntoElement, MonochromeSprite,
-    NoopTextSystem, ParentElement, PlatformAtlas, PlatformHeadlessRenderer, PrimitiveBatch, Render,
-    Rgba, Scene, Size, Styled, SubpixelSprite, TileId, TransformationMatrix, Window, div, px, rgb, size,
+    AnyWindowHandle, App, AppContext, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds,
+    ContentMask, Context, DevicePixels, Entity, HeadlessAppContext, Hsla, IntoElement,
+    MonochromeSprite, NoopTextSystem, ParentElement, PlatformAtlas, PlatformHeadlessRenderer,
+    PrimitiveBatch, Render, Rgba, Scene, Size, Styled, SubpixelSprite, TileId,
+    TransformationMatrix, Window, div, px, rgb, size,
 };
 use image::{Rgba as ImageRgba, RgbaImage};
 use parking_lot::Mutex;
@@ -268,50 +269,50 @@ impl PlatformHeadlessRenderer for KoboRenderer {
 /// current viewport. The label is made from quads so the device binary does not
 /// depend on a desktop font stack or GPU renderer.
 pub fn render_button_test_image() -> Result<RgbaImage> {
-    let mut app = HeadlessAppContext::with_platform(
-        Arc::new(NoopTextSystem::new()),
-        Arc::new(()),
-        || Some(Box::new(KoboRenderer::new())),
-    );
-    let window = app.open_window(TEST_CANVAS, |_window, cx: &mut App| {
-        cx.new(|_| ButtonTestView)
-    })?;
-    app.run_until_parked();
-    app.capture_screenshot(window.into())
+    ButtonRenderSession::new()?.capture()
 }
 
-/// Retains the GPUI-rendered base frame and exposes the two visual states used by
-/// the Kobo input smoke test. Keeping this state in-process avoids restarting the
-/// application between touch events.
+/// Retains the GPUI application, window, and view for the lifetime of the Kobo
+/// input smoke test.
 pub struct ButtonRenderSession {
-    base: RgbaImage,
-    pressed: bool,
-    activated: bool,
+    window: AnyWindowHandle,
+    view: Entity<ButtonTestView>,
+    app: HeadlessAppContext,
 }
 
 impl ButtonRenderSession {
     pub fn new() -> Result<Self> {
+        let mut app = HeadlessAppContext::with_platform(
+            Arc::new(NoopTextSystem::new()),
+            Arc::new(()),
+            || Some(Box::new(KoboRenderer::new())),
+        );
+        let mut view = None;
+        let window = app.open_window(TEST_CANVAS, |_window, cx: &mut App| {
+            let entity = cx.new(|_| ButtonTestView::default());
+            view = Some(entity.clone());
+            entity
+        })?;
+        app.run_until_parked();
+
         Ok(Self {
-            base: render_button_test_image()?,
-            pressed: false,
-            activated: false,
+            app,
+            window: window.into(),
+            view: view.expect("GPUI window builder did not create its root view"),
         })
     }
 
-    pub fn capture(&self) -> Result<RgbaImage> {
-        let mut image = self.base.clone();
-        if self.activated {
-            flip_damage_vertically(&mut image, BUTTON_DAMAGE);
-        }
-        if self.pressed {
-            invert_damage(&mut image, BUTTON_DAMAGE);
-        }
-        Ok(image)
+    pub fn capture(&mut self) -> Result<RgbaImage> {
+        self.app.capture_screenshot(self.window.clone())
     }
 
     pub fn set_state(&mut self, pressed: bool, activated: bool) -> Result<RgbaImage> {
-        self.pressed = pressed;
-        self.activated = activated;
+        self.app.update_entity(&self.view, |view, cx| {
+            view.pressed = pressed;
+            view.activated = activated;
+            cx.notify();
+        });
+        self.app.run_until_parked();
         self.capture()
     }
 }
@@ -325,30 +326,6 @@ pub fn button_damage_image(image: &RgbaImage) -> RgbaImage {
         BUTTON_DAMAGE.height,
     )
     .to_image()
-}
-
-fn invert_damage(image: &mut RgbaImage, rect: PixelRect) {
-    for y in rect.y..rect.y + rect.height {
-        for x in rect.x..rect.x + rect.width {
-            let pixel = image.get_pixel_mut(x, y);
-            pixel.0[0] = 255 - pixel.0[0];
-            pixel.0[1] = 255 - pixel.0[1];
-            pixel.0[2] = 255 - pixel.0[2];
-        }
-    }
-}
-
-fn flip_damage_vertically(image: &mut RgbaImage, rect: PixelRect) {
-    for offset in 0..rect.height / 2 {
-        let top = rect.y + offset;
-        let bottom = rect.y + rect.height - 1 - offset;
-        for x in rect.x..rect.x + rect.width {
-            let top_pixel = *image.get_pixel(x, top);
-            let bottom_pixel = *image.get_pixel(x, bottom);
-            image.put_pixel(x, top, bottom_pixel);
-            image.put_pixel(x, bottom, top_pixel);
-        }
-    }
 }
 
 /// Write an RGBA grayscale render as a binary PGM image.
@@ -365,11 +342,26 @@ pub fn write_pgm(image: &RgbaImage, path: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
-struct ButtonTestView;
+#[derive(Default)]
+struct ButtonTestView {
+    pressed: bool,
+    activated: bool,
+}
 
 impl Render for ButtonTestView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let white = rgb(0xffffff);
+        let black = rgb(0x181818);
+        let (button_color, bar_color) = if self.pressed {
+            (white, black)
+        } else {
+            (black, white)
+        };
+        let bar_heights = if self.activated {
+            [34.0, 25.0, 16.0]
+        } else {
+            [16.0, 25.0, 34.0]
+        };
         div()
             .flex()
             .items_center()
@@ -384,15 +376,15 @@ impl Render for ButtonTestView {
                     .justify_center()
                     .w(px(180.0))
                     .h(px(64.0))
-                    .bg(rgb(0x181818))
+                    .bg(button_color)
                     .child(
                         div()
                             .flex()
                             .items_end()
                             .gap(px(5.0))
-                            .child(div().w(px(10.0)).h(px(16.0)).bg(white))
-                            .child(div().w(px(10.0)).h(px(25.0)).bg(white))
-                            .child(div().w(px(10.0)).h(px(34.0)).bg(white)),
+                            .child(div().w(px(10.0)).h(px(bar_heights[0])).bg(bar_color))
+                            .child(div().w(px(10.0)).h(px(bar_heights[1])).bg(bar_color))
+                            .child(div().w(px(10.0)).h(px(bar_heights[2])).bg(bar_color)),
                     ),
             )
     }
