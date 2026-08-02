@@ -1,0 +1,21 @@
+[package]
+name = "gpui_kobo"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/gpui_kobo.rs"
+
+[dependencies]
+anyhow.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+image.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+gpui_wgpu.workspace = true
