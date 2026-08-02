@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use gpui_kobo::{
-    BUTTON_DAMAGE, ButtonRenderSession, CANVAS_HEIGHT, CANVAS_WIDTH, TouchDevice, TouchPhase,
+    BUTTON_DAMAGE, ButtonRenderSession, CANVAS_HEIGHT, CANVAS_WIDTH, TouchDevice,
     button_damage_image, write_pgm,
 };
 use image::RgbaImage;
@@ -67,15 +67,13 @@ fn run_interactive(
     let mut touch = TouchDevice::discover()?;
     println!("touchscreen: {}", touch.description());
     println!(
-        "viewport: {}x{}; tap the GPUI button once to activate it and again to exit",
+        "viewport: {}x{}; tap the bar control to toggle it, then tap the exit control",
         viewport.width, viewport.height
     );
 
     let damage_path = options.output.with_file_name("gpui-kobo-button-damage.pgm");
     let deadline = Instant::now() + options.timeout;
-    let mut pressed_inside = false;
-    let mut activated = false;
-    let mut completed_taps = 0_u8;
+    let mut previous_state = session.state();
 
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -99,63 +97,31 @@ fn run_interactive(
             mapped.phase, event.raw_x, event.raw_y, mapped.x, mapped.y
         );
 
-        match mapped.phase {
-            TouchPhase::Down if BUTTON_DAMAGE.contains(mapped.x, mapped.y) => {
-                pressed_inside = true;
-                render_damage(
-                    session,
-                    true,
-                    activated,
-                    &options.fbink,
-                    &damage_path,
-                    viewport,
-                )?;
-            }
-            TouchPhase::Up if pressed_inside => {
-                pressed_inside = false;
-                completed_taps = completed_taps.saturating_add(1);
-                if completed_taps == 1 {
-                    activated = true;
-                    render_damage(
-                        session,
-                        false,
-                        true,
-                        &options.fbink,
-                        &damage_path,
-                        viewport,
-                    )?;
-                    println!("button activated; tap it again to exit");
-                } else {
-                    render_damage(
-                        session,
-                        false,
-                        false,
-                        &options.fbink,
-                        &damage_path,
-                        viewport,
-                    )?;
-                    println!("second button tap received; exiting");
-                    thread::sleep(Duration::from_millis(350));
-                    break;
-                }
-            }
-            TouchPhase::Up => pressed_inside = false,
-            _ => {}
+        if let Some(image) = session.dispatch_touch(mapped.phase, mapped.x, mapped.y)? {
+            render_damage(&image, &options.fbink, &damage_path, viewport)?;
         }
+
+        let state = session.state();
+        if state.activated != previous_state.activated {
+            println!("bar control toggled through GPUI hit testing");
+        }
+        if state.exit_requested {
+            println!("exit control activated through GPUI hit testing");
+            thread::sleep(Duration::from_millis(350));
+            break;
+        }
+        previous_state = state;
     }
     Ok(())
 }
 
 fn render_damage(
-    session: &mut ButtonRenderSession,
-    pressed: bool,
-    activated: bool,
+    image: &RgbaImage,
     fbink: &Path,
     damage_path: &Path,
     viewport: Viewport,
 ) -> Result<()> {
-    let image = session.set_state(pressed, activated)?;
-    let damage = button_damage_image(&image);
+    let damage = button_damage_image(image);
     write_pgm(&damage, damage_path)?;
     present_damage(fbink, damage_path, viewport)
 }

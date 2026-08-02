@@ -14,10 +14,11 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use gpui::{
     AnyWindowHandle, App, AppContext, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds,
-    ContentMask, Context, DevicePixels, Entity, HeadlessAppContext, Hsla, IntoElement,
-    MonochromeSprite, NoopTextSystem, ParentElement, PlatformAtlas, PlatformHeadlessRenderer,
-    PrimitiveBatch, Render, Rgba, Scene, Size, Styled, SubpixelSprite, TileId,
-    TransformationMatrix, Window, div, px, rgb, size,
+    ContentMask, Context, DevicePixels, Entity, HeadlessAppContext, Hsla, InteractiveElement,
+    IntoElement, Modifiers, MonochromeSprite, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, NoopTextSystem, ParentElement, PlatformAtlas, PlatformHeadlessRenderer,
+    PlatformInput, PrimitiveBatch, Render, Rgba, Scene, Size, Styled, SubpixelSprite, TileId,
+    TransformationMatrix, Window, div, point, px, rgb, size,
 };
 use image::{Rgba as ImageRgba, RgbaImage};
 use parking_lot::Mutex;
@@ -140,9 +141,9 @@ impl PixelRect {
 }
 
 pub const BUTTON_DAMAGE: PixelRect = PixelRect {
-    x: 120,
+    x: 80,
     y: 336,
-    width: 360,
+    width: 440,
     height: 128,
 };
 
@@ -280,6 +281,13 @@ pub struct ButtonRenderSession {
     app: HeadlessAppContext,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ButtonRenderState {
+    pub pressed: bool,
+    pub activated: bool,
+    pub exit_requested: bool,
+}
+
 impl ButtonRenderSession {
     pub fn new() -> Result<Self> {
         let mut app = HeadlessAppContext::with_platform(
@@ -306,14 +314,46 @@ impl ButtonRenderSession {
         self.app.capture_screenshot(self.window.clone())
     }
 
-    pub fn set_state(&mut self, pressed: bool, activated: bool) -> Result<RgbaImage> {
-        self.app.update_entity(&self.view, |view, cx| {
-            view.pressed = pressed;
-            view.activated = activated;
-            cx.notify();
-        });
+    pub fn state(&self) -> ButtonRenderState {
+        self.app.read_entity(&self.view, |view, _| ButtonRenderState {
+            pressed: view.pressed.is_some(),
+            activated: view.activated,
+            exit_requested: view.exit_requested,
+        })
+    }
+
+    pub fn dispatch_touch(
+        &mut self,
+        phase: TouchPhase,
+        canvas_x: f32,
+        canvas_y: f32,
+    ) -> Result<Option<RgbaImage>> {
+        let before = self.state();
+        let position = point(px(canvas_x / 2.0), px(canvas_y / 2.0));
+        let input = match phase {
+            TouchPhase::Down => PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                click_count: 1,
+                ..Default::default()
+            }),
+            TouchPhase::Move => PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button: before.pressed.then_some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            }),
+            TouchPhase::Up => PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                click_count: 1,
+                ..Default::default()
+            }),
+        };
+        self.app.update_window(self.window.clone(), |_, window, cx| {
+            window.dispatch_event(input, cx);
+        })?;
         self.app.run_until_parked();
-        self.capture()
+        (self.state() != before).then(|| self.capture()).transpose()
     }
 }
 
@@ -344,15 +384,27 @@ pub fn write_pgm(image: &RgbaImage, path: impl AsRef<Path>) -> Result<()> {
 
 #[derive(Default)]
 struct ButtonTestView {
-    pressed: bool,
+    pressed: Option<TestControl>,
     activated: bool,
+    exit_requested: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestControl {
+    Toggle,
+    Exit,
 }
 
 impl Render for ButtonTestView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let white = rgb(0xffffff);
         let black = rgb(0x181818);
-        let (button_color, bar_color) = if self.pressed {
+        let (button_color, bar_color) = if self.pressed == Some(TestControl::Toggle) {
+            (white, black)
+        } else {
+            (black, white)
+        };
+        let (exit_color, exit_mark_color) = if self.pressed == Some(TestControl::Exit) {
             (white, black)
         } else {
             (black, white)
@@ -374,17 +426,71 @@ impl Render for ButtonTestView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .w(px(180.0))
-                    .h(px(64.0))
-                    .bg(button_color)
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(150.0))
+                            .h(px(64.0))
+                            .bg(button_color)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                _cx.listener(|view, _, _, cx| {
+                                    view.pressed = Some(TestControl::Toggle);
+                                    cx.notify();
+                                }),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                _cx.listener(|view, _, _, cx| {
+                                    if view.pressed == Some(TestControl::Toggle) {
+                                        view.activated = !view.activated;
+                                    }
+                                    view.pressed = None;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_end()
+                                    .gap(px(5.0))
+                                    .child(div().w(px(10.0)).h(px(bar_heights[0])).bg(bar_color))
+                                    .child(div().w(px(10.0)).h(px(bar_heights[1])).bg(bar_color))
+                                    .child(div().w(px(10.0)).h(px(bar_heights[2])).bg(bar_color)),
+                            ),
+                    )
                     .child(
                         div()
                             .flex()
                             .items_end()
-                            .gap(px(5.0))
-                            .child(div().w(px(10.0)).h(px(bar_heights[0])).bg(bar_color))
-                            .child(div().w(px(10.0)).h(px(bar_heights[1])).bg(bar_color))
-                            .child(div().w(px(10.0)).h(px(bar_heights[2])).bg(bar_color)),
+                            .justify_center()
+                            .gap(px(7.0))
+                            .w(px(54.0))
+                            .h(px(64.0))
+                            .pb(px(17.0))
+                            .bg(exit_color)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                _cx.listener(|view, _, _, cx| {
+                                    view.pressed = Some(TestControl::Exit);
+                                    cx.notify();
+                                }),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                _cx.listener(|view, _, _, cx| {
+                                    if view.pressed == Some(TestControl::Exit) {
+                                        view.exit_requested = true;
+                                    }
+                                    view.pressed = None;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(div().w(px(8.0)).h(px(30.0)).bg(exit_mark_color))
+                            .child(div().w(px(8.0)).h(px(30.0)).bg(exit_mark_color)),
                     ),
             )
     }
