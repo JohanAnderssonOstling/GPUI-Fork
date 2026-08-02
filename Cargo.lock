@@ -2627,6 +2627,7 @@ dependencies = [
  "gpui",
  "gpui_wgpu",
  "image",
+ "libc",
  "parking_lot",
 ]
 

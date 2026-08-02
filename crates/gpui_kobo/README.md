@@ -103,3 +103,12 @@ and license. FBInk is built with:
 ```sh
 make static MINIMAL=1 BITMAP=1 IMAGE=1 LDFLAGS=-static
 ```
+## Interactive touch test
+
+The packaged launcher now opens a limited interactive smoke test. It discovers
+the Kobo touchscreen through `/dev/input/event*`, maps its absolute coordinates
+to the 600 by 800 GPUI test canvas, and asks FBInk to refresh only the button
+damage rectangle in A2 mode. The first button tap latches a changed bar pattern;
+the second exits and restarts Nickel. If input discovery or a tap fails, the
+launcher recovers after 45 seconds. Override that fallback with
+`GPUI_KOBO_TIMEOUT_SECONDS`.

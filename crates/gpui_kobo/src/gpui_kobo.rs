@@ -116,7 +116,34 @@ pub struct KoboRenderer {
     atlas: Arc<KoboAtlas>,
 }
 
+pub const CANVAS_WIDTH: u32 = 600;
+pub const CANVAS_HEIGHT: u32 = 800;
+
 const TEST_CANVAS: Size<gpui::Pixels> = size(px(300.0), px(400.0));
+
+#[derive(Clone, Copy, Debug)]
+pub struct PixelRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl PixelRect {
+    pub fn contains(self, x: f32, y: f32) -> bool {
+        x >= self.x as f32
+            && y >= self.y as f32
+            && x < (self.x + self.width) as f32
+            && y < (self.y + self.height) as f32
+    }
+}
+
+pub const BUTTON_DAMAGE: PixelRect = PixelRect {
+    x: 120,
+    y: 336,
+    width: 360,
+    height: 128,
+};
 
 impl Default for KoboRenderer {
     fn default() -> Self {
@@ -251,6 +278,77 @@ pub fn render_button_test_image() -> Result<RgbaImage> {
     })?;
     app.run_until_parked();
     app.capture_screenshot(window.into())
+}
+
+/// Retains the GPUI-rendered base frame and exposes the two visual states used by
+/// the Kobo input smoke test. Keeping this state in-process avoids restarting the
+/// application between touch events.
+pub struct ButtonRenderSession {
+    base: RgbaImage,
+    pressed: bool,
+    activated: bool,
+}
+
+impl ButtonRenderSession {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            base: render_button_test_image()?,
+            pressed: false,
+            activated: false,
+        })
+    }
+
+    pub fn capture(&self) -> Result<RgbaImage> {
+        let mut image = self.base.clone();
+        if self.activated {
+            flip_damage_vertically(&mut image, BUTTON_DAMAGE);
+        }
+        if self.pressed {
+            invert_damage(&mut image, BUTTON_DAMAGE);
+        }
+        Ok(image)
+    }
+
+    pub fn set_state(&mut self, pressed: bool, activated: bool) -> Result<RgbaImage> {
+        self.pressed = pressed;
+        self.activated = activated;
+        self.capture()
+    }
+}
+
+pub fn button_damage_image(image: &RgbaImage) -> RgbaImage {
+    image::imageops::crop_imm(
+        image,
+        BUTTON_DAMAGE.x,
+        BUTTON_DAMAGE.y,
+        BUTTON_DAMAGE.width,
+        BUTTON_DAMAGE.height,
+    )
+    .to_image()
+}
+
+fn invert_damage(image: &mut RgbaImage, rect: PixelRect) {
+    for y in rect.y..rect.y + rect.height {
+        for x in rect.x..rect.x + rect.width {
+            let pixel = image.get_pixel_mut(x, y);
+            pixel.0[0] = 255 - pixel.0[0];
+            pixel.0[1] = 255 - pixel.0[1];
+            pixel.0[2] = 255 - pixel.0[2];
+        }
+    }
+}
+
+fn flip_damage_vertically(image: &mut RgbaImage, rect: PixelRect) {
+    for offset in 0..rect.height / 2 {
+        let top = rect.y + offset;
+        let bottom = rect.y + rect.height - 1 - offset;
+        for x in rect.x..rect.x + rect.width {
+            let top_pixel = *image.get_pixel(x, top);
+            let bottom_pixel = *image.get_pixel(x, bottom);
+            image.put_pixel(x, top, bottom_pixel);
+            image.put_pixel(x, bottom, top_pixel);
+        }
+    }
 }
 
 /// Write an RGBA grayscale render as a binary PGM image.
@@ -398,3 +496,6 @@ fn blend_gray(pixel: &mut ImageRgba<u8>, gray: u8, alpha: f32) {
     let blended = (f32::from(gray) * alpha + current * (1.0 - alpha)).round() as u8;
     *pixel = ImageRgba([blended, blended, blended, 255]);
 }
+mod input;
+
+pub use input::*;

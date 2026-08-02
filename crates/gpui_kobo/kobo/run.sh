@@ -40,6 +40,8 @@ trap restart_nickel 0 1 2 15
     fi
 
     if ! FBINK_BIN="$WORKDIR/fbink" "$WORKDIR/gpui-kobo-button" \
+        --interactive \
+        --timeout-seconds "${GPUI_KOBO_TIMEOUT_SECONDS:-45}" \
         --output "$IMAGE"; then
         "$WORKDIR/fbink" -q -c -f -p -m -M -h \
             "GPUI Kobo test failed; see gpui-kobo.log"
@@ -47,7 +49,6 @@ trap restart_nickel 0 1 2 15
         exit 1
     fi
 
-    sleep "${GPUI_KOBO_HOLD_SECONDS:-15}"
     printf '[%s] GPUI Kobo test complete\n' "$(date)"
 } >>"$LOG" 2>&1
 

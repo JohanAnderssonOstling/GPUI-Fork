@@ -14,16 +14,8 @@ if [ ! -d "$DEVICE_ROOT/.kobo" ]; then
 fi
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-CRATE_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-REPO_ROOT=$(CDPATH= cd -- "$CRATE_DIR/../.." && pwd)
-BUILD_ROOT=${KOBO_BUILD_ROOT:-"$REPO_ROOT/target/gpui-kobo"}
-PACKAGE_ROOT="$BUILD_ROOT/package"
-
-"$SCRIPT_DIR/package-kobo.sh" >/dev/null
-
-mkdir -p "$DEVICE_ROOT/.adds/gpui-kobo" "$DEVICE_ROOT/.adds/nm"
-cp -R "$PACKAGE_ROOT/.adds/gpui-kobo/." "$DEVICE_ROOT/.adds/gpui-kobo/"
-cp "$PACKAGE_ROOT/.adds/nm/gpui-kobo" "$DEVICE_ROOT/.adds/nm/gpui-kobo"
+ARCHIVE=$("$SCRIPT_DIR/package-kobo.sh")
+tar -xzf "$ARCHIVE" -C "$DEVICE_ROOT"
 sync
 
 cat <<EOF
@@ -33,6 +25,7 @@ Installed the GPUI test under:
 Safely eject the Kobo. If NickelMenu is installed, select:
   GPUI Kobo test
 
-The test stops Nickel, displays the GPUI-rendered button for 15 seconds, and
-then restarts Nickel. Its log is written to .adds/gpui-kobo/gpui-kobo.log.
+The test stops Nickel and displays the GPUI-rendered button. Tap it once to
+change its state and tap it again to return to Nickel. A 45-second timeout
+recovers automatically. The log is in .adds/gpui-kobo/gpui-kobo.log.
 EOF

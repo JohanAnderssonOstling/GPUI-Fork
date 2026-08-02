@@ -67,11 +67,9 @@ rm -rf "$PACKAGE_ROOT"
 mkdir -p \
     "$PACKAGE_ROOT/.adds/gpui-kobo/third-party-source" \
     "$PACKAGE_ROOT/.adds/nm"
-cp "$GPUI_BINARY" "$PACKAGE_ROOT/.adds/gpui-kobo/gpui-kobo-button"
-cp "$FBINK_BINARY" "$PACKAGE_ROOT/.adds/gpui-kobo/fbink"
 STRIP="$TOOLCHAIN_ROOT/bin/armv7l-linux-musleabihf-strip"
-"$STRIP" "$PACKAGE_ROOT/.adds/gpui-kobo/gpui-kobo-button"
-"$STRIP" "$PACKAGE_ROOT/.adds/gpui-kobo/fbink"
+"$STRIP" -o "$PACKAGE_ROOT/.adds/gpui-kobo/gpui-kobo-button" "$GPUI_BINARY"
+"$STRIP" -o "$PACKAGE_ROOT/.adds/gpui-kobo/fbink" "$FBINK_BINARY"
 cp "$CRATE_DIR/kobo/run.sh" "$PACKAGE_ROOT/.adds/gpui-kobo/run.sh"
 cp "$CRATE_DIR/kobo/nickelmenu" "$PACKAGE_ROOT/.adds/nm/gpui-kobo"
 cp "$REPO_ROOT/LICENSE-APACHE" "$PACKAGE_ROOT/.adds/gpui-kobo/LICENSE-APACHE"
