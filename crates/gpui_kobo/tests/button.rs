@@ -1,10 +1,10 @@
-use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{
-    App, Context, HeadlessAppContext, IntoElement, Render, Window, div, px, rgb, size,
+    AppContext, Application, Bounds, Context, IntoElement, ParentElement, Render, Window, WindowBounds,
+    WindowOptions, Styled, div, point, px, rgb, size,
 };
-use gpui_kobo::KoboRenderer;
-use gpui_wgpu::CosmicTextSystem;
+use gpui_kobo::{KoboPlatform, KoboPlatformOptions};
 
 struct ButtonDemo;
 
@@ -17,6 +17,7 @@ impl Render for ButtonDemo {
             .w_full()
             .h_full()
             .bg(rgb(0xffffff))
+            .font_family("Lilex")
             .child(
                 div()
                     .flex()
@@ -32,21 +33,38 @@ impl Render for ButtonDemo {
 }
 
 #[test]
-fn renders_one_button_with_the_cpu_kobo_renderer() {
-    let text_system = Arc::new(CosmicTextSystem::new("DejaVu Sans"));
-    let mut app = HeadlessAppContext::with_platform(text_system, Arc::new(()), || {
-        Some(Box::new(KoboRenderer::new()))
-    });
-    let window = app
-        .open_window(size(px(300.0), px(160.0)), |_window, cx: &mut App| {
-            cx.new(|_| ButtonDemo)
-        })
-        .expect("headless Kobo test window should open");
-    app.run_until_parked();
+fn production_platform_renders_one_button() {
+    let logical_size = size(px(300.0), px(160.0));
+    let platform = KoboPlatform::new(KoboPlatformOptions {
+        logical_size,
+        scale_factor: 2.0,
+        display: false,
+        interactive: false,
+        timeout: Duration::from_secs(1),
+    })
+    .expect("production Kobo platform should initialize");
 
-    let image = app
-        .capture_screenshot(window.into())
-        .expect("minimal GPUI button scene should render on the CPU");
+    Application::new_inaccessible(platform.clone()).run(move |cx| {
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: logical_size,
+                })),
+                focus: true,
+                show: true,
+                ..Default::default()
+            },
+            |_window, cx| cx.new(|_| ButtonDemo),
+        )
+        .expect("production Kobo test window should open");
+    });
+
+    assert!(platform.take_error().is_none(), "Kobo platform reported an error");
+    let image = platform
+        .last_frame()
+        .expect("production Kobo platform should render a framebuffer");
+    assert_eq!(platform.render_count(), 1);
     assert_eq!(image.dimensions(), (600, 320));
 
     let dark_pixels = image.pixels().filter(|pixel| pixel.0[0] < 64).count();

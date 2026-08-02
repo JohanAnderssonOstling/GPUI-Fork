@@ -917,6 +917,16 @@ impl Background {
         }
     }
 
+    /// Returns the angle, stops, and interpolation color space when this is a
+    /// linear gradient background.
+    pub fn as_linear_gradient(&self) -> Option<(f32, [LinearColorStop; 2], ColorSpace)> {
+        (self.tag == BackgroundTag::LinearGradient).then_some((
+            self.gradient_angle_or_pattern_height,
+            self.colors,
+            self.color_space,
+        ))
+    }
+
     /// Use specified color space for color interpolation.
     ///
     /// <https://developer.mozilla.org/en-US/docs/Web/CSS/color-interpolation-method>

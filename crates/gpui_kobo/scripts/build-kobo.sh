@@ -49,6 +49,10 @@ export CC_armv7_unknown_linux_musleabihf="$CC"
 export CXX_armv7_unknown_linux_musleabihf="$CXX"
 export AR_armv7_unknown_linux_musleabihf="$AR"
 
+if [ "${KOBO_PREPARE_ONLY:-0}" = 1 ]; then
+    exit 0
+fi
+
 cd "$REPO_ROOT"
 cargo build \
     --release \

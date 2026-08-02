@@ -2624,11 +2624,14 @@ name = "gpui_kobo"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "gpui",
  "gpui_wgpu",
  "image",
  "libc",
  "parking_lot",
+ "raw-window-handle",
+ "uuid",
 ]
 
 [[package]]

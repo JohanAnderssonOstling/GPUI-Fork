@@ -2,7 +2,6 @@
 
 WORKDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 LOG="$WORKDIR/gpui-kobo.log"
-IMAGE=/tmp/gpui-kobo-button.pgm
 NICKEL_WAS_RUNNING=0
 
 if pidof nickel >/dev/null 2>&1; then
@@ -44,10 +43,9 @@ trap restart_nickel 0 1 2 15
         sleep 2
     fi
 
-    if ! FBINK_BIN="$WORKDIR/fbink" "$WORKDIR/gpui-kobo-button" \
+    if ! "$WORKDIR/gpui-kobo-button" \
         --interactive \
-        --timeout-seconds "${GPUI_KOBO_TIMEOUT_SECONDS:-45}" \
-        --output "$IMAGE"; then
+        --timeout-seconds "${GPUI_KOBO_TIMEOUT_SECONDS:-45}"; then
         "$WORKDIR/fbink" -q -c -f -p -m -M -h \
             "GPUI Kobo test failed; see gpui-kobo.log"
         sleep 10

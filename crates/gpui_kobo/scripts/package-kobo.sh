@@ -25,8 +25,9 @@ checksum() {
     sha256sum "$1" | cut -d ' ' -f 1
 }
 
-GPUI_BINARY=$("$SCRIPT_DIR/build-kobo.sh")
 mkdir -p "$BUILD_ROOT"
+
+KOBO_PREPARE_ONLY=1 "$SCRIPT_DIR/build-kobo.sh"
 
 if [ ! -f "$FBINK_ARCHIVE" ]; then
     temporary="$FBINK_ARCHIVE.partial"
@@ -63,6 +64,16 @@ if [ ! -x "$FBINK_BINARY" ]; then
     exit 1
 fi
 
+SHIM_OBJECT="$FBINK_SOURCE_ROOT/Release/gpui_fbink_shim.o"
+SHIM_LIBRARY="$FBINK_SOURCE_ROOT/Release/libgpui_fbink_shim.a"
+CC="$TOOLCHAIN_ROOT/bin/armv7l-linux-musleabihf-gcc"
+AR="$TOOLCHAIN_ROOT/bin/armv7l-linux-musleabihf-ar"
+"$CC" -Os -std=c11 -I"$FBINK_SOURCE_ROOT" \
+    -c "$CRATE_DIR/native/fbink_shim.c" -o "$SHIM_OBJECT"
+"$AR" rcs "$SHIM_LIBRARY" "$SHIM_OBJECT"
+
+GPUI_BINARY=$(FBINK_LIB_DIR="$FBINK_SOURCE_ROOT/Release" "$SCRIPT_DIR/build-kobo.sh")
+
 rm -rf "$PACKAGE_ROOT"
 mkdir -p \
     "$PACKAGE_ROOT/.adds/gpui-kobo/third-party-source" \
@@ -79,11 +90,11 @@ cp "$FBINK_SOURCE_ROOT/LICENSE" "$PACKAGE_ROOT/.adds/gpui-kobo/LICENSE-FBINK-GPL
 cp "$FBINK_ARCHIVE" \
     "$PACKAGE_ROOT/.adds/gpui-kobo/third-party-source/$FBINK_ARCHIVE_NAME"
 cat > "$PACKAGE_ROOT/.adds/gpui-kobo/BUILD-INFO.txt" <<EOF
-gpui-kobo-button target: armv7-unknown-linux-musleabihf
+gpui-kobo-button target: armv7-unknown-linux-musleabihf production Platform backend
 GPUI fork commit: $(git -C "$REPO_ROOT" rev-parse HEAD)
 FBInk version: $FBINK_VERSION
 FBInk source SHA-256: $FBINK_SHA256
-FBInk build: make static MINIMAL=1 BITMAP=1 IMAGE=1 LDFLAGS=-static
+FBInk build: statically linked libfbink v1.25.0 plus C ABI shim; CLI retained for crash fallback
 Embedded font: Lilex Regular and Bold (SIL Open Font License 1.1)
 EOF
 

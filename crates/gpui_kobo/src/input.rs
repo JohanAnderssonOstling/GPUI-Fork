@@ -12,6 +12,7 @@ const EV_SYN: u16 = 0x00;
 const EV_KEY: u16 = 0x01;
 const EV_ABS: u16 = 0x03;
 const SYN_REPORT: u16 = 0x00;
+const SYN_DROPPED: u16 = 0x03;
 const BTN_TOUCH: u16 = 330;
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
@@ -65,6 +66,7 @@ pub enum TouchPhase {
     Down,
     Move,
     Up,
+    Cancel,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -107,7 +109,9 @@ impl TouchTransform {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Gesture {
     Tap { x: f32, y: f32 },
+    LongPress { x: f32, y: f32 },
     Swipe { dx: f32, dy: f32 },
+    Cancelled,
 }
 
 #[derive(Debug)]
@@ -115,6 +119,8 @@ pub struct GestureTracker {
     start: Option<(f32, f32)>,
     last: Option<(f32, f32)>,
     threshold: f32,
+    started_at: Option<Instant>,
+    long_press_after: Duration,
 }
 
 impl Default for GestureTracker {
@@ -129,15 +135,22 @@ impl GestureTracker {
             start: None,
             last: None,
             threshold,
+            started_at: None,
+            long_press_after: Duration::from_millis(650),
         }
     }
 
     pub fn observe(&mut self, event: MappedTouch) -> Option<Gesture> {
+        self.observe_at(event, Instant::now())
+    }
+
+    pub fn observe_at(&mut self, event: MappedTouch, now: Instant) -> Option<Gesture> {
         let point = (event.x, event.y);
         match event.phase {
             TouchPhase::Down => {
                 self.start = Some(point);
                 self.last = Some(point);
+                self.started_at = Some(now);
                 None
             }
             TouchPhase::Move => {
@@ -147,17 +160,71 @@ impl GestureTracker {
             TouchPhase::Up => {
                 let start = self.start.take().unwrap_or(point);
                 self.last.take();
+                let held_for = self.started_at.take().map(|started| now.saturating_duration_since(started));
                 let end = point;
                 let dx = end.0 - start.0;
                 let dy = end.1 - start.1;
                 if dx.hypot(dy) >= self.threshold {
                     Some(Gesture::Swipe { dx, dy })
+                } else if held_for.is_some_and(|duration| duration >= self.long_press_after) {
+                    Some(Gesture::LongPress { x: point.0, y: point.1 })
                 } else {
                     Some(Gesture::Tap { x: point.0, y: point.1 })
                 }
             }
+            TouchPhase::Cancel => {
+                self.start = None;
+                self.last = None;
+                self.started_at = None;
+                Some(Gesture::Cancelled)
+            }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TouchCalibration {
+    pub x_minimum: i32,
+    pub x_maximum: i32,
+    pub y_minimum: i32,
+    pub y_maximum: i32,
+}
+
+impl TouchCalibration {
+    pub fn parse(value: &str) -> Result<Self> {
+        let values: Vec<i32> = value
+            .split(',')
+            .map(str::trim)
+            .map(str::parse)
+            .collect::<std::result::Result<_, _>>()
+            .context("touch calibration must contain four integers")?;
+        if values.len() != 4 || values[1] <= values[0] || values[3] <= values[2] {
+            bail!("touch calibration must be x_min,x_max,y_min,y_max with increasing ranges");
+        }
+        Ok(Self {
+            x_minimum: values[0],
+            x_maximum: values[1],
+            y_minimum: values[2],
+            y_maximum: values[3],
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HardwareButton {
+    PreviousPage,
+    NextPage,
+    Home,
+    Power,
+    Sleep,
+    Unknown(u16),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ButtonEvent {
+    pub button: HardwareButton,
+    pub pressed: bool,
+    pub repeated: bool,
 }
 
 pub struct TouchDevice {
@@ -231,6 +298,19 @@ impl TouchDevice {
         )
     }
 
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn calibration(&self) -> TouchCalibration {
+        TouchCalibration {
+            x_minimum: self.x_axis.minimum,
+            x_maximum: self.x_axis.maximum,
+            y_minimum: self.y_axis.minimum,
+            y_maximum: self.y_axis.maximum,
+        }
+    }
+
     pub fn map_to_canvas(
         &self,
         event: TouchEvent,
@@ -266,8 +346,21 @@ impl TouchDevice {
         canvas_height: u32,
         transform: TouchTransform,
     ) -> MappedTouch {
-        let mut x = self.x_axis.normalize(event.raw_x);
-        let mut y = self.y_axis.normalize(event.raw_y);
+        self.map_to_canvas_calibrated(event, canvas_width, canvas_height, transform, self.calibration())
+    }
+
+    pub fn map_to_canvas_calibrated(
+        &self,
+        event: TouchEvent,
+        canvas_width: u32,
+        canvas_height: u32,
+        transform: TouchTransform,
+        calibration: TouchCalibration,
+    ) -> MappedTouch {
+        let x_axis = AxisInfo { code: self.x_axis.code, minimum: calibration.x_minimum, maximum: calibration.x_maximum };
+        let y_axis = AxisInfo { code: self.y_axis.code, minimum: calibration.y_minimum, maximum: calibration.y_maximum };
+        let mut x = x_axis.normalize(event.raw_x);
+        let mut y = y_axis.normalize(event.raw_y);
         if transform.swap_axes {
             mem::swap(&mut x, &mut y);
         }
@@ -328,6 +421,12 @@ impl TouchDevice {
 
     fn process_raw_event(&mut self, event: RawInputEvent) -> Option<TouchEvent> {
         match (event.kind, event.code) {
+            (EV_SYN, SYN_DROPPED) => {
+                self.active = false;
+                self.reported_active = false;
+                self.moved = false;
+                return Some(TouchEvent { phase: TouchPhase::Cancel, raw_x: self.raw_x, raw_y: self.raw_y });
+            }
             (EV_ABS, code) if code == self.x_axis.code => {
                 self.raw_x = event.value;
                 self.moved = true;
@@ -362,6 +461,87 @@ impl TouchDevice {
             _ => {}
         }
         None
+    }
+}
+
+struct ButtonSource {
+    file: File,
+    path: PathBuf,
+}
+
+pub struct ButtonDevice {
+    sources: Vec<ButtonSource>,
+}
+
+impl ButtonDevice {
+    pub fn discover(excluded: &Path) -> Result<Self> {
+        let mut paths: Vec<_> = fs::read_dir("/dev/input")
+            .context("cannot read /dev/input")?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path != excluded)
+            .filter(|path| path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("event")))
+            .collect();
+        paths.sort();
+        let sources = paths
+            .into_iter()
+            .filter_map(|path| File::open(&path).ok().map(|file| ButtonSource { file, path }))
+            .collect();
+        Ok(Self { sources })
+    }
+
+    pub fn description(&self) -> String {
+        if self.sources.is_empty() {
+            return "no separate hardware-button devices".into();
+        }
+        self.sources
+            .iter()
+            .map(|source| source.path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    pub fn next_event(&mut self, timeout: Duration) -> Result<Option<ButtonEvent>> {
+        if self.sources.is_empty() {
+            return Ok(None);
+        }
+        let mut descriptors: Vec<libc::pollfd> = self
+            .sources
+            .iter()
+            .map(|source| libc::pollfd { fd: source.file.as_raw_fd(), events: libc::POLLIN, revents: 0 })
+            .collect();
+        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, timeout_ms) };
+        if result <= 0 {
+            return Ok(None);
+        }
+        for (index, descriptor) in descriptors.iter().enumerate() {
+            if descriptor.revents & libc::POLLIN == 0 {
+                continue;
+            }
+            let mut event = MaybeUninit::<RawInputEvent>::uninit();
+            let bytes = unsafe { slice::from_raw_parts_mut(event.as_mut_ptr().cast::<u8>(), mem::size_of::<RawInputEvent>()) };
+            self.sources[index].file.read_exact(bytes)?;
+            let event = unsafe { event.assume_init() };
+            if event.kind == EV_KEY {
+                return Ok(Some(ButtonEvent {
+                    button: hardware_button_from_code(event.code),
+                    pressed: event.value != 0,
+                    repeated: event.value == 2,
+                }));
+            }
+        }
+        Ok(None)
+    }
+}
+
+pub fn hardware_button_from_code(code: u16) -> HardwareButton {
+    match code {
+        104 | 105 | 193 => HardwareButton::PreviousPage,
+        106 | 109 | 194 => HardwareButton::NextPage,
+        102 => HardwareButton::Home,
+        116 => HardwareButton::Power,
+        142 => HardwareButton::Sleep,
+        other => HardwareButton::Unknown(other),
     }
 }
 

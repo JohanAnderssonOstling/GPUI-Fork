@@ -13,8 +13,11 @@ path = "src/gpui_kobo.rs"
 
 [dependencies]
 anyhow.workspace = true
-gpui = { workspace = true, features = ["test-support"] }
+gpui.workspace = true
 gpui_wgpu.workspace = true
 image.workspace = true
 libc = "0.2"
 parking_lot.workspace = true
+futures.workspace = true
+raw-window-handle = "0.6"
+uuid.workspace = true
