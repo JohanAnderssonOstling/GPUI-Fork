@@ -13,12 +13,23 @@ Supported GPUI primitives are deliberately limited to what the test needs:
 
 - solid quads;
 - monochrome glyph sprites;
-- subpixel glyph sprites converted to grayscale.
+- subpixel glyph sprites converted to grayscale;
+- straight underlines;
+- RGBA polychrome sprites converted to grayscale.
 
-Paths, shadows, images, surfaces, kinetic gestures, and production platform
-integration remain out of scope. `gpui_wgpu::CosmicTextSystem` is reused for
+Paths, shadows, surfaces, transformed sprites, wavy underlines, kinetic
+gestures, and production platform integration remain out of scope.
+`gpui_wgpu::CosmicTextSystem` is reused for
 text shaping and glyph rasterization only; presentation remains CPU-only and
 does not require a GPU or system fonts.
+
+Kobo-specific behavior is explicit backend policy:
+
+- `ScreenGeometry` parses FBInk viewport, panel size, origin, rotation, and device identity;
+- touch coordinates support inferred axis swapping and a `GPUI_KOBO_TOUCH_TRANSFORM=swap,invert-x,invert-y` override;
+- gestures are classified only at finger release, preserving the no-render-during-drag guard;
+- scroll releases use one A2 damage update, other changes use partial GC16, and cleanup uses full GC16 after six fast updates or three accumulated screen areas;
+- `--self-test --no-display` checks geometry, gesture and refresh policy, text rasterization, repaint suppression, damage bounds, and EXIT behavior before Nickel is stopped.
 
 ## Host smoke run
 
@@ -67,8 +78,8 @@ The launcher:
 1. records whether Nickel was running;
 2. stops Nickel and other framebuffer-owning reader processes;
 3. renders and displays the GPUI text library through FBInk using full GC16;
-4. routes touch drags through GPUI scrolling and presents pixel-derived damage
-   rectangles with partial A2 refreshes;
+4. routes touch drags through GPUI scrolling and presents one pixel-derived A2
+   damage update on release, with count- and area-triggered full GC16 cleanup;
 5. exits through the GPUI EXIT control or after 45 seconds;
 6. restarts Nickel even when the test command fails or is terminated.
 

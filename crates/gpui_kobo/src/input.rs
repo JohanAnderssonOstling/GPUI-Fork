@@ -81,6 +81,85 @@ pub struct MappedTouch {
     pub y: f32,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TouchTransform {
+    pub swap_axes: bool,
+    pub invert_x: bool,
+    pub invert_y: bool,
+}
+
+impl TouchTransform {
+    pub fn parse(value: &str) -> Result<Self> {
+        let mut transform = Self::default();
+        for token in value.split(',').map(str::trim).filter(|token| !token.is_empty()) {
+            match token {
+                "none" => transform = Self::default(),
+                "swap" => transform.swap_axes = true,
+                "invert-x" => transform.invert_x = true,
+                "invert-y" => transform.invert_y = true,
+                unknown => bail!("unknown touch transform `{unknown}`"),
+            }
+        }
+        Ok(transform)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Gesture {
+    Tap { x: f32, y: f32 },
+    Swipe { dx: f32, dy: f32 },
+}
+
+#[derive(Debug)]
+pub struct GestureTracker {
+    start: Option<(f32, f32)>,
+    last: Option<(f32, f32)>,
+    threshold: f32,
+}
+
+impl Default for GestureTracker {
+    fn default() -> Self {
+        Self::new(24.0)
+    }
+}
+
+impl GestureTracker {
+    pub fn new(threshold: f32) -> Self {
+        Self {
+            start: None,
+            last: None,
+            threshold,
+        }
+    }
+
+    pub fn observe(&mut self, event: MappedTouch) -> Option<Gesture> {
+        let point = (event.x, event.y);
+        match event.phase {
+            TouchPhase::Down => {
+                self.start = Some(point);
+                self.last = Some(point);
+                None
+            }
+            TouchPhase::Move => {
+                self.last = Some(point);
+                None
+            }
+            TouchPhase::Up => {
+                let start = self.start.take().unwrap_or(point);
+                self.last.take();
+                let end = point;
+                let dx = end.0 - start.0;
+                let dy = end.1 - start.1;
+                if dx.hypot(dy) >= self.threshold {
+                    Some(Gesture::Swipe { dx, dy })
+                } else {
+                    Some(Gesture::Tap { x: point.0, y: point.1 })
+                }
+            }
+        }
+    }
+}
+
 pub struct TouchDevice {
     file: File,
     path: PathBuf,
@@ -160,17 +239,48 @@ impl TouchDevice {
         canvas_width: u32,
         canvas_height: u32,
     ) -> MappedTouch {
+        self.map_to_canvas_with_transform(
+            event,
+            canvas_width,
+            canvas_height,
+            self.inferred_transform(viewport_width, viewport_height),
+        )
+    }
+
+    pub fn inferred_transform(
+        &self,
+        viewport_width: u32,
+        viewport_height: u32,
+    ) -> TouchTransform {
+        TouchTransform {
+            swap_axes: (self.x_axis.span() > self.y_axis.span())
+                != (viewport_width > viewport_height),
+            ..TouchTransform::default()
+        }
+    }
+
+    pub fn map_to_canvas_with_transform(
+        &self,
+        event: TouchEvent,
+        canvas_width: u32,
+        canvas_height: u32,
+        transform: TouchTransform,
+    ) -> MappedTouch {
         let mut x = self.x_axis.normalize(event.raw_x);
         let mut y = self.y_axis.normalize(event.raw_y);
-        let raw_is_landscape = self.x_axis.span() > self.y_axis.span();
-        let viewport_is_landscape = viewport_width > viewport_height;
-        if raw_is_landscape != viewport_is_landscape {
+        if transform.swap_axes {
             mem::swap(&mut x, &mut y);
+        }
+        if transform.invert_x {
+            x = 1.0 - x;
+        }
+        if transform.invert_y {
+            y = 1.0 - y;
         }
         MappedTouch {
             phase: event.phase,
-            x: x * canvas_width as f32,
-            y: y * canvas_height as f32,
+            x: x * canvas_width.saturating_sub(1) as f32,
+            y: y * canvas_height.saturating_sub(1) as f32,
         }
     }
 

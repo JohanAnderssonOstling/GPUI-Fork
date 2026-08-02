@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail, ensure};
 use gpui_kobo::{
-    ButtonRenderSession, CANVAS_HEIGHT, CANVAS_WIDTH, FrameUpdate, PixelRect, TouchDevice,
-    TouchPhase, damage_image, write_pgm,
+    ButtonRenderSession, CANVAS_HEIGHT, CANVAS_WIDTH, FrameUpdate, Gesture, GestureTracker,
+    MappedTouch, RefreshMode, RefreshPolicy, ScreenGeometry, TouchDevice, TouchPhase,
+    TouchTransform, damage_image, rgba8_to_grayscale, write_pgm,
 };
 use image::RgbaImage;
 
@@ -21,12 +22,6 @@ struct Options {
     interactive: bool,
     self_test: bool,
     timeout: Duration,
-}
-
-#[derive(Clone, Copy)]
-struct Viewport {
-    width: u32,
-    height: u32,
 }
 
 fn main() -> Result<()> {
@@ -52,18 +47,107 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let viewport = query_viewport(&options.fbink)?;
+    let geometry = query_geometry(&options.fbink)?;
+    println!("display: {}", geometry.description());
     present_full(&options.fbink, &options.output)?;
     print_render_result(&image, &options.output);
 
     if options.interactive {
-        run_interactive(&options, viewport, &mut session)?;
+        run_interactive(&options, geometry, &mut session)?;
     }
     Ok(())
 }
 
 fn run_self_test() -> Result<()> {
     let started = Instant::now();
+
+    let geometry = ScreenGeometry::from_fbink_state(
+        "viewWidth=600;viewHeight=800;screenWidth=758;screenHeight=1024;\
+         viewHoriOrigin=0;viewVertOrigin=42;currentRota=1;\
+         deviceName='Kobo Test';deviceCodename='kraken';",
+    )
+    .context("SELFTEST FAIL FBInk geometry parser")?;
+    ensure!(
+        geometry.view_width == 600
+            && geometry.view_height == 800
+            && geometry.view_y == 42
+            && geometry.current_rotation == 1,
+        "SELFTEST FAIL FBInk geometry values"
+    );
+    let scaled = geometry.scale_damage(
+        gpui_kobo::PixelRect { x: 10, y: 20, width: 101, height: 51 },
+        300,
+        400,
+    );
+    ensure!(
+        scaled.x == 20 && scaled.y == 40 && scaled.width == 202 && scaled.height == 102,
+        "SELFTEST FAIL damage scaling produced {scaled:?}"
+    );
+    println!("SELFTEST PASS display_geometry {}", geometry.description());
+
+    let transform = TouchTransform::parse("swap,invert-x")
+        .context("SELFTEST FAIL touch transform parser")?;
+    ensure!(
+        transform.swap_axes && transform.invert_x && !transform.invert_y,
+        "SELFTEST FAIL touch transform values"
+    );
+    let mut gestures = GestureTracker::default();
+    gestures.observe(MappedTouch { phase: TouchPhase::Down, x: 300.0, y: 500.0 });
+    gestures.observe(MappedTouch { phase: TouchPhase::Move, x: 300.0, y: 400.0 });
+    let gesture = gestures.observe(MappedTouch {
+        phase: TouchPhase::Up,
+        x: 300.0,
+        y: 300.0,
+    });
+    ensure!(
+        matches!(gesture, Some(Gesture::Swipe { dx, dy }) if dx == 0.0 && dy == -200.0),
+        "SELFTEST FAIL swipe classification: {gesture:?}"
+    );
+    println!("SELFTEST PASS touch_transform_and_gesture gesture={gesture:?}");
+
+    let policy_damage = gpui_kobo::PixelRect { x: 0, y: 100, width: 100, height: 100 };
+    let mut policy = RefreshPolicy::default();
+    ensure!(
+        policy.decide(false, policy_damage, 480_000) == RefreshMode::PartialGray,
+        "SELFTEST FAIL tap refresh mode"
+    );
+    for update_number in 1..6 {
+        ensure!(
+            policy.decide(true, policy_damage, 480_000) == RefreshMode::FastMono,
+            "SELFTEST FAIL fast refresh {update_number}"
+        );
+    }
+    ensure!(
+        policy.decide(true, policy_damage, 480_000) == RefreshMode::FullGray,
+        "SELFTEST FAIL ghosting cleanup refresh"
+    );
+    ensure!(policy.fast_updates() == 0, "SELFTEST FAIL cleanup counter reset");
+    let area_damage = gpui_kobo::PixelRect { x: 0, y: 100, width: 600, height: 600 };
+    let mut area_policy = RefreshPolicy::default();
+    for update_number in 1..4 {
+        ensure!(
+            area_policy.decide(true, area_damage, 480_000) == RefreshMode::FastMono,
+            "SELFTEST FAIL area fast refresh {update_number}"
+        );
+    }
+    ensure!(
+        area_policy.decide(true, area_damage, 480_000) == RefreshMode::FullGray,
+        "SELFTEST FAIL accumulated-area cleanup refresh"
+    );
+    println!("SELFTEST PASS refresh_policy count_cleanup=6 area_cleanup=3_screens");
+
+    let (red_gray, red_alpha) = rgba8_to_grayscale([255, 0, 0, 128], 0.5);
+    let (white_gray, white_alpha) = rgba8_to_grayscale([255, 255, 255, 255], 1.0);
+    ensure!(
+        red_gray == 54 && (red_alpha - 0.250_98).abs() < 0.001,
+        "SELFTEST FAIL RGBA sprite conversion red=({red_gray}, {red_alpha})"
+    );
+    ensure!(
+        white_gray == 255 && white_alpha == 1.0,
+        "SELFTEST FAIL RGBA sprite conversion white=({white_gray}, {white_alpha})"
+    );
+    println!("SELFTEST PASS polychrome_sprite grayscale=54 alpha={red_alpha:.3}");
+
     let mut session = ButtonRenderSession::new().context("SELFTEST FAIL session initialization")?;
     let initialized_ms = started.elapsed().as_millis();
 
@@ -141,18 +225,28 @@ fn run_self_test() -> Result<()> {
 
 fn run_interactive(
     options: &Options,
-    viewport: Viewport,
+    geometry: ScreenGeometry,
     session: &mut ButtonRenderSession,
 ) -> Result<()> {
     let mut touch = TouchDevice::discover()?;
+    let inferred_transform = touch.inferred_transform(geometry.view_width, geometry.view_height);
+    let transform = match env::var("GPUI_KOBO_TOUCH_TRANSFORM") {
+        Ok(value) => TouchTransform::parse(&value)
+            .with_context(|| format!("invalid GPUI_KOBO_TOUCH_TRANSFORM={value}"))?,
+        Err(env::VarError::NotPresent) => inferred_transform,
+        Err(error) => return Err(error).context("reading GPUI_KOBO_TOUCH_TRANSFORM"),
+    };
     println!("touchscreen: {}", touch.description());
     println!(
-        "viewport: {}x{}; drag the GPUI library list and tap EXIT to return",
-        viewport.width, viewport.height
+        "touch transform: swap={} invert_x={} invert_y={}",
+        transform.swap_axes, transform.invert_x, transform.invert_y
     );
+    println!("drag the GPUI library list and tap EXIT to return");
 
     let damage_path = options.output.with_file_name("gpui-kobo-library-damage.pgm");
     let deadline = Instant::now() + options.timeout;
+    let mut gestures = GestureTracker::default();
+    let mut refresh_policy = RefreshPolicy::default();
 
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -164,20 +258,33 @@ fn run_interactive(
             println!("interactive timeout reached");
             break;
         };
-        let mapped = touch.map_to_canvas(
+        let mapped = touch.map_to_canvas_with_transform(
             event,
-            viewport.width,
-            viewport.height,
             CANVAS_WIDTH,
             CANVAS_HEIGHT,
+            transform,
         );
+        let gesture = gestures.observe(mapped);
 
         if let Some(update) = session.dispatch_touch(mapped.phase, mapped.x, mapped.y)? {
-            println!(
-                "GPUI damage: x={} y={} width={} height={}",
-                update.damage.x, update.damage.y, update.damage.width, update.damage.height
+            let scrolling = matches!(gesture, Some(Gesture::Swipe { .. }));
+            let mode = refresh_policy.decide(
+                scrolling,
+                update.damage,
+                u64::from(CANVAS_WIDTH) * u64::from(CANVAS_HEIGHT),
             );
-            render_damage(&update, &options.fbink, &damage_path, viewport)?;
+            println!(
+                "GPUI release: gesture={gesture:?} refresh={mode:?} damage=x:{},y:{},w:{},h:{}",
+                update.damage.x, update.damage.y, update.damage.width, update.damage.height,
+            );
+            render_update(
+                &update,
+                mode,
+                &options.fbink,
+                &options.output,
+                &damage_path,
+                &geometry,
+            )?;
         }
 
         if session.state().exit_requested {
@@ -188,18 +295,24 @@ fn run_interactive(
     Ok(())
 }
 
-fn render_damage(
+fn render_update(
     update: &FrameUpdate,
+    mode: RefreshMode,
     fbink: &Path,
+    full_path: &Path,
     damage_path: &Path,
-    viewport: Viewport,
+    geometry: &ScreenGeometry,
 ) -> Result<()> {
+    if mode == RefreshMode::FullGray {
+        write_pgm(&update.image, full_path)?;
+        return present_full(fbink, full_path);
+    }
     let damage = damage_image(&update.image, update.damage);
     write_pgm(&damage, damage_path)?;
-    present_damage(fbink, damage_path, update.damage, viewport)
+    present_damage(fbink, damage_path, update.damage, geometry, mode)
 }
 
-fn query_viewport(fbink: &Path) -> Result<Viewport> {
+fn query_geometry(fbink: &Path) -> Result<ScreenGeometry> {
     let output = Command::new(fbink)
         .args(["-q", "-e"])
         .output()
@@ -208,19 +321,7 @@ fn query_viewport(fbink: &Path) -> Result<Viewport> {
         bail!("FBInk state query exited with {}", output.status);
     }
     let state = String::from_utf8(output.stdout).context("FBInk state was not UTF-8")?;
-    Ok(Viewport {
-        width: state_value(&state, "viewWidth")?,
-        height: state_value(&state, "viewHeight")?,
-    })
-}
-
-fn state_value(state: &str, name: &str) -> Result<u32> {
-    state
-        .split(';')
-        .find_map(|part| part.strip_prefix(&format!("{name}=")))
-        .ok_or_else(|| anyhow::anyhow!("FBInk state omitted {name}"))?
-        .parse()
-        .with_context(|| format!("FBInk returned an invalid {name}"))
+    ScreenGeometry::from_fbink_state(&state)
 }
 
 fn present_full(fbink: &Path, image: &Path) -> Result<()> {
@@ -235,18 +336,19 @@ fn present_full(fbink: &Path, image: &Path) -> Result<()> {
 fn present_damage(
     fbink: &Path,
     image: &Path,
-    damage: PixelRect,
-    viewport: Viewport,
+    damage: gpui_kobo::PixelRect,
+    geometry: &ScreenGeometry,
+    mode: RefreshMode,
 ) -> Result<()> {
-    let x = damage.x * viewport.width / CANVAS_WIDTH;
-    let y = damage.y * viewport.height / CANVAS_HEIGHT;
-    let width = damage.width * viewport.width / CANVAS_WIDTH;
-    let height = damage.height * viewport.height / CANVAS_HEIGHT;
+    let damage = geometry.scale_damage(damage, CANVAS_WIDTH, CANVAS_HEIGHT);
     run_fbink(
         fbink,
         image,
-        &["-q", "-w", "-W", "A2"],
-        format!("x={x},y={y},w={width},h={height}"),
+        &["-q", "-w", "-W", mode.waveform()],
+        format!(
+            "x={},y={},w={},h={}",
+            damage.x, damage.y, damage.width, damage.height
+        ),
     )
 }
 

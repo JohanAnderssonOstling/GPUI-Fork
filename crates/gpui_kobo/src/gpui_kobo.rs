@@ -13,17 +13,38 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use gpui::{
-    AnyWindowHandle, App, AppContext, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds,
+    AnyWindowHandle, App, AppContext, AssetSource, AtlasKey, AtlasTextureId, AtlasTextureKind,
+    AtlasTile, Bounds,
     ContentMask, Context, DevicePixels, Entity, HeadlessAppContext, Hsla, InteractiveElement,
     IntoElement, MonochromeSprite, MouseButton, MouseUpEvent, ParentElement, PlatformAtlas,
     PlatformHeadlessRenderer, PlatformInput,
-    PlatformTextSystem, PrimitiveBatch, Render, Rgba, Scene, ScrollDelta, ScrollWheelEvent, Size, StatefulInteractiveElement,
-    Styled, SubpixelSprite, TileId, TouchPhase as GpuiTouchPhase, TransformationMatrix, Window, div,
-    point, px, rgb, size,
+    PlatformTextSystem, PolychromeSprite, PrimitiveBatch, Render, Rgba, Scene, ScrollDelta,
+    ScrollWheelEvent, Size, StatefulInteractiveElement, Styled, SubpixelSprite, TileId,
+    TouchPhase as GpuiTouchPhase, TransformationMatrix, Underline, Window, div, point, px,
+    rgb, size, SharedString,
 };
 use gpui_wgpu::CosmicTextSystem;
 use image::{Rgba as ImageRgba, RgbaImage};
 use parking_lot::Mutex;
+
+struct KoboAssets;
+
+impl AssetSource for KoboAssets {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        Ok(match path {
+            "kobo-cover.ppm" => Some(Cow::Borrowed(include_bytes!("../assets/kobo-cover.ppm"))),
+            _ => None,
+        })
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        Ok(if path.is_empty() {
+            vec!["kobo-cover.ppm".into()]
+        } else {
+            Vec::new()
+        })
+    }
+}
 
 #[derive(Clone)]
 struct CpuTile {
@@ -176,8 +197,16 @@ impl KoboRenderer {
                 }
                 PrimitiveBatch::Shadows(range) if range.is_empty() => {}
                 PrimitiveBatch::Paths(range) if range.is_empty() => {}
-                PrimitiveBatch::Underlines(range) if range.is_empty() => {}
-                PrimitiveBatch::PolychromeSprites { range, .. } if range.is_empty() => {}
+                PrimitiveBatch::Underlines(range) => {
+                    for underline in &scene.underlines[range] {
+                        self.draw_underline(&mut target, underline)?;
+                    }
+                }
+                PrimitiveBatch::PolychromeSprites { range, .. } => {
+                    for sprite in &scene.polychrome_sprites[range] {
+                        self.draw_polychrome_sprite(&mut target, sprite)?;
+                    }
+                }
                 PrimitiveBatch::Surfaces(range) if range.is_empty() => {}
                 unsupported => bail!("unsupported GPUI primitive batch in Kobo spike: {unsupported:?}"),
             }
@@ -228,6 +257,78 @@ impl KoboRenderer {
             &tile,
             true,
         )
+    }
+
+    fn draw_underline(&self, target: &mut RgbaImage, underline: &Underline) -> Result<()> {
+        if underline.wavy != 0 {
+            bail!("Kobo spike does not support wavy underlines");
+        }
+        fill_rect(target, underline.bounds, underline.content_mask, underline.color);
+        Ok(())
+    }
+
+    fn draw_polychrome_sprite(
+        &self,
+        target: &mut RgbaImage,
+        sprite: &PolychromeSprite,
+    ) -> Result<()> {
+        let tile = self
+            .atlas
+            .pixels(sprite.tile.tile_id)
+            .ok_or_else(|| anyhow::anyhow!("image references a missing CPU atlas tile"))?;
+        let source_width = usize::try_from(tile.size.width.0.max(0))?;
+        let source_height = usize::try_from(tile.size.height.0.max(0))?;
+        if tile.bytes.len() != source_width.saturating_mul(source_height).saturating_mul(4) {
+            bail!("polychrome atlas tile is not RGBA8");
+        }
+
+        let left = sprite.bounds.origin.x.0.floor().max(0.0) as u32;
+        let top = sprite.bounds.origin.y.0.floor().max(0.0) as u32;
+        let right = (sprite.bounds.origin.x.0 + sprite.bounds.size.width.0)
+            .ceil()
+            .min(target.width() as f32) as u32;
+        let bottom = (sprite.bounds.origin.y.0 + sprite.bounds.size.height.0)
+            .ceil()
+            .min(target.height() as f32) as u32;
+        let mask_left = sprite.content_mask.bounds.origin.x.0.floor().max(0.0) as u32;
+        let mask_top = sprite.content_mask.bounds.origin.y.0.floor().max(0.0) as u32;
+        let mask_right = (sprite.content_mask.bounds.origin.x.0
+            + sprite.content_mask.bounds.size.width.0)
+            .ceil()
+            .min(target.width() as f32) as u32;
+        let mask_bottom = (sprite.content_mask.bounds.origin.y.0
+            + sprite.content_mask.bounds.size.height.0)
+            .ceil()
+            .min(target.height() as f32) as u32;
+        let width = sprite.bounds.size.width.0.max(1.0);
+        let height = sprite.bounds.size.height.0.max(1.0);
+
+        for y in top.max(mask_top)..bottom.min(mask_bottom) {
+            for x in left.max(mask_left)..right.min(mask_right) {
+                let source_x = (((x as f32 - sprite.bounds.origin.x.0) / width)
+                    * source_width as f32)
+                    .floor()
+                    .clamp(0.0, source_width.saturating_sub(1) as f32)
+                    as usize;
+                let source_y = (((y as f32 - sprite.bounds.origin.y.0) / height)
+                    * source_height as f32)
+                    .floor()
+                    .clamp(0.0, source_height.saturating_sub(1) as f32)
+                    as usize;
+                let offset = (source_y * source_width + source_x) * 4;
+                let rgba = &tile.bytes[offset..offset + 4];
+                let (gray, alpha) = rgba8_to_grayscale(
+                    [rgba[0], rgba[1], rgba[2], rgba[3]],
+                    sprite.opacity,
+                );
+                blend_gray(
+                    target.get_pixel_mut(x, y),
+                    gray,
+                    alpha,
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -287,7 +388,7 @@ impl ButtonRenderSession {
 
         let mut app = HeadlessAppContext::with_platform(
             text_system,
-            Arc::new(()),
+            Arc::new(KoboAssets),
             || Some(Box::new(KoboRenderer::new())),
         );
         let mut view = None;
@@ -650,12 +751,28 @@ fn grayscale(color: Hsla) -> (u8, f32) {
     ((luminance.clamp(0.0, 1.0) * 255.0).round() as u8, rgba.a)
 }
 
+/// Convert an RGBA8 sprite sample into the grayscale intensity and effective alpha
+/// consumed by the Kobo CPU renderer.
+pub fn rgba8_to_grayscale(rgba: [u8; 4], opacity: f32) -> (u8, f32) {
+    let luminance = 0.2126 * rgba[0] as f32
+        + 0.7152 * rgba[1] as f32
+        + 0.0722 * rgba[2] as f32;
+    (
+        luminance.round().clamp(0.0, 255.0) as u8,
+        rgba[3] as f32 / 255.0 * opacity.clamp(0.0, 1.0),
+    )
+}
+
 fn blend_gray(pixel: &mut ImageRgba<u8>, gray: u8, alpha: f32) {
     let alpha = alpha.clamp(0.0, 1.0);
     let current = f32::from(pixel.0[0]);
     let blended = (f32::from(gray) * alpha + current * (1.0 - alpha)).round() as u8;
     *pixel = ImageRgba([blended, blended, blended, 255]);
 }
+mod display;
 mod input;
+mod refresh;
 
+pub use display::*;
 pub use input::*;
+pub use refresh::*;
