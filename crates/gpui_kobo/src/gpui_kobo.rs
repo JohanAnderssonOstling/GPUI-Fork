@@ -15,11 +15,13 @@ use anyhow::{Result, bail};
 use gpui::{
     AnyWindowHandle, App, AppContext, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds,
     ContentMask, Context, DevicePixels, Entity, HeadlessAppContext, Hsla, InteractiveElement,
-    IntoElement, Modifiers, MonochromeSprite, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, NoopTextSystem, ParentElement, PlatformAtlas, PlatformHeadlessRenderer,
-    PlatformInput, PrimitiveBatch, Render, Rgba, Scene, Size, Styled, SubpixelSprite, TileId,
-    TransformationMatrix, Window, div, point, px, rgb, size,
+    IntoElement, MonochromeSprite, MouseButton, MouseUpEvent, ParentElement, PlatformAtlas,
+    PlatformHeadlessRenderer, PlatformInput,
+    PlatformTextSystem, PrimitiveBatch, Render, Rgba, Scene, ScrollDelta, ScrollWheelEvent, Size, StatefulInteractiveElement,
+    Styled, SubpixelSprite, TileId, TouchPhase as GpuiTouchPhase, TransformationMatrix, Window, div,
+    point, px, rgb, size,
 };
+use gpui_wgpu::CosmicTextSystem;
 use image::{Rgba as ImageRgba, RgbaImage};
 use parking_lot::Mutex;
 
@@ -130,22 +132,6 @@ pub struct PixelRect {
     pub width: u32,
     pub height: u32,
 }
-
-impl PixelRect {
-    pub fn contains(self, x: f32, y: f32) -> bool {
-        x >= self.x as f32
-            && y >= self.y as f32
-            && x < (self.x + self.width) as f32
-            && y < (self.y + self.height) as f32
-    }
-}
-
-pub const BUTTON_DAMAGE: PixelRect = PixelRect {
-    x: 80,
-    y: 336,
-    width: 440,
-    height: 128,
-};
 
 impl Default for KoboRenderer {
     fn default() -> Self {
@@ -263,35 +249,44 @@ impl PlatformHeadlessRenderer for KoboRenderer {
     }
 }
 
-/// Render the deployable one-button feasibility scene through GPUI.
-///
-/// The logical 300 by 400 canvas is rendered at GPUI's test display scale,
-/// producing a 600 by 800 grayscale image that FBInk can scale to the device's
-/// current viewport. The label is made from quads so the device binary does not
-/// depend on a desktop font stack or GPU renderer.
+/// Render the deployable library feasibility scene through GPUI.
 pub fn render_button_test_image() -> Result<RgbaImage> {
     ButtonRenderSession::new()?.capture()
 }
 
-/// Retains the GPUI application, window, and view for the lifetime of the Kobo
-/// input smoke test.
+/// A complete CPU-rendered frame update and the exact pixel bounds that changed.
+pub struct FrameUpdate {
+    pub image: RgbaImage,
+    pub damage: PixelRect,
+}
+
+/// Retains the GPUI application, window, view, prior framebuffer, and touch-drag
+/// state for the lifetime of the Kobo test.
 pub struct ButtonRenderSession {
     window: AnyWindowHandle,
     view: Entity<ButtonTestView>,
     app: HeadlessAppContext,
+    render_count: u64,
+    previous_frame: Option<RgbaImage>,
+    last_touch_position: Option<(f32, f32)>,
+    pending_scroll_y: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ButtonRenderState {
-    pub pressed: bool,
-    pub activated: bool,
     pub exit_requested: bool,
 }
 
 impl ButtonRenderSession {
     pub fn new() -> Result<Self> {
+        let text_system = Arc::new(CosmicTextSystem::new_without_system_fonts("Lilex"));
+        text_system.add_fonts(vec![
+            Cow::Borrowed(include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf")),
+            Cow::Borrowed(include_bytes!("../../../assets/fonts/lilex/Lilex-Bold.ttf")),
+        ])?;
+
         let mut app = HeadlessAppContext::with_platform(
-            Arc::new(NoopTextSystem::new()),
+            text_system,
             Arc::new(()),
             || Some(Box::new(KoboRenderer::new())),
         );
@@ -304,20 +299,34 @@ impl ButtonRenderSession {
         app.run_until_parked();
 
         Ok(Self {
-            app,
             window: window.into(),
             view: view.expect("GPUI window builder did not create its root view"),
+            app,
+            render_count: 0,
+            previous_frame: None,
+            last_touch_position: None,
+            pending_scroll_y: 0.0,
         })
     }
 
+    fn render_current(&mut self) -> Result<RgbaImage> {
+        let image = self.app.capture_screenshot(self.window.clone())?;
+        self.render_count = self.render_count.saturating_add(1);
+        Ok(image)
+    }
+
     pub fn capture(&mut self) -> Result<RgbaImage> {
-        self.app.capture_screenshot(self.window.clone())
+        let image = self.render_current()?;
+        self.previous_frame = Some(image.clone());
+        Ok(image)
+    }
+
+    pub fn render_count(&self) -> u64 {
+        self.render_count
     }
 
     pub fn state(&self) -> ButtonRenderState {
         self.app.read_entity(&self.view, |view, _| ButtonRenderState {
-            pressed: view.pressed.is_some(),
-            activated: view.activated,
             exit_requested: view.exit_requested,
         })
     }
@@ -327,51 +336,112 @@ impl ButtonRenderSession {
         phase: TouchPhase,
         canvas_x: f32,
         canvas_y: f32,
-    ) -> Result<Option<RgbaImage>> {
-        let before = self.state();
-        let position = point(px(canvas_x / 2.0), px(canvas_y / 2.0));
-        let input = match phase {
-            TouchPhase::Down => PlatformInput::MouseDown(MouseDownEvent {
-                button: MouseButton::Left,
-                position,
-                click_count: 1,
-                ..Default::default()
-            }),
-            TouchPhase::Move => PlatformInput::MouseMove(MouseMoveEvent {
-                position,
-                pressed_button: before.pressed.then_some(MouseButton::Left),
-                modifiers: Modifiers::default(),
-            }),
-            TouchPhase::Up => PlatformInput::MouseUp(MouseUpEvent {
-                button: MouseButton::Left,
-                position,
-                click_count: 1,
-                ..Default::default()
-            }),
-        };
+    ) -> Result<Option<FrameUpdate>> {
+        let logical_x = canvas_x / 2.0;
+        let logical_y = canvas_y / 2.0;
+
+        match phase {
+            TouchPhase::Down => {
+                self.last_touch_position = Some((logical_x, logical_y));
+                self.pending_scroll_y = 0.0;
+                return Ok(None);
+            }
+            TouchPhase::Move => {
+                if let Some((_, previous_y)) = self.last_touch_position {
+                    self.pending_scroll_y += logical_y - previous_y;
+                }
+                self.last_touch_position = Some((logical_x, logical_y));
+                return Ok(None);
+            }
+            TouchPhase::Up => {}
+        }
+
+        if let Some((_, previous_y)) = self.last_touch_position {
+            self.pending_scroll_y += logical_y - previous_y;
+        }
+        let scroll_y = self.pending_scroll_y;
+        self.last_touch_position = None;
+        self.pending_scroll_y = 0.0;
+
+        let position = point(px(logical_x), px(logical_y));
+        let scrolled = scroll_y.abs() >= 1.0;
         self.app.update_window(self.window.clone(), |_, window, cx| {
-            window.dispatch_event(input, cx);
+            if scrolled {
+                window.dispatch_event(
+                    PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Pixels(point(px(0.0), px(scroll_y))),
+                        touch_phase: GpuiTouchPhase::Ended,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            }
+            window.dispatch_event(
+                PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position,
+                    click_count: 1,
+                    ..Default::default()
+                }),
+                cx,
+            );
         })?;
         self.app.run_until_parked();
-        (self.state() != before).then(|| self.capture()).transpose()
+
+        if self.state().exit_requested || !scrolled {
+            return Ok(None);
+        }
+
+        let image = self.render_current()?;
+        let damage = self
+            .previous_frame
+            .as_ref()
+            .and_then(|previous| changed_pixel_bounds(previous, &image));
+        self.previous_frame = Some(image.clone());
+        Ok(damage.map(|damage| FrameUpdate { image, damage }))
     }
 }
 
-pub fn button_damage_image(image: &RgbaImage) -> RgbaImage {
-    image::imageops::crop_imm(
-        image,
-        BUTTON_DAMAGE.x,
-        BUTTON_DAMAGE.y,
-        BUTTON_DAMAGE.width,
-        BUTTON_DAMAGE.height,
-    )
-    .to_image()
+pub fn changed_pixel_bounds(before: &RgbaImage, after: &RgbaImage) -> Option<PixelRect> {
+    if before.dimensions() != after.dimensions() {
+        return Some(PixelRect {
+            x: 0,
+            y: 0,
+            width: after.width(),
+            height: after.height(),
+        });
+    }
+
+    let mut min_x = after.width();
+    let mut min_y = after.height();
+    let mut max_x = 0;
+    let mut max_y = 0;
+    let mut changed = false;
+    for y in 0..after.height() {
+        for x in 0..after.width() {
+            if before.get_pixel(x, y) != after.get_pixel(x, y) {
+                changed = true;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    changed.then_some(PixelRect {
+        x: min_x,
+        y: min_y,
+        width: max_x - min_x + 1,
+        height: max_y - min_y + 1,
+    })
+}
+
+pub fn damage_image(image: &RgbaImage, damage: PixelRect) -> RgbaImage {
+    image::imageops::crop_imm(image, damage.x, damage.y, damage.width, damage.height).to_image()
 }
 
 /// Write an RGBA grayscale render as a binary PGM image.
-///
-/// PGM keeps the on-device executable independent from an image encoder and is
-/// one of the image formats accepted by image-enabled FBInk builds.
 pub fn write_pgm(image: &RgbaImage, path: impl AsRef<Path>) -> Result<()> {
     let mut writer = BufWriter::new(File::create(path.as_ref())?);
     write!(writer, "P5\n{} {}\n255\n", image.width(), image.height())?;
@@ -382,116 +452,108 @@ pub fn write_pgm(image: &RgbaImage, path: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
+const BOOK_TITLES: [&str; 16] = [
+    "The Left Hand of Darkness",
+    "A Wizard of Earthsea",
+    "The Dispossessed",
+    "Kindred",
+    "The Fifth Season",
+    "Invisible Cities",
+    "The Name of the Rose",
+    "The Book of Disquiet",
+    "The Master and Margarita",
+    "The Memory Police",
+    "Drive Your Plow Over the Bones",
+    "The City and the City",
+    "The Remains of the Day",
+    "Piranesi",
+    "The Employees",
+    "We Have Always Lived Here",
+];
+
 #[derive(Default)]
 struct ButtonTestView {
-    pressed: Option<TestControl>,
-    activated: bool,
     exit_requested: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TestControl {
-    Toggle,
-    Exit,
-}
-
 impl Render for ButtonTestView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let white = rgb(0xffffff);
         let black = rgb(0x181818);
-        let (button_color, bar_color) = if self.pressed == Some(TestControl::Toggle) {
-            (white, black)
-        } else {
-            (black, white)
-        };
-        let (exit_color, exit_mark_color) = if self.pressed == Some(TestControl::Exit) {
-            (white, black)
-        } else {
-            (black, white)
-        };
-        let bar_heights = if self.activated {
-            [34.0, 25.0, 16.0]
-        } else {
-            [16.0, 25.0, 34.0]
-        };
+        let paper = rgb(0xf3f0e8);
+        let alternate = rgb(0xe4e0d6);
+
         div()
             .flex()
-            .items_center()
-            .justify_center()
+            .flex_col()
             .w_full()
             .h_full()
-            .bg(white)
+            .bg(paper)
+            .font_family("Lilex")
+            .text_color(black)
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .justify_center()
-                    .gap(px(12.0))
+                    .justify_between()
+                    .w_full()
+                    .h(px(54.0))
+                    .px(px(14.0))
+                    .bg(black)
+                    .text_color(white)
+                    .text_size(px(18.0))
+                    .child("KOBO LIBRARY")
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .justify_center()
-                            .w(px(150.0))
-                            .h(px(64.0))
-                            .bg(button_color)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                _cx.listener(|view, _, _, cx| {
-                                    view.pressed = Some(TestControl::Toggle);
-                                    cx.notify();
-                                }),
-                            )
+                            .w(px(62.0))
+                            .h(px(34.0))
+                            .bg(black)
+                            .text_color(white)
+                            .text_size(px(14.0))
+                            .child("EXIT")
                             .on_mouse_up(
                                 MouseButton::Left,
-                                _cx.listener(|view, _, _, cx| {
-                                    if view.pressed == Some(TestControl::Toggle) {
-                                        view.activated = !view.activated;
-                                    }
-                                    view.pressed = None;
+                                cx.listener(|view, _, _, cx| {
+                                    view.exit_requested = true;
                                     cx.notify();
                                 }),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_end()
-                                    .gap(px(5.0))
-                                    .child(div().w(px(10.0)).h(px(bar_heights[0])).bg(bar_color))
-                                    .child(div().w(px(10.0)).h(px(bar_heights[1])).bg(bar_color))
-                                    .child(div().w(px(10.0)).h(px(bar_heights[2])).bg(bar_color)),
                             ),
-                    )
-                    .child(
+                    ),
+            )
+            .child(
+                div()
+                    .id("kobo-library-list")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .w_full()
+                    .overflow_y_scroll()
+                    .children(BOOK_TITLES.iter().enumerate().map(|(index, title)| {
                         div()
                             .flex()
-                            .items_end()
-                            .justify_center()
-                            .gap(px(7.0))
-                            .w(px(54.0))
-                            .h(px(64.0))
-                            .pb(px(17.0))
-                            .bg(exit_color)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                _cx.listener(|view, _, _, cx| {
-                                    view.pressed = Some(TestControl::Exit);
-                                    cx.notify();
-                                }),
-                            )
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                _cx.listener(|view, _, _, cx| {
-                                    if view.pressed == Some(TestControl::Exit) {
-                                        view.exit_requested = true;
-                                    }
-                                    view.pressed = None;
-                                    cx.notify();
-                                }),
-                            )
-                            .child(div().w(px(8.0)).h(px(30.0)).bg(exit_mark_color))
-                            .child(div().w(px(8.0)).h(px(30.0)).bg(exit_mark_color)),
-                    ),
+                            .items_center()
+                            .w_full()
+                            .h(px(48.0))
+                            .px(px(16.0))
+                            .bg(if index % 2 == 0 { white } else { alternate })
+                            .text_size(px(14.0))
+                            .child(format!("{:02}  {title}", index + 1))
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w_full()
+                    .h(px(28.0))
+                    .bg(black)
+                    .text_color(white)
+                    .text_size(px(10.0))
+                    .child("DRAG TO SCROLL | TAP EXIT"),
             )
     }
 }

@@ -32,6 +32,11 @@ trap restart_nickel 0 1 2 15
     cd "$WORKDIR" || exit 1
     chmod +x gpui-kobo-button fbink
 
+    if ! "$WORKDIR/gpui-kobo-button" --self-test --no-display; then
+        printf '[%s] GPUI Kobo self-test failed; leaving Nickel running\n' "$(date)"
+        exit 1
+    fi
+
     if [ "$NICKEL_WAS_RUNNING" -eq 1 ]; then
         sync
         killall -TERM nickel hindenburg sickel fickel adobehost foxitpdf iink \

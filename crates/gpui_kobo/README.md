@@ -1,12 +1,13 @@
 # gpui_kobo
 
-Deployable feasibility test for determining whether GPUI can support a Kobo
-framebuffer backend. This is intentionally one rendered button, not a Kobo
-application or a complete GPUI platform.
+Deployable feasibility backend for determining whether GPUI can support Kobo
+e-readers. This remains a focused backend test, not a Kobo reader application.
 
-The test uses GPUI's headless platform to lay out a real GPUI view and a small
-CPU renderer to rasterize its scene. The ARM executable writes a grayscale PGM
-and invokes a separately bundled FBInk CLI to present it on e-ink hardware.
+The test retains a real GPUI view, shapes an embedded Lilex font with GPUI's
+Cosmic text system, and rasterizes the scene with a small CPU renderer. Raw
+evdev touch drags become GPUI mouse and scroll events. Consecutive GPUI frames
+are diffed to derive the exact damage rectangle sent to the separately bundled
+FBInk CLI.
 
 Supported GPUI primitives are deliberately limited to what the test needs:
 
@@ -14,9 +15,10 @@ Supported GPUI primitives are deliberately limited to what the test needs:
 - monochrome glyph sprites;
 - subpixel glyph sprites converted to grayscale.
 
-Paths, shadows, images, surfaces, continuous event handling, and production
-platform integration remain out of scope. The test icon is made from GPUI quads
-so the device build does not require `gpui_wgpu`, a GPU, or system fonts.
+Paths, shadows, images, surfaces, kinetic gestures, and production platform
+integration remain out of scope. `gpui_wgpu::CosmicTextSystem` is reused for
+text shaping and glyph rasterization only; presentation remains CPU-only and
+does not require a GPU or system fonts.
 
 ## Host smoke run
 
@@ -43,7 +45,9 @@ target/gpui-kobo/gpui-kobo-test-armv7.tar.gz
 ```
 
 Both external downloads are SHA-256 pinned. The package includes FBInk's exact
-source archive and GPLv3 license alongside its static CLI binary.
+source archive and GPLv3 license alongside its static CLI binary. Lilex Regular
+and Bold are embedded in the executable and its SIL Open Font License is also
+included.
 
 ## Transfer over USB
 
@@ -62,9 +66,11 @@ The launcher:
 
 1. records whether Nickel was running;
 2. stops Nickel and other framebuffer-owning reader processes;
-3. renders and displays the GPUI button through FBInk using a full GC16 refresh;
-4. leaves the result visible for 15 seconds;
-5. restarts Nickel even when the test command fails or is terminated.
+3. renders and displays the GPUI text library through FBInk using full GC16;
+4. routes touch drags through GPUI scrolling and presents pixel-derived damage
+   rectangles with partial A2 refreshes;
+5. exits through the GPUI EXIT control or after 45 seconds;
+6. restarts Nickel even when the test command fails or is terminated.
 
 Diagnostics are appended to:
 
@@ -103,12 +109,24 @@ and license. FBInk is built with:
 ```sh
 make static MINIMAL=1 BITMAP=1 IMAGE=1 LDFLAGS=-static
 ```
-## Interactive touch test
+## Interactive backend test
 
-The packaged launcher now opens a limited interactive smoke test. It discovers
-the Kobo touchscreen through `/dev/input/event*`, maps its absolute coordinates
-to the 600 by 800 GPUI test canvas, and asks FBInk to refresh only the button
-damage rectangle in A2 mode. The first button tap latches a changed bar pattern;
-the second exits and restarts Nickel. If input discovery or a tap fails, the
-launcher recovers after 45 seconds. Override that fallback with
-`GPUI_KOBO_TIMEOUT_SECONDS`.
+The packaged launcher discovers the Kobo touchscreen through
+`/dev/input/event*`, maps its absolute coordinates to the 600 by 800 GPUI test
+canvas, and displays a text library with more rows than fit on screen. Drag the
+list upward and downward to exercise GPUI-native scrolling. Every rendered
+frame is compared with the previous one, and FBInk receives only the resulting
+changed-pixel bounds. Tap EXIT to restart Nickel. If input discovery or touch
+handling fails, the launcher recovers after 45 seconds; override that fallback
+with `GPUI_KOBO_TIMEOUT_SECONDS`.
+
+## Automated device preflight
+
+Before stopping Nickel, the launcher runs a headless on-device self-test. It
+uses synthetic touch input and fails the launch if embedded text does not
+rasterize, touch-down or touch-move causes a render, finger-up causes anything
+other than one render, scroll damage escapes the list viewport, or EXIT hit
+testing requires a framebuffer update. The log records structured `SELFTEST
+PASS` lines with render counts, damage bounds, and timings. This keeps routine
+device testing log-driven; manual checks are limited to visual quality and one
+physical swipe.

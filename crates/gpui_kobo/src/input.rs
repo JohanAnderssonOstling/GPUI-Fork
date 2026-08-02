@@ -275,7 +275,7 @@ fn axis_pair(fd: libc::c_int, x_code: u16, y_code: u16) -> Option<(AxisInfo, Axi
 fn abs_info(fd: libc::c_int, code: u16) -> Option<RawAbsInfo> {
     let mut info = RawAbsInfo::default();
     let request = ioctl_read_request(b'E', 0x40 + code as u8, mem::size_of::<RawAbsInfo>());
-    let result = unsafe { libc::ioctl(fd, request as libc::c_int, &mut info) };
+    let result = unsafe { libc::ioctl(fd, request as _, &mut info) };
     (result >= 0).then_some(info)
 }
 

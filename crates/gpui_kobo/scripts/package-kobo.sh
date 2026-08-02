@@ -73,6 +73,8 @@ STRIP="$TOOLCHAIN_ROOT/bin/armv7l-linux-musleabihf-strip"
 cp "$CRATE_DIR/kobo/run.sh" "$PACKAGE_ROOT/.adds/gpui-kobo/run.sh"
 cp "$CRATE_DIR/kobo/nickelmenu" "$PACKAGE_ROOT/.adds/nm/gpui-kobo"
 cp "$REPO_ROOT/LICENSE-APACHE" "$PACKAGE_ROOT/.adds/gpui-kobo/LICENSE-APACHE"
+cp "$REPO_ROOT/assets/fonts/lilex/OFL.txt" \
+    "$PACKAGE_ROOT/.adds/gpui-kobo/LICENSE-LILEX-OFL.txt"
 cp "$FBINK_SOURCE_ROOT/LICENSE" "$PACKAGE_ROOT/.adds/gpui-kobo/LICENSE-FBINK-GPLv3"
 cp "$FBINK_ARCHIVE" \
     "$PACKAGE_ROOT/.adds/gpui-kobo/third-party-source/$FBINK_ARCHIVE_NAME"
@@ -82,6 +84,7 @@ GPUI fork commit: $(git -C "$REPO_ROOT" rev-parse HEAD)
 FBInk version: $FBINK_VERSION
 FBInk source SHA-256: $FBINK_SHA256
 FBInk build: make static MINIMAL=1 BITMAP=1 IMAGE=1 LDFLAGS=-static
+Embedded font: Lilex Regular and Bold (SIL Open Font License 1.1)
 EOF
 
 tar -czf "$ARCHIVE" -C "$PACKAGE_ROOT" .

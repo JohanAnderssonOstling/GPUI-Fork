@@ -2,17 +2,16 @@ use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use gpui_kobo::{
-    BUTTON_DAMAGE, ButtonRenderSession, CANVAS_HEIGHT, CANVAS_WIDTH, TouchDevice,
-    button_damage_image, write_pgm,
+    ButtonRenderSession, CANVAS_HEIGHT, CANVAS_WIDTH, FrameUpdate, PixelRect, TouchDevice,
+    TouchPhase, damage_image, write_pgm,
 };
 use image::RgbaImage;
 
-const DEFAULT_OUTPUT: &str = "/tmp/gpui-kobo-button.pgm";
+const DEFAULT_OUTPUT: &str = "/tmp/gpui-kobo-library.pgm";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 45;
 
 struct Options {
@@ -20,6 +19,7 @@ struct Options {
     fbink: PathBuf,
     display: bool,
     interactive: bool,
+    self_test: bool,
     timeout: Duration,
 }
 
@@ -33,6 +33,9 @@ fn main() -> Result<()> {
     let Some(options) = parse_options()? else {
         return Ok(());
     };
+    if options.self_test {
+        return run_self_test();
+    }
     if options.interactive && !options.display {
         bail!("--interactive cannot be combined with --no-display");
     }
@@ -40,7 +43,7 @@ fn main() -> Result<()> {
     let mut session = ButtonRenderSession::new()?;
     let image = session
         .capture()
-        .context("GPUI failed to render the initial button scene")?;
+        .context("GPUI failed to render the initial library scene")?;
     write_pgm(&image, &options.output)
         .with_context(|| format!("failed to write {}", options.output.display()))?;
 
@@ -59,6 +62,83 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn run_self_test() -> Result<()> {
+    let started = Instant::now();
+    let mut session = ButtonRenderSession::new().context("SELFTEST FAIL session initialization")?;
+    let initialized_ms = started.elapsed().as_millis();
+
+    let render_started = Instant::now();
+    let initial = session.capture().context("SELFTEST FAIL initial text render")?;
+    let initial_render_ms = render_started.elapsed().as_millis();
+    let antialiased_pixels = initial
+        .pixels()
+        .filter(|pixel| !matches!(pixel.0[0], 24 | 224 | 240 | 255))
+        .count();
+    ensure!(
+        antialiased_pixels > 100,
+        "SELFTEST FAIL text rasterization produced only {antialiased_pixels} antialiased pixels"
+    );
+    println!(
+        "SELFTEST PASS text_rasterization antialiased_pixels={antialiased_pixels} init_ms={initialized_ms} initial_render_ms={initial_render_ms}"
+    );
+
+    let renders_before_drag = session.render_count();
+    ensure!(
+        session.dispatch_touch(TouchPhase::Down, 300.0, 500.0)?.is_none(),
+        "SELFTEST FAIL touch-down produced a frame"
+    );
+    ensure!(
+        session.dispatch_touch(TouchPhase::Move, 300.0, 420.0)?.is_none(),
+        "SELFTEST FAIL first touch-move produced a frame"
+    );
+    ensure!(
+        session.dispatch_touch(TouchPhase::Move, 300.0, 340.0)?.is_none(),
+        "SELFTEST FAIL second touch-move produced a frame"
+    );
+    ensure!(
+        session.render_count() == renders_before_drag,
+        "SELFTEST FAIL drag rendered before finger-up"
+    );
+    println!("SELFTEST PASS repaint_guard renders_during_drag=0");
+
+    let release_started = Instant::now();
+    let update = session
+        .dispatch_touch(TouchPhase::Up, 300.0, 300.0)?
+        .context("SELFTEST FAIL finger-up produced no changed frame")?;
+    let release_ms = release_started.elapsed().as_millis();
+    ensure!(
+        session.render_count() == renders_before_drag + 1,
+        "SELFTEST FAIL finger-up did not produce exactly one render"
+    );
+    let damage_bottom = update.damage.y + update.damage.height;
+    ensure!(
+        update.damage.y >= 108 && damage_bottom <= 744,
+        "SELFTEST FAIL scroll damage escaped list viewport: x={} y={} width={} height={}",
+        update.damage.x,
+        update.damage.y,
+        update.damage.width,
+        update.damage.height
+    );
+    println!(
+        "SELFTEST PASS release_scroll renders=1 release_ms={release_ms} damage_x={} damage_y={} damage_width={} damage_height={}",
+        update.damage.x, update.damage.y, update.damage.width, update.damage.height
+    );
+
+    let renders_before_exit = session.render_count();
+    ensure!(
+        session.dispatch_touch(TouchPhase::Up, 510.0, 54.0)?.is_none(),
+        "SELFTEST FAIL EXIT produced an unnecessary framebuffer update"
+    );
+    ensure!(session.state().exit_requested, "SELFTEST FAIL EXIT hit testing");
+    ensure!(
+        session.render_count() == renders_before_exit,
+        "SELFTEST FAIL EXIT caused an unnecessary render"
+    );
+    println!("SELFTEST PASS exit_hit_test framebuffer_renders=0");
+    println!("SELFTEST PASS all total_ms={}", started.elapsed().as_millis());
+    Ok(())
+}
+
 fn run_interactive(
     options: &Options,
     viewport: Viewport,
@@ -67,13 +147,12 @@ fn run_interactive(
     let mut touch = TouchDevice::discover()?;
     println!("touchscreen: {}", touch.description());
     println!(
-        "viewport: {}x{}; tap the bar control to toggle it, then tap the exit control",
+        "viewport: {}x{}; drag the GPUI library list and tap EXIT to return",
         viewport.width, viewport.height
     );
 
-    let damage_path = options.output.with_file_name("gpui-kobo-button-damage.pgm");
+    let damage_path = options.output.with_file_name("gpui-kobo-library-damage.pgm");
     let deadline = Instant::now() + options.timeout;
-    let mut previous_state = session.state();
 
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -92,38 +171,32 @@ fn run_interactive(
             CANVAS_WIDTH,
             CANVAS_HEIGHT,
         );
-        println!(
-            "touch {:?}: raw=({}, {}) canvas=({:.1}, {:.1})",
-            mapped.phase, event.raw_x, event.raw_y, mapped.x, mapped.y
-        );
 
-        if let Some(image) = session.dispatch_touch(mapped.phase, mapped.x, mapped.y)? {
-            render_damage(&image, &options.fbink, &damage_path, viewport)?;
+        if let Some(update) = session.dispatch_touch(mapped.phase, mapped.x, mapped.y)? {
+            println!(
+                "GPUI damage: x={} y={} width={} height={}",
+                update.damage.x, update.damage.y, update.damage.width, update.damage.height
+            );
+            render_damage(&update, &options.fbink, &damage_path, viewport)?;
         }
 
-        let state = session.state();
-        if state.activated != previous_state.activated {
-            println!("bar control toggled through GPUI hit testing");
-        }
-        if state.exit_requested {
-            println!("exit control activated through GPUI hit testing");
-            thread::sleep(Duration::from_millis(350));
+        if session.state().exit_requested {
+            println!("EXIT activated through GPUI hit testing");
             break;
         }
-        previous_state = state;
     }
     Ok(())
 }
 
 fn render_damage(
-    image: &RgbaImage,
+    update: &FrameUpdate,
     fbink: &Path,
     damage_path: &Path,
     viewport: Viewport,
 ) -> Result<()> {
-    let damage = button_damage_image(image);
+    let damage = damage_image(&update.image, update.damage);
     write_pgm(&damage, damage_path)?;
-    present_damage(fbink, damage_path, viewport)
+    present_damage(fbink, damage_path, update.damage, viewport)
 }
 
 fn query_viewport(fbink: &Path) -> Result<Viewport> {
@@ -159,11 +232,16 @@ fn present_full(fbink: &Path, image: &Path) -> Result<()> {
     )
 }
 
-fn present_damage(fbink: &Path, image: &Path, viewport: Viewport) -> Result<()> {
-    let x = BUTTON_DAMAGE.x * viewport.width / CANVAS_WIDTH;
-    let y = BUTTON_DAMAGE.y * viewport.height / CANVAS_HEIGHT;
-    let width = BUTTON_DAMAGE.width * viewport.width / CANVAS_WIDTH;
-    let height = BUTTON_DAMAGE.height * viewport.height / CANVAS_HEIGHT;
+fn present_damage(
+    fbink: &Path,
+    image: &Path,
+    damage: PixelRect,
+    viewport: Viewport,
+) -> Result<()> {
+    let x = damage.x * viewport.width / CANVAS_WIDTH;
+    let y = damage.y * viewport.height / CANVAS_HEIGHT;
+    let width = damage.width * viewport.width / CANVAS_WIDTH;
+    let height = damage.height * viewport.height / CANVAS_HEIGHT;
     run_fbink(
         fbink,
         image,
@@ -191,6 +269,7 @@ fn parse_options() -> Result<Option<Options>> {
     let mut fbink = default_fbink_path();
     let mut display = true;
     let mut interactive = false;
+    let mut self_test = false;
     let mut timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECONDS);
     let mut args = env::args_os().skip(1);
 
@@ -200,6 +279,7 @@ fn parse_options() -> Result<Option<Options>> {
             Some("--fbink") => fbink = required_value("--fbink", args.next())?.into(),
             Some("--no-display") => display = false,
             Some("--interactive") => interactive = true,
+            Some("--self-test") => self_test = true,
             Some("--timeout-seconds") => {
                 let value = required_value("--timeout-seconds", args.next())?;
                 let seconds = value
@@ -221,6 +301,7 @@ fn parse_options() -> Result<Option<Options>> {
         fbink,
         display,
         interactive,
+        self_test,
         timeout,
     }))
 }
@@ -246,7 +327,7 @@ fn default_fbink_path() -> PathBuf {
 
 fn print_render_result(image: &RgbaImage, output: &Path) {
     println!(
-        "rendered {}x{} GPUI button to {}",
+        "rendered {}x{} GPUI library to {}",
         image.width(),
         image.height(),
         output.display()
@@ -256,10 +337,11 @@ fn print_render_result(image: &RgbaImage, output: &Path) {
 fn print_help() {
     println!(
         "gpui-kobo-button [--output PATH] [--fbink PATH] [--no-display]\n\
-         	[--interactive] [--timeout-seconds N]\n\
+         \t[--interactive] [--self-test] [--timeout-seconds N]\n\
          \n\
-         Render one button through GPUI's CPU Kobo renderer. Interactive mode\n\
-         reads evdev touch input: the first button tap activates it and the\n\
-         second exits. The default recovery timeout is {DEFAULT_TIMEOUT_SECONDS} seconds."
+         Render a text library through GPUI's CPU Kobo renderer. Interactive mode\n\
+         translates evdev drags into GPUI scrolling and uses pixel-derived FBInk\n\
+         damage updates. Tap EXIT to return. The recovery timeout is\n\
+         {DEFAULT_TIMEOUT_SECONDS} seconds."
     );
 }

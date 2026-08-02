@@ -25,7 +25,7 @@ Installed the GPUI test under:
 Safely eject the Kobo. If NickelMenu is installed, select:
   GPUI Kobo test
 
-The test stops Nickel and displays the GPUI-rendered button. Tap it once to
-change its state and tap it again to return to Nickel. A 45-second timeout
-recovers automatically. The log is in .adds/gpui-kobo/gpui-kobo.log.
+The test stops Nickel and displays a GPUI-rendered text library. Drag the list
+to scroll and tap EXIT to return to Nickel. A 45-second timeout recovers
+automatically. The log is in .adds/gpui-kobo/gpui-kobo.log.
 EOF
