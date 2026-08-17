@@ -23,6 +23,67 @@ pub struct CompositorGpuHint {
 }
 
 impl WgpuContext {
+    /// Creates a GPU context that is not tied to a window surface.
+    ///
+    /// A software fallback adapter is preferred so visual tests are stable on
+    /// headless Linux builders. If no fallback adapter is installed, this
+    /// falls back to the best available surface-independent adapter.
+    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    pub fn new_headless() -> anyhow::Result<Self> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
+        });
+
+        let request = |force_fallback_adapter| {
+            instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter,
+            })
+        };
+        let adapter = gpui::block_on(request(true))
+            .or_else(|fallback_error| {
+                log::warn!(
+                    "No headless fallback adapter available ({fallback_error}); trying any adapter"
+                );
+                gpui::block_on(request(false))
+            })
+            .map_err(|error| {
+                anyhow::anyhow!("Failed to request a headless GPU adapter: {error}")
+            })?;
+        let (device, queue, dual_source_blending, color_texture_format) =
+            gpui::block_on(Self::create_device(&adapter))?;
+        let device_lost = Arc::new(AtomicBool::new(false));
+        device.set_device_lost_callback({
+            let device_lost = Arc::clone(&device_lost);
+            move |reason, message| {
+                log::error!("headless wgpu device lost: reason={reason:?}, message={message}");
+                if reason != wgpu::DeviceLostReason::Destroyed {
+                    device_lost.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+
+        log::info!(
+            "Selected headless GPU adapter: {:?} ({:?})",
+            adapter.get_info().name,
+            adapter.get_info().backend
+        );
+        Ok(Self {
+            instance,
+            adapter,
+            device: Arc::new(device),
+            queue: Arc::new(queue),
+            dual_source_blending,
+            color_texture_format,
+            device_lost,
+        })
+    }
+
     #[cfg(not(target_family = "wasm"))]
     pub fn new(
         instance: wgpu::Instance,

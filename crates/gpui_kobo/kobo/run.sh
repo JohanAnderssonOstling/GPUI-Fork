@@ -45,7 +45,7 @@ trap restart_nickel 0 1 2 15
 
     if ! "$WORKDIR/gpui-kobo-button" \
         --interactive \
-        --timeout-seconds "${GPUI_KOBO_TIMEOUT_SECONDS:-45}"; then
+        --timeout-seconds "${GPUI_KOBO_TIMEOUT_SECONDS:-0}"; then
         "$WORKDIR/fbink" -q -c -f -p -m -M -h \
             "GPUI Kobo test failed; see gpui-kobo.log"
         sleep 10

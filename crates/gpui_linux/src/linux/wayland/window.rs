@@ -89,6 +89,25 @@ struct InProgressConfigure {
     tiling: Tiling,
 }
 
+#[derive(Default)]
+struct PendingDrawableResize {
+    pending: Option<Size<DevicePixels>>,
+}
+
+impl PendingDrawableResize {
+    fn queue(&mut self, size: Size<DevicePixels>) {
+        self.pending = Some(size);
+    }
+
+    fn take(&mut self) -> Option<Size<DevicePixels>> {
+        self.pending.take()
+    }
+
+    fn clear(&mut self) {
+        self.pending = None;
+    }
+}
+
 pub struct WaylandWindowState {
     surface_state: WaylandSurfaceState,
     acknowledged_first_configure: bool,
@@ -105,6 +124,7 @@ pub struct WaylandWindowState {
     renderer: WgpuRenderer,
     bounds: Bounds<Pixels>,
     scale: f32,
+    buffer_scale: i32,
     input_handler: Option<PlatformInputHandler>,
     decorations: WindowDecorations,
     background_appearance: WindowBackgroundAppearance,
@@ -120,6 +140,7 @@ pub struct WaylandWindowState {
     renderer_presented: bool,
     in_progress_configure: Option<InProgressConfigure>,
     resize_throttle: bool,
+    pending_drawable_resize: PendingDrawableResize,
     in_progress_window_controls: Option<WindowControls>,
     window_controls: WindowControls,
     client_inset: Option<Pixels>,
@@ -347,6 +368,11 @@ impl WaylandWindowState {
                     height: DevicePixels(f32::from(options.bounds.size.height) as i32),
                 },
                 transparent: true,
+                size_policy: if viewport.is_some() {
+                    gpui_wgpu::SurfaceSizePolicy::GrowOnly
+                } else {
+                    gpui_wgpu::SurfaceSizePolicy::Exact
+                },
                 // Prefer Mailbox to avoid blocking. Falls back to FIFO if Mailbox is unsupported.
                 preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
             };
@@ -370,6 +396,19 @@ impl WaylandWindowState {
                 .set_max_size(max_texture_size, max_texture_size);
         }
 
+        if let Some(viewport) = &viewport {
+            viewport.set_source(
+                0.0,
+                0.0,
+                f32::from(options.bounds.size.width) as f64,
+                f32::from(options.bounds.size.height) as f64,
+            );
+            viewport.set_destination(
+                f32::from(options.bounds.size.width) as i32,
+                f32::from(options.bounds.size.height) as i32,
+            );
+        }
+
         Ok(Self {
             surface_state,
             acknowledged_first_configure: false,
@@ -385,6 +424,7 @@ impl WaylandWindowState {
             renderer,
             bounds: options.bounds,
             scale: 1.0,
+            buffer_scale: 1,
             input_handler: None,
             decorations: WindowDecorations::Client,
             background_appearance: WindowBackgroundAppearance::Opaque,
@@ -394,6 +434,7 @@ impl WaylandWindowState {
             window_bounds: options.bounds,
             in_progress_configure: None,
             resize_throttle: false,
+            pending_drawable_resize: PendingDrawableResize::default(),
             client,
             appearance,
             handle,
@@ -674,7 +715,7 @@ impl WaylandWindowStatePtr {
                     }
                     drop(state);
                     if let Some(size) = configure.size {
-                        self.resize(size);
+                        self.resize_from_configure(size);
                     }
                 }
             }
@@ -913,6 +954,7 @@ impl WaylandWindowStatePtr {
                 // We use `PreferredBufferScale` instead to set the scale if it's available
                 if state.surface.version() < wl_surface::EVT_PREFERRED_BUFFER_SCALE_SINCE {
                     state.surface.set_buffer_scale(scale);
+                    state.buffer_scale = scale;
                     drop(state);
                     self.rescale(scale as f32);
                 }
@@ -926,6 +968,7 @@ impl WaylandWindowStatePtr {
                 // We use `PreferredBufferScale` instead to set the scale if it's available
                 if state.surface.version() < wl_surface::EVT_PREFERRED_BUFFER_SCALE_SINCE {
                     state.surface.set_buffer_scale(scale);
+                    state.buffer_scale = scale;
                     drop(state);
                     self.rescale(scale as f32);
                 }
@@ -934,6 +977,7 @@ impl WaylandWindowStatePtr {
                 // We use `WpFractionalScale` instead to set the scale if it's available
                 if state.globals.fractional_scale_manager.is_none() {
                     state.surface.set_buffer_scale(factor);
+                    state.buffer_scale = factor;
                     drop(state);
                     self.rescale(factor as f32);
                 }
@@ -981,11 +1025,24 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn set_size_and_scale(&self, size: Option<Size<Pixels>>, scale: Option<f32>) {
+        self.set_size_and_scale_impl(size, scale, false);
+    }
+
+    fn resize_from_configure(&self, size: Size<Pixels>) {
+        self.set_size_and_scale_impl(Some(size), None, true);
+    }
+
+    fn set_size_and_scale_impl(
+        &self,
+        size: Option<Size<Pixels>>,
+        scale: Option<f32>,
+        defer_drawable_resize: bool,
+    ) {
         let (size, scale) = {
             let mut state = self.state.borrow_mut();
-            if size.is_none_or(|size| size == state.bounds.size)
-                && scale.is_none_or(|scale| scale == state.scale)
-            {
+            let logical_size_changed = size.is_some_and(|size| size != state.bounds.size);
+            let scale_changed = scale.is_some_and(|scale| scale != state.scale);
+            if !logical_size_changed && !scale_changed {
                 return;
             }
             if let Some(size) = size {
@@ -995,7 +1052,18 @@ impl WaylandWindowStatePtr {
                 state.scale = scale;
             }
             let device_bounds = state.bounds.to_device_pixels(state.scale);
-            state.renderer.update_drawable_size(device_bounds.size);
+            if defer_drawable_resize {
+                state.pending_drawable_resize.queue(device_bounds.size);
+                if std::env::var_os("BOKHEIM_PROFILE_RESIZE").is_some() {
+                    eprintln!(
+                        "GPUI_RESIZE_QUEUED size={}x{}",
+                        device_bounds.size.width.0, device_bounds.size.height.0
+                    );
+                }
+            } else {
+                state.pending_drawable_resize.clear();
+                state.renderer.update_drawable_size(device_bounds.size);
+            }
             (state.bounds.size, state.scale)
         };
 
@@ -1008,6 +1076,14 @@ impl WaylandWindowStatePtr {
         {
             let state = self.state.borrow();
             if let Some(viewport) = &state.viewport {
+                let device_size = state.bounds.to_device_pixels(state.scale).size;
+                let buffer_scale = state.buffer_scale.max(1) as f64;
+                viewport.set_source(
+                    0.0,
+                    0.0,
+                    device_size.width.0 as f64 / buffer_scale,
+                    device_size.height.0 as f64 / buffer_scale,
+                );
                 viewport
                     .set_destination(f32::from(size.width) as i32, f32::from(size.height) as i32);
             }
@@ -1411,6 +1487,20 @@ impl PlatformWindow for WaylandWindow {
     fn draw(&self, scene: &Scene) {
         let mut state = self.borrow_mut();
 
+        // Wayland configure events may arrive faster than frames. Apply only
+        // the latest drawable extent immediately before rendering the freshly
+        // laid-out scene. This coalesces surface configuration without ever
+        // scaling or re-presenting stale content.
+        if let Some(drawable_size) = state.pending_drawable_resize.take() {
+            if std::env::var_os("BOKHEIM_PROFILE_RESIZE").is_some() {
+                eprintln!(
+                    "GPUI_RESIZE_APPLY size={}x{}",
+                    drawable_size.width.0, drawable_size.height.0
+                );
+            }
+            state.renderer.update_drawable_size(drawable_size);
+        }
+
         if state.renderer.device_lost() {
             let raw_window = RawWindow {
                 window: state.surface.id().as_ptr().cast::<std::ffi::c_void>(),
@@ -1732,4 +1822,22 @@ fn inset_by_tiling(mut bounds: Bounds<Pixels>, inset: Pixels, tiling: Tiling) ->
     }
 
     bounds
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_drawable_resize_applies_only_the_latest_size() {
+        let mut resize = PendingDrawableResize::default();
+        resize.queue(size(DevicePixels(800), DevicePixels(600)));
+        resize.queue(size(DevicePixels(1200), DevicePixels(900)));
+
+        assert_eq!(
+            resize.take(),
+            Some(size(DevicePixels(1200), DevicePixels(900)))
+        );
+        assert_eq!(resize.take(), None);
+    }
 }

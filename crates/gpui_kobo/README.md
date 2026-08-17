@@ -126,7 +126,7 @@ The launcher:
 4. routes touch, page buttons, wake, and rotation through the Kobo runtime and
    presents in-memory damage on release, with count-, area-, and idle-triggered
    full GC16 cleanup;
-5. exits through the GPUI EXIT control or after 45 seconds;
+5. exits through the GPUI EXIT control or after a timeout when `GPUI_KOBO_TIMEOUT_SECONDS` is set to a non-zero value;
 6. restarts Nickel even when the test command fails or is terminated.
 
 Diagnostics are appended to:
@@ -173,9 +173,8 @@ canvas, polls page/home/power buttons, and displays a text library with more row
 than fit on screen. Drag the list or use page buttons to exercise GPUI-native
 scrolling. Every rendered frame is compared with the previous one, and linked
 FBInk receives only the resulting changed-pixel bounds. Tap EXIT to restart
-Nickel. If input discovery or touch
-handling fails, the launcher recovers after 45 seconds; override that fallback
-with `GPUI_KOBO_TIMEOUT_SECONDS`.
+Nickel. If input discovery or touch handling fails, the launcher now runs without
+an automatic timeout unless `GPUI_KOBO_TIMEOUT_SECONDS` is set to a non-zero value.
 
 ## Automated device preflight
 

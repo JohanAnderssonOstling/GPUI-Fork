@@ -140,6 +140,7 @@ impl WebWindow {
         let renderer_config = WgpuSurfaceConfig {
             size: device_size,
             transparent: false,
+            size_policy: gpui_wgpu::SurfaceSizePolicy::Exact,
             preferred_present_mode: None,
         };
 

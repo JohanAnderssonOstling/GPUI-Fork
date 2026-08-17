@@ -6,13 +6,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail, ensure};
 use gpui::Application;
 use gpui_kobo::{
-    DeviceRefreshProfile, FrameUpdate, Gesture, GestureTracker, HardwareButton,
+    DeviceRefreshProfile, FrameUpdate, Gesture, GestureTracker, GrayFrame, HardwareButton,
     MappedTouch, RepaintScheduler, RefreshMode, RefreshPolicy, RuntimeEvent, ScreenGeometry,
-    TouchCalibration, TouchPhase, TouchTransform, extended_renderer_self_test,
+    TouchCalibration, TouchPhase, TouchTransform, changed_pixel_bounds, extended_renderer_self_test,
     hardware_button_from_code, presenter_self_test, rgba8_to_grayscale, write_pgm,
     KoboAssets, KoboPlatform, KoboPlatformOptions, open_button_test_window,
 };
-use image::RgbaImage;
+use image::{GrayImage, Luma};
 
 const DEFAULT_OUTPUT: &str = "/tmp/gpui-kobo-library.pgm";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 45;
@@ -50,7 +50,7 @@ fn main() -> Result<()> {
 }
 
 struct PlatformRun {
-    image: RgbaImage,
+    image: GrayImage,
     render_count: u64,
     quit_requested: bool,
 }
@@ -184,6 +184,23 @@ fn run_self_test() -> Result<()> {
     );
     println!("SELFTEST PASS refresh_policy count_cleanup=6 area_cleanup=3_screens");
 
+    let before = GrayImage::from_pixel(20, 20, Luma([255]));
+    let mut after = before.clone();
+    after.put_pixel(7, 9, Luma([0]));
+    let damage = changed_pixel_bounds(&before, &after)
+        .context("SELFTEST FAIL raw grayscale damage was not detected")?;
+    ensure!(
+        damage == gpui_kobo::PixelRect { x: 7, y: 9, width: 1, height: 1 },
+        "SELFTEST FAIL raw grayscale damage bounds {damage:?}"
+    );
+    let frame = GrayFrame::unpooled(after);
+    let shared = frame.clone();
+    ensure!(
+        std::ptr::eq(frame.as_ref(), shared.as_ref()),
+        "SELFTEST FAIL grayscale frame ownership was copied"
+    );
+    println!("SELFTEST PASS grayscale_damage raw_bytes=true shared_frame=true");
+
     let scheduler_profile = DeviceRefreshProfile {
         cleanup_after_fast_updates: 6,
         cleanup_after_screen_areas: 3,
@@ -193,14 +210,16 @@ fn run_self_test() -> Result<()> {
     let mut scheduler = RepaintScheduler::new(scheduler_profile);
     scheduler.enqueue(
         FrameUpdate {
-            image: RgbaImage::from_pixel(20, 20, image::Rgba([255, 255, 255, 255])),
+            image: GrayFrame::unpooled(GrayImage::from_pixel(20, 20, Luma([255]))),
+            previous_image: None,
             damage: gpui_kobo::PixelRect { x: 2, y: 3, width: 4, height: 5 },
         },
         true,
     );
     scheduler.enqueue(
         FrameUpdate {
-            image: RgbaImage::from_pixel(20, 20, image::Rgba([240, 240, 240, 255])),
+            image: GrayFrame::unpooled(GrayImage::from_pixel(20, 20, Luma([240]))),
+            previous_image: None,
             damage: gpui_kobo::PixelRect { x: 5, y: 6, width: 4, height: 5 },
         },
         true,
@@ -308,7 +327,7 @@ fn run_self_test() -> Result<()> {
     Ok(())
 }
 
-fn changed_pixels(before: &RgbaImage, after: &RgbaImage) -> usize {
+fn changed_pixels(before: &GrayImage, after: &GrayImage) -> usize {
     before.pixels().zip(after.pixels()).filter(|(left, right)| left != right).count()
 }
 

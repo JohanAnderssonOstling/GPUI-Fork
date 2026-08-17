@@ -6,12 +6,7 @@
 
 mod platform;
 mod virtual_keyboard;
-pub use platform::{
-    KoboExperienceMode, KoboPlatform, KoboPlatformOptions, KoboWindow, PageButtonBehavior,
-    begin_application_startup_profile, begin_book_launch_profile, current_experience_mode,
-    current_render_mode, request_auto_rotation, request_experience_mode, request_full_repaint,
-    request_reader_page_repaint, request_render_mode,
-};
+pub use platform::{KoboPlatform, KoboPlatformOptions, KoboWindow, PageButtonBehavior};
 pub use virtual_keyboard::KoboKeyboardRoot;
 
 use std::borrow::Cow;
@@ -22,17 +17,19 @@ use std::io::{BufWriter, Write};
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::Instant;
 
 use anyhow::{Result, bail};
 use gpui::{
-    App, AppContext, AssetSource, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile,
-    Background, Bounds, ContentMask, Context, Corners, DevicePixels, Hsla, InteractiveElement,
-    IntoElement, MonochromeSprite, MouseButton, ParentElement, Path as GpuiPath, PlatformAtlas,
-    PolychromeSprite, PrimitiveBatch, Quad, Render, Rgba, ScaledPixels, Scene, Shadow,
-    SharedString, Size, StatefulInteractiveElement, Styled, SubpixelSprite, TileId,
-    TransformationMatrix, Underline, Window, WindowBounds, WindowOptions, div, linear_color_stop,
-    linear_gradient, point, px, rgb, size,
+    App, AppContext, AssetSource, AtlasKey, AtlasTextureId, AtlasTextureKind,
+    AtlasTile, Background, Bounds, Corners,
+    ContentMask, Context, DevicePixels, Hsla, InteractiveElement,
+    IntoElement, MonochromeSprite, MouseButton, ParentElement, PlatformAtlas,
+    Path as GpuiPath, PolychromeSprite, PrimitiveBatch, Quad, Render, Rgba,
+    ScaledPixels, Scene, Shadow,
+    Size, StatefulInteractiveElement, Styled, SubpixelSprite, TileId,
+    TransformationMatrix, Underline, Window, WindowBounds,
+    WindowOptions, div, point, px,
+    linear_color_stop, linear_gradient, rgb, size, SharedString,
 };
 use image::{GrayImage, Luma};
 use parking_lot::Mutex;
@@ -42,17 +39,6 @@ pub fn verbose_logging_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("GPUI_KOBO_VERBOSE")
-            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
-    })
-}
-
-/// Enables per-frame CPU renderer timings in the regular Kobo application.
-/// Kept separate from verbose input/presentation diagnostics so profiling can
-/// be enabled without flooding the device log with unrelated events.
-pub(crate) fn render_profiling_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("GPUI_KOBO_PROFILE")
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
     })
 }
@@ -121,9 +107,7 @@ impl PlatformAtlas for KoboAtlas {
         let kind = key.texture_kind();
         let expected_len = match kind {
             AtlasTextureKind::Monochrome => pixel_count,
-            AtlasTextureKind::Subpixel | AtlasTextureKind::Polychrome => {
-                pixel_count.saturating_mul(4)
-            }
+            AtlasTextureKind::Subpixel | AtlasTextureKind::Polychrome => pixel_count.saturating_mul(4),
         };
         if bytes.len() != expected_len {
             bail!(
@@ -144,10 +128,7 @@ impl PlatformAtlas for KoboAtlas {
             texture_id: AtlasTextureId { index: 0, kind },
             tile_id,
             padding: 0,
-            bounds: Bounds {
-                origin: Default::default(),
-                size,
-            },
+            bounds: Bounds { origin: Default::default(), size },
         };
         let pixels = match kind {
             AtlasTextureKind::Monochrome => CpuTilePixels::Mask(bytes.into_owned()),
@@ -155,7 +136,9 @@ impl PlatformAtlas for KoboAtlas {
                 bytes
                     .chunks_exact(4)
                     .map(|channels| {
-                        ((u16::from(channels[0]) + u16::from(channels[1]) + u16::from(channels[2]))
+                        ((u16::from(channels[0])
+                            + u16::from(channels[1])
+                            + u16::from(channels[2]))
                             / 3) as u8
                     })
                     .collect(),
@@ -167,7 +150,7 @@ impl PlatformAtlas for KoboAtlas {
                         (0.2126 * f32::from(channels[0])
                             + 0.7152 * f32::from(channels[1])
                             + 0.0722 * f32::from(channels[2]))
-                        .round() as u8,
+                            .round() as u8,
                     );
                     converted.push(channels[3]);
                 }
@@ -175,9 +158,9 @@ impl PlatformAtlas for KoboAtlas {
             }
         };
         let opaque = match &pixels {
-            CpuTilePixels::LumaAlpha(pixels) => pixels
-                .chunks_exact(2)
-                .all(|channels| channels[1] == u8::MAX),
+            CpuTilePixels::LumaAlpha(pixels) => {
+                pixels.chunks_exact(2).all(|channels| channels[1] == u8::MAX)
+            }
             CpuTilePixels::Mask(_) => false,
         };
         state.pixels_by_tile_id.insert(
@@ -288,11 +271,7 @@ impl SceneSpatialIndex {
                 }
             }
         }
-        Self {
-            columns,
-            rows,
-            cells,
-        }
+        Self { columns, rows, cells }
     }
 
     fn collect_candidates(
@@ -526,10 +505,7 @@ fn polychrome_fingerprint(sprite: &PolychromeSprite) -> u64 {
 fn pixel_rect_bounds(rect: PixelRect) -> Bounds<ScaledPixels> {
     Bounds {
         origin: point(ScaledPixels(rect.x as f32), ScaledPixels(rect.y as f32)),
-        size: size(
-            ScaledPixels(rect.width as f32),
-            ScaledPixels(rect.height as f32),
-        ),
+        size: size(ScaledPixels(rect.width as f32), ScaledPixels(rect.height as f32)),
     }
 }
 
@@ -537,7 +513,11 @@ fn bounds_empty(bounds: Bounds<ScaledPixels>) -> bool {
     bounds.size.width.0 <= 0.0 || bounds.size.height.0 <= 0.0
 }
 
-fn bounds_pixel_rect(bounds: Bounds<ScaledPixels>, width: u32, height: u32) -> Option<PixelRect> {
+fn bounds_pixel_rect(
+    bounds: Bounds<ScaledPixels>,
+    width: u32,
+    height: u32,
+) -> Option<PixelRect> {
     let left = bounds.origin.x.0.floor().max(0.0).min(width as f32) as u32;
     let top = bounds.origin.y.0.floor().max(0.0).min(height as f32) as u32;
     let right = (bounds.origin.x.0 + bounds.size.width.0)
@@ -556,7 +536,11 @@ fn bounds_pixel_rect(bounds: Bounds<ScaledPixels>, width: u32, height: u32) -> O
     })
 }
 
-fn scene_primitive_stamps(scene: &Scene, width: u32, height: u32) -> Vec<PrimitiveStamp> {
+fn scene_primitive_stamps(
+    scene: &Scene,
+    width: u32,
+    height: u32,
+) -> Vec<PrimitiveStamp> {
     let mut stamps = Vec::new();
     for batch in scene.batches() {
         match batch {
@@ -568,11 +552,7 @@ fn scene_primitive_stamps(scene: &Scene, width: u32, height: u32) -> Vec<Primiti
                         width,
                         height,
                     ) {
-                        stamps.push(PrimitiveStamp {
-                            fingerprint: quad_fingerprint(primitive),
-                            bounds,
-                            primitive: ScenePrimitive::Quad(index),
-                        });
+                        stamps.push(PrimitiveStamp { fingerprint: quad_fingerprint(primitive), bounds, primitive: ScenePrimitive::Quad(index) });
                     }
                 }
             }
@@ -585,14 +565,7 @@ fn scene_primitive_stamps(scene: &Scene, width: u32, height: u32) -> Vec<Primiti
                         width,
                         height,
                     ) {
-                        stamps.push(PrimitiveStamp {
-                            fingerprint: monochrome_fingerprint(primitive),
-                            bounds,
-                            primitive: ScenePrimitive::MonochromeSprite {
-                                index,
-                                tile_id: primitive.tile.tile_id.0,
-                            },
-                        });
+                        stamps.push(PrimitiveStamp { fingerprint: monochrome_fingerprint(primitive), bounds, primitive: ScenePrimitive::MonochromeSprite { index, tile_id: primitive.tile.tile_id.0 } });
                     }
                 }
             }
@@ -605,23 +578,14 @@ fn scene_primitive_stamps(scene: &Scene, width: u32, height: u32) -> Vec<Primiti
                         width,
                         height,
                     ) {
-                        stamps.push(PrimitiveStamp {
-                            fingerprint: subpixel_fingerprint(primitive),
-                            bounds,
-                            primitive: ScenePrimitive::SubpixelSprite {
-                                index,
-                                tile_id: primitive.tile.tile_id.0,
-                            },
-                        });
+                        stamps.push(PrimitiveStamp { fingerprint: subpixel_fingerprint(primitive), bounds, primitive: ScenePrimitive::SubpixelSprite { index, tile_id: primitive.tile.tile_id.0 } });
                     }
                 }
             }
             PrimitiveBatch::Paths(range) => {
                 for index in range {
                     let primitive = &scene.paths[index];
-                    let Some(first) = primitive.vertices.first() else {
-                        continue;
-                    };
+                    let Some(first) = primitive.vertices.first() else { continue; };
                     let mut min_x = first.xy_position.x.0;
                     let mut min_y = first.xy_position.y.0;
                     let mut max_x = min_x;
@@ -638,11 +602,7 @@ fn scene_primitive_stamps(scene: &Scene, width: u32, height: u32) -> Vec<Primiti
                     }
                     .intersect(&primitive.content_mask.bounds);
                     if let Some(bounds) = bounds_pixel_rect(bounds, width, height) {
-                        stamps.push(PrimitiveStamp {
-                            fingerprint: path_fingerprint(primitive),
-                            bounds,
-                            primitive: ScenePrimitive::Path(index),
-                        });
+                        stamps.push(PrimitiveStamp { fingerprint: path_fingerprint(primitive), bounds, primitive: ScenePrimitive::Path(index) });
                     }
                 }
             }
@@ -654,11 +614,7 @@ fn scene_primitive_stamps(scene: &Scene, width: u32, height: u32) -> Vec<Primiti
                         width,
                         height,
                     ) {
-                        stamps.push(PrimitiveStamp {
-                            fingerprint: underline_fingerprint(primitive),
-                            bounds,
-                            primitive: ScenePrimitive::Underline(index),
-                        });
+                        stamps.push(PrimitiveStamp { fingerprint: underline_fingerprint(primitive), bounds, primitive: ScenePrimitive::Underline(index) });
                     }
                 }
             }
@@ -670,29 +626,13 @@ fn scene_primitive_stamps(scene: &Scene, width: u32, height: u32) -> Vec<Primiti
                         width,
                         height,
                     ) {
-                        stamps.push(PrimitiveStamp {
-                            fingerprint: polychrome_fingerprint(primitive),
-                            bounds,
-                            primitive: ScenePrimitive::PolychromeSprite {
-                                index,
-                                tile_id: primitive.tile.tile_id.0,
-                            },
-                        });
+                        stamps.push(PrimitiveStamp { fingerprint: polychrome_fingerprint(primitive), bounds, primitive: ScenePrimitive::PolychromeSprite { index, tile_id: primitive.tile.tile_id.0 } });
                     }
                 }
             }
             PrimitiveBatch::Shadows(_) => {}
             PrimitiveBatch::Surfaces(range) if range.is_empty() => {}
-            _ => stamps.push(PrimitiveStamp {
-                fingerprint: u64::MAX,
-                bounds: PixelRect {
-                    x: 0,
-                    y: 0,
-                    width,
-                    height,
-                },
-                primitive: ScenePrimitive::Unsupported,
-            }),
+            _ => stamps.push(PrimitiveStamp { fingerprint: u64::MAX, bounds: PixelRect { x: 0, y: 0, width, height }, primitive: ScenePrimitive::Unsupported }),
         }
     }
     stamps
@@ -733,12 +673,7 @@ fn add_dirty_region(regions: &mut Vec<PixelRect>, rect: PixelRect, canvas: Pixel
     let top = rect.y.saturating_sub(1);
     let right = (rect.x + rect.width + 1).min(canvas.width);
     let bottom = (rect.y + rect.height + 1).min(canvas.height);
-    let mut merged = PixelRect {
-        x: left,
-        y: top,
-        width: right - left,
-        height: bottom - top,
-    };
+    let mut merged = PixelRect { x: left, y: top, width: right - left, height: bottom - top };
     let mut index = 0;
     while index < regions.len() {
         if pixel_rects_touch(regions[index], merged) {
@@ -769,12 +704,7 @@ fn union_pixel_rect(left: PixelRect, right: PixelRect) -> PixelRect {
     let y = left.y.min(right.y);
     let right_edge = (left.x + left.width).max(right.x + right.width);
     let bottom_edge = (left.y + left.height).max(right.y + right.height);
-    PixelRect {
-        x,
-        y,
-        width: right_edge - x,
-        height: bottom_edge - y,
-    }
+    PixelRect { x, y, width: right_edge - x, height: bottom_edge - y }
 }
 
 fn rect_area_u64(rect: &PixelRect) -> u64 {
@@ -849,78 +779,47 @@ impl KoboRenderer {
         }
     }
 
-    /// Drop framebuffer-size-dependent render state while retaining the CPU
-    /// atlas shared with GPUI's window. Retained scenes keep atlas tile IDs, so
-    /// replacing the atlas during a scale transition makes their glyph and
-    /// image references invalid.
-    pub(crate) fn reset_surface(&mut self) {
-        self.previous_scene = None;
-        self.frame_pool.lock().clear();
-        self.frame_generation = 0;
-        self.damage_history.clear();
-        self.candidate_marks.clear();
-        self.candidate_generation = 0;
-        self.candidate_heap.clear();
-        self.candidate_indices.clear();
-    }
-
     pub(crate) fn render_to_grayscale(
         &mut self,
         scene: &Scene,
         size: Size<DevicePixels>,
         previous: Option<&GrayImage>,
     ) -> Result<Option<(GrayFrame, PixelRect)>> {
-        let profile_enabled = render_profiling_enabled();
-        let total_started = profile_enabled.then(Instant::now);
         let width = u32::try_from(size.width.0.max(0))?;
         let height = u32::try_from(size.height.0.max(0))?;
         if width == 0 || height == 0 {
             bail!("Kobo render target must be non-empty");
         }
-        let full = PixelRect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        };
-        let stamps_started = profile_enabled.then(Instant::now);
+        let full = PixelRect { x: 0, y: 0, width, height };
         let primitives = scene_primitive_stamps(scene, width, height);
-        let stamps_us = stamps_started.map_or(0, |started| started.elapsed().as_micros());
         let reuse_spatial_index = previous
             .is_some_and(|image| image.dimensions() == (width, height))
             && self.previous_scene.as_ref().is_some_and(|old| {
                 old.size == (width, height) && old.primitives.len() == primitives.len()
             });
-        let diff_started = profile_enabled.then(Instant::now);
         let mut changed_indices = Vec::new();
         let mut regions = match (&self.previous_scene, previous) {
             (Some(old), Some(previous))
-                if old.size == (width, height) && previous.dimensions() == (width, height) =>
+                if old.size == (width, height)
+                    && previous.dimensions() == (width, height) =>
             {
-                changed_primitive_regions(&old.primitives, &primitives, full, &mut changed_indices)
+                changed_primitive_regions(
+                    &old.primitives,
+                    &primitives,
+                    full,
+                    &mut changed_indices,
+                )
             }
             _ => vec![full],
         };
-        let diff_us = diff_started.map_or(0, |started| started.elapsed().as_micros());
         if regions.is_empty() {
-            if let Some(total_started) = total_started {
-                println!(
-                    "GPUI_KOBO_CPU_RENDER changed=false primitives={} stamps_us={stamps_us} diff_us={diff_us} spatial_us=0 buffer_us=0 raster_us=0 total_us={}",
-                    primitives.len(),
-                    total_started.elapsed().as_micros(),
-                );
-            }
             return Ok(None);
         }
         let total_area: u64 = regions.iter().map(rect_area_u64).sum();
-        if regions.len() > 6
-            || total_area.saturating_mul(5) >= rect_area_u64(&full).saturating_mul(3)
-        {
+        if regions.len() > 6 || total_area.saturating_mul(5) >= rect_area_u64(&full).saturating_mul(3) {
             regions.clear();
             regions.push(full);
         }
-        let changed_primitive_count = changed_indices.len();
-        let spatial_started = profile_enabled.then(Instant::now);
         let spatial_index = if reuse_spatial_index {
             let old = self.previous_scene.take().expect("checked above");
             let mut spatial_index = old.spatial_index;
@@ -935,14 +834,12 @@ impl KoboRenderer {
         } else {
             SceneSpatialIndex::new(&primitives, width, height)
         };
-        let spatial_us = spatial_started.map_or(0, |started| started.elapsed().as_micros());
         let snapshot = SceneSnapshot {
             size: (width, height),
             spatial_index,
             primitives,
         };
 
-        let buffer_started = profile_enabled.then(Instant::now);
         let recycled = {
             let mut pool = self.frame_pool.lock();
             pool.iter()
@@ -969,8 +866,6 @@ impl KoboRenderer {
         } else {
             target.as_mut().fill(255);
         }
-        let buffer_us = buffer_started.map_or(0, |started| started.elapsed().as_micros());
-        let raster_started = profile_enabled.then(Instant::now);
         let atlas = self.atlas.clone();
         let atlas_state = atlas.state.lock();
         for region in &regions {
@@ -983,9 +878,7 @@ impl KoboRenderer {
                 *region,
             )?;
         }
-        let raster_us = raster_started.map_or(0, |started| started.elapsed().as_micros());
         let history_regions = regions.clone();
-        let region_count = history_regions.len();
         let damage = regions.into_iter().reduce(union_pixel_rect).unwrap_or(full);
         let next_generation = self.frame_generation.wrapping_add(1).max(1);
         self.frame_generation = next_generation;
@@ -997,21 +890,7 @@ impl KoboRenderer {
             self.damage_history.pop_front();
         }
         self.previous_scene = Some(snapshot);
-        if let Some(total_started) = total_started {
-            println!(
-                "GPUI_KOBO_CPU_RENDER changed=true primitives={} changed_primitives={changed_primitive_count} regions={} damage_pixels={} stamps_us={stamps_us} diff_us={diff_us} spatial_us={spatial_us} buffer_us={buffer_us} raster_us={raster_us} total_us={}",
-                self.previous_scene
-                    .as_ref()
-                    .map_or(0, |scene| scene.primitives.len()),
-                region_count,
-                u64::from(damage.width) * u64::from(damage.height),
-                total_started.elapsed().as_micros(),
-            );
-        }
-        Ok(Some((
-            GrayFrame::pooled(target, next_generation, &self.frame_pool),
-            damage,
-        )))
+        Ok(Some((GrayFrame::pooled(target, next_generation, &self.frame_pool), damage)))
     }
 
     fn render_scene_region(
@@ -1044,9 +923,9 @@ impl KoboRenderer {
                     let mut sprite = scene.monochrome_sprites[*index];
                     sprite.content_mask.bounds = sprite.content_mask.bounds.intersect(&clip);
                     if !bounds_empty(sprite.content_mask.bounds) {
-                        let tile = tiles.get(tile_id).ok_or_else(|| {
-                            anyhow::anyhow!("glyph references a missing CPU atlas tile")
-                        })?;
+                        let tile = tiles
+                            .get(tile_id)
+                            .ok_or_else(|| anyhow::anyhow!("glyph references a missing CPU atlas tile"))?;
                         Self::draw_monochrome_sprite(target, &sprite, tile)?;
                     }
                 }
@@ -1054,9 +933,9 @@ impl KoboRenderer {
                     let mut sprite = scene.subpixel_sprites[*index];
                     sprite.content_mask.bounds = sprite.content_mask.bounds.intersect(&clip);
                     if !bounds_empty(sprite.content_mask.bounds) {
-                        let tile = tiles.get(tile_id).ok_or_else(|| {
-                            anyhow::anyhow!("glyph references a missing CPU atlas tile")
-                        })?;
+                        let tile = tiles
+                            .get(tile_id)
+                            .ok_or_else(|| anyhow::anyhow!("glyph references a missing CPU atlas tile"))?;
                         Self::draw_subpixel_sprite(target, &sprite, tile)?;
                     }
                 }
@@ -1074,15 +953,13 @@ impl KoboRenderer {
                     let mut sprite = scene.polychrome_sprites[*index];
                     sprite.content_mask.bounds = sprite.content_mask.bounds.intersect(&clip);
                     if !bounds_empty(sprite.content_mask.bounds) {
-                        let tile = tiles.get(tile_id).ok_or_else(|| {
-                            anyhow::anyhow!("image references a missing CPU atlas tile")
-                        })?;
+                        let tile = tiles
+                            .get(tile_id)
+                            .ok_or_else(|| anyhow::anyhow!("image references a missing CPU atlas tile"))?;
                         Self::draw_polychrome_sprite(target, &sprite, tile)?;
                     }
                 }
-                ScenePrimitive::Unsupported => {
-                    bail!("unsupported GPUI primitive batch in Kobo renderer")
-                }
+                ScenePrimitive::Unsupported => bail!("unsupported GPUI primitive batch in Kobo renderer"),
             }
         }
 
@@ -1123,16 +1000,10 @@ impl KoboRenderer {
 
     fn draw_underline(target: &mut GrayImage, underline: &Underline) -> Result<()> {
         if underline.wavy == 0 {
-            fill_rect(
-                target,
-                underline.bounds,
-                underline.content_mask,
-                underline.color,
-            );
+            fill_rect(target, underline.bounds, underline.content_mask, underline.color);
             return Ok(());
         }
-        let Some((x0, y0, x1, y1)) = clipped_rect(target, underline.bounds, underline.content_mask)
-        else {
+        let Some((x0, y0, x1, y1)) = clipped_rect(target, underline.bounds, underline.content_mask) else {
             return Ok(());
         };
         let (gray, alpha) = grayscale(underline.color);
@@ -1209,10 +1080,10 @@ impl KoboRenderer {
         }
 
         const FIXED_ONE: i64 = 1 << 16;
-        let source_x_step =
-            ((source_width as f64 * FIXED_ONE as f64) / width as f64).round() as i64;
-        let source_y_step =
-            ((source_height as f64 * FIXED_ONE as f64) / height as f64).round() as i64;
+        let source_x_step = ((source_width as f64 * FIXED_ONE as f64) / width as f64)
+            .round() as i64;
+        let source_y_step = ((source_height as f64 * FIXED_ONE as f64) / height as f64)
+            .round() as i64;
         let source_x_start = ((((draw_left as f64 - sprite.bounds.origin.x.0 as f64)
             / width as f64)
             * source_width as f64)
@@ -1236,7 +1107,8 @@ impl KoboRenderer {
                     as usize;
                 let offset = (source_y * source_width + source_x) * 2;
                 let gray = pixels[offset];
-                let alpha = f32::from(pixels[offset + 1]) / 255.0 * sprite.opacity.clamp(0.0, 1.0);
+                let alpha = f32::from(pixels[offset + 1]) / 255.0
+                    * sprite.opacity.clamp(0.0, 1.0);
                 blend_gray(target.get_pixel_mut(x, y), gray, alpha);
                 source_x_fixed += source_x_step;
             }
@@ -1295,7 +1167,11 @@ struct GrayFrameInner {
 }
 
 impl GrayFrame {
-    fn pooled(image: GrayImage, generation: u64, pool: &Arc<Mutex<Vec<FramePoolEntry>>>) -> Self {
+    fn pooled(
+        image: GrayImage,
+        generation: u64,
+        pool: &Arc<Mutex<Vec<FramePoolEntry>>>,
+    ) -> Self {
         Self(Arc::new(GrayFrameInner {
             image,
             generation,
@@ -1304,11 +1180,7 @@ impl GrayFrame {
     }
 
     pub fn unpooled(image: GrayImage) -> Self {
-        Self(Arc::new(GrayFrameInner {
-            image,
-            generation: 0,
-            pool: None,
-        }))
+        Self(Arc::new(GrayFrameInner { image, generation: 0, pool: None }))
     }
 
     pub(crate) fn image_mut(&mut self) -> &mut GrayImage {
@@ -1405,12 +1277,7 @@ pub fn changed_pixel_bounds_in(
             if old == new {
                 continue;
             }
-            let pixel = PixelRect {
-                x: candidate.x + offset as u32,
-                y,
-                width: 1,
-                height: 1,
-            };
+            let pixel = PixelRect { x: candidate.x + offset as u32, y, width: 1, height: 1 };
             damage = Some(damage.map_or(pixel, |damage| union_pixel_rect(damage, pixel)));
         }
     }
@@ -1435,12 +1302,10 @@ pub fn extended_renderer_self_test() -> Result<RendererCoverage> {
         origin: point(ScaledPixels(8.0), ScaledPixels(8.0)),
         size: size(ScaledPixels(48.0), ScaledPixels(30.0)),
     };
-    let mask = ContentMask {
-        bounds: Bounds {
-            origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
-            size: size(ScaledPixels(64.0), ScaledPixels(64.0)),
-        },
-    };
+    let mask = ContentMask { bounds: Bounds {
+        origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
+        size: size(ScaledPixels(64.0), ScaledPixels(64.0)),
+    }};
     let mut quad = Quad::default();
     quad.bounds = bounds;
     quad.content_mask = mask;
@@ -1482,12 +1347,10 @@ pub fn extended_renderer_self_test() -> Result<RendererCoverage> {
     path.line_to(point(px(32.0), px(58.0)));
     path.line_to(point(px(50.0), px(44.0)));
     path.color = rgb(0x303030).into();
-    path.content_mask = ContentMask {
-        bounds: Bounds {
-            origin: point(px(0.0), px(0.0)),
-            size: size(px(64.0), px(64.0)),
-        },
-    };
+    path.content_mask = ContentMask { bounds: Bounds {
+        origin: point(px(0.0), px(0.0)),
+        size: size(px(64.0), px(64.0)),
+    }};
     draw_path(&mut target, &path.scale(1.0), None);
 
     let underline = Underline {
@@ -1506,14 +1369,9 @@ pub fn extended_renderer_self_test() -> Result<RendererCoverage> {
 
     let painted_pixels = target.pixels().filter(|pixel| pixel.0[0] != 255).count();
     if painted_pixels < 500 || rounded_corner_pixels != 0 {
-        bail!(
-            "rectangular renderer coverage failed: painted={painted_pixels} unpainted_corners={rounded_corner_pixels}"
-        );
+        bail!("rectangular renderer coverage failed: painted={painted_pixels} unpainted_corners={rounded_corner_pixels}");
     }
-    Ok(RendererCoverage {
-        painted_pixels,
-        rounded_corner_pixels,
-    })
+    Ok(RendererCoverage { painted_pixels, rounded_corner_pixels })
 }
 
 /// Write a grayscale render as a binary PGM image.
@@ -1637,7 +1495,15 @@ fn draw_quad(target: &mut GrayImage, quad: &Quad) {
         return;
     };
     let (background_gray, background_alpha) = background_gray(quad.background);
-    fill_clipped_gray(target, x0, y0, x1, y1, background_gray, background_alpha);
+    fill_clipped_gray(
+        target,
+        x0,
+        y0,
+        x1,
+        y1,
+        background_gray,
+        background_alpha,
+    );
     let has_any_border = quad.border_widths.top.0 > 0.0
         || quad.border_widths.right.0 > 0.0
         || quad.border_widths.bottom.0 > 0.0
@@ -1712,35 +1578,24 @@ fn draw_path(
         let a = triangle[0].xy_position;
         let b = triangle[1].xy_position;
         let c = triangle[2].xy_position;
-        let min_x =
-            a.x.0
-                .min(b.x.0)
-                .min(c.x.0)
-                .floor()
-                .max(content_bounds.origin.x.0)
-                .max(0.0) as u32;
-        let min_y =
-            a.y.0
-                .min(b.y.0)
-                .min(c.y.0)
-                .floor()
-                .max(content_bounds.origin.y.0)
-                .max(0.0) as u32;
-        let max_x =
-            a.x.0
-                .max(b.x.0)
-                .max(c.x.0)
-                .ceil()
-                .min(content_bounds.origin.x.0 + content_bounds.size.width.0)
-                .min(target.width() as f32) as u32;
-        let max_y =
-            a.y.0
-                .max(b.y.0)
-                .max(c.y.0)
-                .ceil()
-                .min(content_bounds.origin.y.0 + content_bounds.size.height.0)
-                .min(target.height() as f32) as u32;
-        let denominator = (b.y.0 - c.y.0) * (a.x.0 - c.x.0) + (c.x.0 - b.x.0) * (a.y.0 - c.y.0);
+        let min_x = a.x.0.min(b.x.0).min(c.x.0)
+            .floor()
+            .max(content_bounds.origin.x.0)
+            .max(0.0) as u32;
+        let min_y = a.y.0.min(b.y.0).min(c.y.0)
+            .floor()
+            .max(content_bounds.origin.y.0)
+            .max(0.0) as u32;
+        let max_x = a.x.0.max(b.x.0).max(c.x.0)
+            .ceil()
+            .min(content_bounds.origin.x.0 + content_bounds.size.width.0)
+            .min(target.width() as f32) as u32;
+        let max_y = a.y.0.max(b.y.0).max(c.y.0)
+            .ceil()
+            .min(content_bounds.origin.y.0 + content_bounds.size.height.0)
+            .min(target.height() as f32) as u32;
+        let denominator = (b.y.0 - c.y.0) * (a.x.0 - c.x.0)
+            + (c.x.0 - b.x.0) * (a.y.0 - c.y.0);
         if denominator.abs() <= f32::EPSILON {
             continue;
         }
@@ -1751,20 +1606,14 @@ fn draw_path(
                 if !content_bounds.contains(&point(ScaledPixels(px), ScaledPixels(py))) {
                     continue;
                 }
-                let wa =
-                    ((b.y.0 - c.y.0) * (px - c.x.0) + (c.x.0 - b.x.0) * (py - c.y.0)) / denominator;
-                let wb =
-                    ((c.y.0 - a.y.0) * (px - c.x.0) + (a.x.0 - c.x.0) * (py - c.y.0)) / denominator;
+                let wa = ((b.y.0 - c.y.0) * (px - c.x.0) + (c.x.0 - b.x.0) * (py - c.y.0)) / denominator;
+                let wb = ((c.y.0 - a.y.0) * (px - c.x.0) + (a.x.0 - c.x.0) * (py - c.y.0)) / denominator;
                 let wc = 1.0 - wa - wb;
                 if wa < 0.0 || wb < 0.0 || wc < 0.0 {
                     continue;
                 }
-                let st_x = wa * triangle[0].st_position.x
-                    + wb * triangle[1].st_position.x
-                    + wc * triangle[2].st_position.x;
-                let st_y = wa * triangle[0].st_position.y
-                    + wb * triangle[1].st_position.y
-                    + wc * triangle[2].st_position.y;
+                let st_x = wa * triangle[0].st_position.x + wb * triangle[1].st_position.x + wc * triangle[2].st_position.x;
+                let st_y = wa * triangle[0].st_position.y + wb * triangle[1].st_position.y + wc * triangle[2].st_position.y;
                 if st_x * st_x > st_y {
                     continue;
                 }
@@ -1789,10 +1638,7 @@ fn background_gray(background: Background) -> (u8, f32) {
         let green = from.g + (to.g - from.g) * amount;
         let blue = from.b + (to.b - from.b) * amount;
         let alpha = from.a + (to.a - from.a) * amount;
-        return (
-            ((0.2126 * red + 0.7152 * green + 0.0722 * blue) * 255.0).round() as u8,
-            alpha,
-        );
+        return (((0.2126 * red + 0.7152 * green + 0.0722 * blue) * 255.0).round() as u8, alpha);
     }
     (255, 0.0)
 }
@@ -1844,20 +1690,6 @@ fn draw_mask(
     _rgba_mask: bool,
     transformation: TransformationMatrix,
 ) -> Result<()> {
-    const GLYPH_COVERAGE_THRESHOLD: u8 = 96;
-
-    // GPUI may position glyph sprites on fractional scaled pixels. Fractional
-    // placement is useful with antialiasing, but produces unstable gray edges
-    // and wider damage on an e-ink display. Snap translation-only glyphs to
-    // the CPU framebuffer before sampling their atlas mask.
-    let mut transformation = transformation;
-    let translation_only = transformation.rotation_scale == [[1.0, 0.0], [0.0, 1.0]];
-    if translation_only {
-        transformation.translation[0] =
-            (bounds.origin.x.0 + transformation.translation[0]).round() - bounds.origin.x.0;
-        transformation.translation[1] =
-            (bounds.origin.y.0 + transformation.translation[1]).round() - bounds.origin.y.0;
-    }
     let transformed = transform_bounds(bounds, transformation);
     let Some((x0, y0, x1, y1)) = clipped_rect(target, transformed, mask) else {
         return Ok(());
@@ -1870,6 +1702,7 @@ fn draw_mask(
     let CpuTilePixels::Mask(mask_pixels) = &tile.pixels else {
         bail!("glyph atlas tile is not a coverage mask");
     };
+    let translation_only = transformation.rotation_scale == [[1.0, 0.0], [0.0, 1.0]];
     let translated_x = bounds.origin.x.0 + transformation.translation[0];
     let translated_y = bounds.origin.y.0 + transformation.translation[1];
     let aligned_x = translated_x.round();
@@ -1895,19 +1728,13 @@ fn draw_mask(
             let source_row = &mask_pixels[source_start..source_start + width];
             let target_row = &mut target.as_mut()[target_start..target_start + width];
             for (pixel, &coverage) in target_row.iter_mut().zip(source_row) {
-                let coverage: u8 = if coverage >= GLYPH_COVERAGE_THRESHOLD {
-                    255
-                } else {
-                    0
-                };
                 let alpha = ((u16::from(coverage) * color_alpha + 127) / 255) as u8;
                 blend_gray_channel(pixel, gray, alpha);
             }
         }
         return Ok(());
     }
-    let inverse = invert_transform(transformation)
-        .ok_or_else(|| anyhow::anyhow!("glyph transformation is singular"))?;
+    let inverse = invert_transform(transformation).ok_or_else(|| anyhow::anyhow!("glyph transformation is singular"))?;
     let target_width = bounds.size.width.0.max(1.0);
     let target_height = bounds.size.height.0.max(1.0);
     let (gray, color_alpha) = grayscale(color);
@@ -1922,62 +1749,37 @@ fn draw_mask(
             {
                 continue;
             }
-            let source_x = (((sample_x - bounds.origin.x.0) / target_width) * source_width as f32)
+            let source_x = (((sample_x - bounds.origin.x.0) / target_width)
+                * source_width as f32)
                 .floor()
                 .clamp(0.0, (source_width - 1) as f32) as usize;
-            let source_y = (((sample_y - bounds.origin.y.0) / target_height) * source_height as f32)
+            let source_y = (((sample_y - bounds.origin.y.0) / target_height)
+                * source_height as f32)
                 .floor()
                 .clamp(0.0, (source_height - 1) as f32) as usize;
             let pixel_index = source_y * source_width + source_x;
-            let coverage = if mask_pixels[pixel_index] >= GLYPH_COVERAGE_THRESHOLD {
-                1.0
-            } else {
-                0.0
-            };
-            blend_gray(target.get_pixel_mut(x, y), gray, color_alpha * coverage);
+            let coverage = f32::from(mask_pixels[pixel_index]) / 255.0;
+            blend_gray(
+                target.get_pixel_mut(x, y),
+                gray,
+                color_alpha * coverage,
+            );
         }
     }
     Ok(())
 }
 
-fn transform_bounds(
-    bounds: Bounds<ScaledPixels>,
-    transform: TransformationMatrix,
-) -> Bounds<ScaledPixels> {
+fn transform_bounds(bounds: Bounds<ScaledPixels>, transform: TransformationMatrix) -> Bounds<ScaledPixels> {
     let points = [
         apply_transform(transform, bounds.origin.x.0, bounds.origin.y.0),
-        apply_transform(
-            transform,
-            bounds.origin.x.0 + bounds.size.width.0,
-            bounds.origin.y.0,
-        ),
-        apply_transform(
-            transform,
-            bounds.origin.x.0,
-            bounds.origin.y.0 + bounds.size.height.0,
-        ),
-        apply_transform(
-            transform,
-            bounds.origin.x.0 + bounds.size.width.0,
-            bounds.origin.y.0 + bounds.size.height.0,
-        ),
+        apply_transform(transform, bounds.origin.x.0 + bounds.size.width.0, bounds.origin.y.0),
+        apply_transform(transform, bounds.origin.x.0, bounds.origin.y.0 + bounds.size.height.0),
+        apply_transform(transform, bounds.origin.x.0 + bounds.size.width.0, bounds.origin.y.0 + bounds.size.height.0),
     ];
-    let min_x = points
-        .iter()
-        .map(|point| point.0)
-        .fold(f32::INFINITY, f32::min);
-    let min_y = points
-        .iter()
-        .map(|point| point.1)
-        .fold(f32::INFINITY, f32::min);
-    let max_x = points
-        .iter()
-        .map(|point| point.0)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let max_y = points
-        .iter()
-        .map(|point| point.1)
-        .fold(f32::NEG_INFINITY, f32::max);
+    let min_x = points.iter().map(|point| point.0).fold(f32::INFINITY, f32::min);
+    let min_y = points.iter().map(|point| point.1).fold(f32::INFINITY, f32::min);
+    let max_x = points.iter().map(|point| point.0).fold(f32::NEG_INFINITY, f32::max);
+    let max_y = points.iter().map(|point| point.1).fold(f32::NEG_INFINITY, f32::max);
     Bounds {
         origin: point(ScaledPixels(min_x), ScaledPixels(min_y)),
         size: size(ScaledPixels(max_x - min_x), ScaledPixels(max_y - min_y)),
@@ -1986,12 +1788,8 @@ fn transform_bounds(
 
 fn apply_transform(transform: TransformationMatrix, x: f32, y: f32) -> (f32, f32) {
     (
-        transform.translation[0]
-            + transform.rotation_scale[0][0] * x
-            + transform.rotation_scale[0][1] * y,
-        transform.translation[1]
-            + transform.rotation_scale[1][0] * x
-            + transform.rotation_scale[1][1] * y,
+        transform.translation[0] + transform.rotation_scale[0][0] * x + transform.rotation_scale[0][1] * y,
+        transform.translation[1] + transform.rotation_scale[1][0] * x + transform.rotation_scale[1][1] * y,
     )
 }
 
@@ -2004,15 +1802,10 @@ fn invert_transform(transform: TransformationMatrix) -> Option<TransformationMat
     let inverse = determinant.recip();
     let rotation_scale = [[d * inverse, -b * inverse], [-c * inverse, a * inverse]];
     let translation = [
-        -(rotation_scale[0][0] * transform.translation[0]
-            + rotation_scale[0][1] * transform.translation[1]),
-        -(rotation_scale[1][0] * transform.translation[0]
-            + rotation_scale[1][1] * transform.translation[1]),
+        -(rotation_scale[0][0] * transform.translation[0] + rotation_scale[0][1] * transform.translation[1]),
+        -(rotation_scale[1][0] * transform.translation[0] + rotation_scale[1][1] * transform.translation[1]),
     ];
-    Some(TransformationMatrix {
-        rotation_scale,
-        translation,
-    })
+    Some(TransformationMatrix { rotation_scale, translation })
 }
 
 fn clipped_rect(
@@ -2041,7 +1834,9 @@ fn grayscale(color: Hsla) -> (u8, f32) {
 /// Convert an RGBA8 sprite sample into the grayscale intensity and effective alpha
 /// consumed by the Kobo CPU renderer.
 pub fn rgba8_to_grayscale(rgba: [u8; 4], opacity: f32) -> (u8, f32) {
-    let luminance = 0.2126 * rgba[0] as f32 + 0.7152 * rgba[1] as f32 + 0.0722 * rgba[2] as f32;
+    let luminance = 0.2126 * rgba[0] as f32
+        + 0.7152 * rgba[1] as f32
+        + 0.0722 * rgba[2] as f32;
     (
         luminance.round().clamp(0.0, 255.0) as u8,
         rgba[3] as f32 / 255.0 * opacity.clamp(0.0, 1.0),
@@ -2063,7 +1858,10 @@ fn blend_gray_channel(pixel: &mut u8, gray: u8, alpha: u8) {
         return;
     }
     let inverse = 255 - alpha;
-    *pixel = ((u16::from(gray) * alpha + u16::from(*pixel) * inverse + 127) / 255) as u8;
+    *pixel = ((u16::from(gray) * alpha
+        + u16::from(*pixel) * inverse
+        + 127)
+        / 255) as u8;
 }
 mod display;
 mod input;

@@ -4,7 +4,7 @@ use gpui::{
     AppContext, Application, Bounds, Context, IntoElement, ParentElement, Render, Window, WindowBounds,
     WindowOptions, Styled, div, point, px, rgb, size,
 };
-use gpui_kobo::{KoboPlatform, KoboPlatformOptions};
+use gpui_kobo::{KoboPlatform, KoboPlatformOptions, PageButtonBehavior};
 
 struct ButtonDemo;
 
@@ -41,6 +41,8 @@ fn production_platform_renders_one_button() {
         display: false,
         interactive: false,
         timeout: Duration::from_secs(1),
+        page_buttons: PageButtonBehavior::Scroll,
+        ..Default::default()
     })
     .expect("production Kobo platform should initialize");
 

@@ -1,22 +1,38 @@
 use std::time::{Duration, Instant};
 
-use image::RgbaImage;
+use crate::{FrameUpdate, GrayFrame, PixelRect};
 
-use crate::{FrameUpdate, PixelRect};
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum KoboRenderMode {
+    FastMonochrome,
+    #[default]
+    QualityGrayscale,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RefreshMode {
     FastMono,
+    TextMono,
     PartialGray,
     FullGray,
+    FullMono,
 }
 
 impl RefreshMode {
     pub fn waveform(self) -> &'static str {
         match self {
             Self::FastMono => "A2",
-            Self::PartialGray | Self::FullGray => "GC16",
+            Self::TextMono => "DU",
+            Self::PartialGray | Self::FullGray | Self::FullMono => "GC16",
         }
+    }
+
+    pub fn is_full(self) -> bool {
+        matches!(self, Self::FullGray | Self::FullMono)
+    }
+
+    fn is_fast_partial(self) -> bool {
+        matches!(self, Self::FastMono)
     }
 }
 
@@ -49,24 +65,52 @@ impl RefreshPolicy {
     }
 
     pub fn decide(&mut self, scrolling: bool, damage: PixelRect, screen_area: u64) -> RefreshMode {
+        self.decide_for_mode(
+            KoboRenderMode::QualityGrayscale,
+            scrolling,
+            damage,
+            screen_area,
+        )
+    }
+
+    pub fn decide_for_mode(
+        &mut self,
+        render_mode: KoboRenderMode,
+        scrolling: bool,
+        damage: PixelRect,
+        screen_area: u64,
+    ) -> RefreshMode {
+        if render_mode == KoboRenderMode::FastMonochrome {
+            // Library mode remains thresholded monochrome, but DU avoids the
+            // severe ghosting produced by repeated A2 navigation updates.
+            // Do not accumulate cleanup debt or schedule automatic GC16.
+            return RefreshMode::TextMono;
+        }
+
         if !scrolling {
             return RefreshMode::PartialGray;
         }
 
-        self.fast_updates = self.fast_updates.saturating_add(1);
-        self.accumulated_damage = self
-            .accumulated_damage
-            .saturating_add(u64::from(damage.width) * u64::from(damage.height));
-        if self.fast_updates >= self.cleanup_after_fast_updates
-            || self.accumulated_damage
-                >= screen_area.saturating_mul(self.cleanup_after_screen_areas)
-        {
-            self.fast_updates = 0;
-            self.accumulated_damage = 0;
+        self.record_fast_update(damage);
+        if self.cleanup_due(screen_area) {
+            self.mark_cleanup();
             RefreshMode::FullGray
         } else {
             RefreshMode::FastMono
         }
+    }
+
+    fn record_fast_update(&mut self, damage: PixelRect) {
+        self.fast_updates = self.fast_updates.saturating_add(1);
+        self.accumulated_damage = self
+            .accumulated_damage
+            .saturating_add(u64::from(damage.width) * u64::from(damage.height));
+    }
+
+    fn cleanup_due(&self, screen_area: u64) -> bool {
+        self.fast_updates >= self.cleanup_after_fast_updates
+            || self.accumulated_damage
+                >= screen_area.saturating_mul(self.cleanup_after_screen_areas)
     }
 
     pub fn fast_updates(&self) -> u32 {
@@ -131,20 +175,29 @@ pub struct ScheduledRefresh {
 pub struct RepaintScheduler {
     policy: RefreshPolicy,
     profile: DeviceRefreshProfile,
+    render_mode: KoboRenderMode,
     pending: Option<FrameUpdate>,
     pending_scrolling: bool,
-    last_presented: Option<RgbaImage>,
+    last_presented: Option<GrayFrame>,
     last_fast_update: Option<Instant>,
 }
 
 impl RepaintScheduler {
     pub fn new(profile: DeviceRefreshProfile) -> Self {
+        Self::new_with_render_mode(profile, KoboRenderMode::QualityGrayscale)
+    }
+
+    pub fn new_with_render_mode(
+        profile: DeviceRefreshProfile,
+        render_mode: KoboRenderMode,
+    ) -> Self {
         Self {
             policy: RefreshPolicy::with_limits(
                 profile.cleanup_after_fast_updates,
                 profile.cleanup_after_screen_areas,
             ),
             profile,
+            render_mode,
             pending: None,
             pending_scrolling: false,
             last_presented: None,
@@ -152,11 +205,27 @@ impl RepaintScheduler {
         }
     }
 
+    pub fn set_render_mode(&mut self, render_mode: KoboRenderMode) {
+        if self.render_mode == render_mode {
+            return;
+        }
+        self.render_mode = render_mode;
+        self.policy = RefreshPolicy::with_limits(
+            self.profile.cleanup_after_fast_updates,
+            self.profile.cleanup_after_screen_areas,
+        );
+        self.pending = None;
+        self.pending_scrolling = false;
+        self.last_presented = None;
+        self.last_fast_update = None;
+    }
+
     pub fn enqueue(&mut self, update: FrameUpdate, scrolling: bool) {
         self.pending_scrolling |= scrolling;
         self.pending = Some(match self.pending.take() {
             Some(previous) => FrameUpdate {
                 image: update.image,
+                previous_image: previous.previous_image,
                 damage: union(previous.damage, update.damage),
             },
             None => update,
@@ -166,13 +235,14 @@ impl RepaintScheduler {
     pub fn flush(&mut self, now: Instant) -> Option<ScheduledRefresh> {
         let update = self.pending.take()?;
         let scrolling = std::mem::take(&mut self.pending_scrolling);
-        let mode = self.policy.decide(
+        let mode = self.policy.decide_for_mode(
+            self.render_mode,
             scrolling,
             update.damage,
             u64::from(update.image.width()) * u64::from(update.image.height()),
         );
         self.last_presented = Some(update.image.clone());
-        self.last_fast_update = (mode == RefreshMode::FastMono).then_some(now);
+        self.last_fast_update = mode.is_fast_partial().then_some(now);
         Some(ScheduledRefresh {
             update,
             mode,
@@ -194,10 +264,23 @@ impl RepaintScheduler {
         let image = self.last_presented.clone()?;
         self.last_fast_update = None;
         self.policy.mark_cleanup();
-        let damage = PixelRect { x: 0, y: 0, width: image.width(), height: image.height() };
+        let damage = PixelRect {
+            x: 0,
+            y: 0,
+            width: image.width(),
+            height: image.height(),
+        };
         Some(ScheduledRefresh {
-            update: FrameUpdate { image, damage },
-            mode: RefreshMode::FullGray,
+            update: FrameUpdate {
+                image,
+                previous_image: None,
+                damage,
+            },
+            mode: if self.render_mode == KoboRenderMode::FastMonochrome {
+                RefreshMode::FullMono
+            } else {
+                RefreshMode::FullGray
+            },
             reason: RefreshReason::IdleCleanup,
         })
     }
@@ -212,5 +295,10 @@ fn union(left: PixelRect, right: PixelRect) -> PixelRect {
     let y = left.y.min(right.y);
     let right_edge = (left.x + left.width).max(right.x + right.width);
     let bottom_edge = (left.y + left.height).max(right.y + right.height);
-    PixelRect { x, y, width: right_edge - x, height: bottom_edge - y }
+    PixelRect {
+        x,
+        y,
+        width: right_edge - x,
+        height: bottom_edge - y,
+    }
 }

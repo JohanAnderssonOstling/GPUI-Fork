@@ -67,6 +67,23 @@ impl HeadlessAppContext {
         asset_source: Arc<dyn AssetSource>,
         renderer_factory: impl Fn() -> Option<Box<dyn PlatformHeadlessRenderer>> + 'static,
     ) -> Self {
+        Self::with_platform_and_scale_factor(
+            platform_text_system,
+            asset_source,
+            renderer_factory,
+            2.0,
+        )
+    }
+
+    /// Creates a headless app context with an explicit device scale factor.
+    /// Visual compatibility suites normally use `1.0` so CSS pixels map
+    /// directly to image pixels.
+    pub fn with_platform_and_scale_factor(
+        platform_text_system: Arc<dyn PlatformTextSystem>,
+        asset_source: Arc<dyn AssetSource>,
+        renderer_factory: impl Fn() -> Option<Box<dyn PlatformHeadlessRenderer>> + 'static,
+        scale_factor: f32,
+    ) -> Self {
         let seed = std::env::var("SEED")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -79,11 +96,12 @@ impl HeadlessAppContext {
 
         let renderer_factory: Box<dyn Fn() -> Option<Box<dyn PlatformHeadlessRenderer>>> =
             Box::new(renderer_factory);
-        let platform = TestPlatform::with_platform(
+        let platform = TestPlatform::with_platform_and_scale_factor(
             background_executor.clone(),
             foreground_executor.clone(),
             platform_text_system.clone(),
             Some(renderer_factory),
+            scale_factor,
         );
 
         let text_system = Arc::new(TextSystem::new(platform_text_system));

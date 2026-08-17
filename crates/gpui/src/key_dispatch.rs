@@ -218,14 +218,18 @@ impl DispatchTree {
     }
 
     pub fn set_focus_id(&mut self, focus_id: FocusId) {
-        let node_id = *self.node_stack.last().unwrap();
+        let Some(node_id) = self.node_stack.last().copied() else {
+            return;
+        };
         self.nodes[node_id.0].focus_id = Some(focus_id);
         self.focusable_node_ids.insert(focus_id, node_id);
     }
 
     pub fn set_view_id(&mut self, view_id: EntityId) {
         if self.view_stack.last().copied() != Some(view_id) {
-            let node_id = *self.node_stack.last().unwrap();
+            let Some(node_id) = self.node_stack.last().copied() else {
+                return;
+            };
             self.nodes[node_id.0].view_id = Some(view_id);
             self.view_node_ids.insert(view_id, node_id);
             self.view_stack.push(view_id);
@@ -233,7 +237,11 @@ impl DispatchTree {
     }
 
     pub fn pop_node(&mut self) {
-        let node = &self.nodes[self.active_node_id().unwrap().0];
+        let Some(active_node_id) = self.active_node_id() else {
+            self.node_stack.clear();
+            return;
+        };
+        let node = &self.nodes[active_node_id.0];
         if node.context.is_some() {
             self.context_stack.pop();
         }
@@ -600,7 +608,22 @@ impl DispatchTree {
     }
 
     fn active_node(&mut self) -> &mut DispatchNode {
-        let active_node_id = self.active_node_id().unwrap();
+        if self.nodes.is_empty() {
+            self.nodes.push(DispatchNode::default());
+            debug_assert!(false, "dispatch tree had no nodes");
+        }
+
+        let mut active_node_id = self.active_node_id()
+            .unwrap_or_else(|| {
+                debug_assert!(false, "dispatch tree had no active node");
+                DispatchNodeId(0)
+            });
+
+        if active_node_id.0 >= self.nodes.len() {
+            debug_assert!(false, "active dispatch node index out of range");
+            active_node_id = DispatchNodeId(0);
+        }
+
         &mut self.nodes[active_node_id.0]
     }
 

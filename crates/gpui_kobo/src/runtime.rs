@@ -4,13 +4,16 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 
 use crate::{
-    ButtonDevice, ButtonEvent, Gesture, GestureTracker, MappedTouch, ScreenGeometry, TouchCalibration,
-    TouchDevice, TouchTransform, CANVAS_HEIGHT, CANVAS_WIDTH,
+    ButtonDevice, ButtonEvent, Gesture, GestureTracker, MappedTouch, ScreenGeometry,
+    TouchCalibration, TouchDevice, TouchTransform,
 };
 
 #[derive(Clone, Copy, Debug)]
 pub enum RuntimeEvent {
-    Touch { mapped: MappedTouch, gesture: Option<Gesture> },
+    Touch {
+        mapped: MappedTouch,
+        gesture: Option<Gesture>,
+    },
     Button(ButtonEvent),
     Idle,
 }
@@ -24,13 +27,41 @@ pub struct KoboRuntime {
     transform: TouchTransform,
     calibration: TouchCalibration,
     explicit_transform: bool,
+    touch_rotation_offset: u8,
+    canvas_width: u32,
+    canvas_height: u32,
+}
+
+fn orient_touch_transform(
+    mut transform: TouchTransform,
+    rotation: u8,
+    touch_rotation_offset: u8,
+) -> TouchTransform {
+    // The Kobo touch axes are aligned with FBInk rotation 1. Preserve the
+    // aspect-ratio-derived axis swap, then compensate for the selected screen
+    // orientation so hit testing follows the pixels shown to the user.
+    match (rotation + touch_rotation_offset) % 4 {
+        0 => transform.invert_y = !transform.invert_y,
+        1 => {}
+        2 => transform.invert_x = !transform.invert_x,
+        3 => {
+            transform.invert_x = !transform.invert_x;
+            transform.invert_y = !transform.invert_y;
+        }
+        _ => unreachable!(),
+    }
+    transform
 }
 
 impl KoboRuntime {
-    pub fn open(geometry: &ScreenGeometry) -> Result<Self> {
+    pub fn open(geometry: &ScreenGeometry, canvas_width: u32, canvas_height: u32) -> Result<Self> {
         let touch = TouchDevice::discover()?;
         let buttons = ButtonDevice::discover(touch.path())?;
-        let inferred = touch.inferred_transform(geometry.view_width, geometry.view_height);
+        let inferred = orient_touch_transform(
+            touch.inferred_transform(geometry.view_width, geometry.view_height),
+            geometry.current_rotation,
+            0,
+        );
         let (transform, explicit_transform) = match env::var("GPUI_KOBO_TOUCH_TRANSFORM") {
             Ok(value) => (
                 TouchTransform::parse(&value)
@@ -53,6 +84,9 @@ impl KoboRuntime {
             transform,
             calibration,
             explicit_transform,
+            touch_rotation_offset: 0,
+            canvas_width,
+            canvas_height,
         })
     }
 
@@ -72,10 +106,24 @@ impl KoboRuntime {
         self.calibration
     }
 
+    pub fn set_canvas_size(&mut self, canvas_width: u32, canvas_height: u32) {
+        self.canvas_width = canvas_width.max(1);
+        self.canvas_height = canvas_height.max(1);
+    }
+
     pub fn update_geometry(&mut self, geometry: &ScreenGeometry) {
         if !self.explicit_transform {
-            self.transform = self.touch.inferred_transform(geometry.view_width, geometry.view_height);
+            self.transform = orient_touch_transform(
+                self.touch
+                    .inferred_transform(geometry.view_width, geometry.view_height),
+                geometry.current_rotation,
+                self.touch_rotation_offset,
+            );
         }
+    }
+
+    pub fn set_touch_rotation_offset(&mut self, touch_rotation_offset: u8) {
+        self.touch_rotation_offset = touch_rotation_offset % 4;
     }
 
     pub fn next_event(&mut self, timeout: Duration) -> Result<RuntimeEvent> {
@@ -87,8 +135,8 @@ impl KoboRuntime {
         if let Some(event) = self.touch.next_event(touch_timeout)? {
             let mapped = self.touch.map_to_canvas_calibrated(
                 event,
-                CANVAS_WIDTH,
-                CANVAS_HEIGHT,
+                self.canvas_width,
+                self.canvas_height,
                 self.transform,
                 self.calibration,
             );
@@ -100,5 +148,12 @@ impl KoboRuntime {
             return Ok(RuntimeEvent::Button(button));
         }
         Ok(RuntimeEvent::Idle)
+    }
+
+    pub fn discard_pending_input(&mut self) -> Result<(usize, usize)> {
+        let touch_events = self.touch.discard_pending_events()?;
+        let button_events = self.buttons.discard_pending_events()?;
+        self.gestures = GestureTracker::default();
+        Ok((touch_events, button_events))
     }
 }

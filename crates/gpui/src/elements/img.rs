@@ -9,9 +9,11 @@ use anyhow::Result;
 use futures::Future;
 use gpui_util::ResultExt;
 use image::{
-    AnimationDecoder, DynamicImage, Frame, ImageError, ImageFormat, Rgba,
-    codecs::{gif::GifDecoder, webp::WebPDecoder},
+    AnimationDecoder, Frame, ImageError, ImageFormat,
+    codecs::gif::GifDecoder,
 };
+#[cfg(any(feature = "image-formats", feature = "image-webp"))]
+use image::{DynamicImage, Rgba, codecs::webp::WebPDecoder};
 use scheduler::Instant;
 use smallvec::SmallVec;
 use std::{
@@ -683,6 +685,7 @@ impl Asset for ImageAssetLoader {
 
                         frames
                     }
+                    #[cfg(any(feature = "image-formats", feature = "image-webp"))]
                     ImageFormat::WebP => {
                         let mut decoder = WebPDecoder::new(Cursor::new(&bytes))?;
 
@@ -693,7 +696,6 @@ impl Asset for ImageAssetLoader {
                             for frame in decoder.into_frames() {
                                 match frame {
                                     Ok(mut frame) => {
-                                        // Convert from RGBA to BGRA.
                                         for pixel in frame.buffer_mut().chunks_exact_mut(4) {
                                             pixel.swap(0, 2);
                                         }
@@ -717,7 +719,6 @@ impl Asset for ImageAssetLoader {
                         } else {
                             let mut data = DynamicImage::from_decoder(decoder)?.into_rgba8();
 
-                            // Convert from RGBA to BGRA.
                             for pixel in data.chunks_exact_mut(4) {
                                 pixel.swap(0, 2);
                             }

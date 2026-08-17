@@ -4,21 +4,21 @@ use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
     Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
-    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    ElementTransform, EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId,
-    GlyphId, GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, profiler, px, rems, size,
-    transparent_black,
+    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect,
+    ElementTransform, Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global,
+    GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext,
+    KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers,
+    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
+    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PolychromeSprite, Primitive, Priority, PromptButton, PromptLevel, Quad,
+    Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
+    prelude::*, profiler, px, rems, size, transparent_black,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -73,6 +73,23 @@ use crate::util::{
 };
 pub use prompts::*;
 
+/// A glyph that has already been shaped and is ready to paint.
+#[derive(Clone, Copy, Debug)]
+pub struct PaintGlyph {
+    /// The glyph origin in logical pixels. The y coordinate is the baseline.
+    pub origin: Point<Pixels>,
+    /// The font containing the glyph.
+    pub font_id: FontId,
+    /// The glyph identifier within the font.
+    pub glyph_id: GlyphId,
+    /// The font size used when shaping the glyph.
+    pub font_size: Pixels,
+    /// The glyph color. This is ignored for color emoji.
+    pub color: Hsla,
+    /// Whether this glyph should use color-emoji rasterization.
+    pub is_emoji: bool,
+}
+
 const MIN_TEXT_RASTER_TRANSFORM_MULTIPLIER: f32 = 1.0;
 const MAX_TEXT_RASTER_TRANSFORM_MULTIPLIER: f32 = 4.0;
 const TEXT_RASTER_TRANSFORM_MULTIPLIER_STEP: f32 = 0.125;
@@ -95,6 +112,13 @@ fn transform_raster_multiplier(transform: TransformationMatrix) -> f32 {
 
     (multiplier / TEXT_RASTER_TRANSFORM_MULTIPLIER_STEP).round()
         * TEXT_RASTER_TRANSFORM_MULTIPLIER_STEP
+}
+
+impl Window {
+    /// Returns whether the last completed frame contained a focused text input.
+    pub fn is_text_input_active(&self) -> bool {
+        self.platform_window.is_text_input_active()
+    }
 }
 
 fn glyph_raster_scale_factor(scale_factor: f32, transform: TransformationMatrix) -> f32 {
@@ -4167,7 +4191,191 @@ impl Window {
         Ok(())
     }
 
+    /// Paints a batch of glyphs that have already been shaped.
+    ///
+    /// The glyphs share the current transform, opacity, content mask, and scene
+    /// order. Use this for a shaped text fragment instead of calling
+    /// [`Window::paint_glyph`] or [`Window::paint_emoji`] once per glyph.
+    pub fn paint_glyphs(&mut self, glyphs: impl IntoIterator<Item = PaintGlyph>) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let element_opacity = self.element_opacity();
+        let scale_factor = self.scale_factor();
+        let current_transform = self.current_transform();
+        let raster_multiplier = transform_raster_multiplier(current_transform);
+        let effective_scale_factor = glyph_raster_scale_factor(scale_factor, current_transform);
+        let content_mask = self.snapped_content_mask();
+        let mut primitives = Vec::new();
+        let mut batch_bounds: Option<Bounds<ScaledPixels>> = None;
+        let mut last_subpixel_mode = None;
+        let mut last_dilation = None;
+
+        for glyph in glyphs {
+            let glyph_origin = glyph.origin.scale(scale_factor);
+            let (integer_origin, subpixel_variant, subpixel_rendering, dilation) = if glyph.is_emoji
+            {
+                (
+                    glyph_origin
+                        .map(|coordinate| ScaledPixels(round_half_toward_zero(coordinate.0))),
+                    Point::default(),
+                    false,
+                    0,
+                )
+            } else {
+                let quantized_origin = Point::new(
+                    round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
+                        / SUBPIXEL_VARIANTS_X as f32,
+                    round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
+                        / SUBPIXEL_VARIANTS_Y as f32,
+                );
+                let subpixel_variant = Point::new(
+                    (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
+                    (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
+                );
+                let subpixel_rendering = match last_subpixel_mode {
+                    Some((font_id, font_size, mode))
+                        if font_id == glyph.font_id && font_size == glyph.font_size =>
+                    {
+                        mode
+                    }
+                    _ => {
+                        let mode = self.should_use_subpixel_rendering_for_transform(
+                            glyph.font_id,
+                            glyph.font_size,
+                            current_transform,
+                        );
+                        last_subpixel_mode = Some((glyph.font_id, glyph.font_size, mode));
+                        mode
+                    }
+                };
+                let dilation = match last_dilation {
+                    Some((color, dilation)) if color == glyph.color => dilation,
+                    _ => {
+                        let dilation = self.text_system().glyph_dilation_for_color(glyph.color);
+                        last_dilation = Some((glyph.color, dilation));
+                        dilation
+                    }
+                };
+                (
+                    quantized_origin.map(|coordinate| ScaledPixels(coordinate.trunc())),
+                    subpixel_variant,
+                    subpixel_rendering,
+                    dilation,
+                )
+            };
+
+            let params = RenderGlyphParams {
+                font_id: glyph.font_id,
+                glyph_id: glyph.glyph_id,
+                font_size: glyph.font_size,
+                subpixel_variant,
+                scale_factor: effective_scale_factor,
+                is_emoji: glyph.is_emoji,
+                subpixel_rendering,
+                dilation,
+            };
+            let raster_bounds = self.text_system().raster_bounds(&params)?;
+            if raster_bounds.is_zero() {
+                continue;
+            }
+
+            let tile = self
+                .sprite_atlas
+                .get_or_insert_with(&params.clone().into(), &mut || {
+                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                    Ok(Some((size, Cow::Owned(bytes))))
+                })?
+                .expect("Callback above only errors or returns Some");
+            let local_bounds = compensate_glyph_sprite_bounds(
+                Bounds {
+                    origin: raster_bounds.origin.map(Into::into),
+                    size: tile.bounds.size.map(Into::into),
+                },
+                raster_multiplier,
+            );
+            let bounds = Bounds {
+                origin: integer_origin + local_bounds.origin,
+                size: local_bounds.size,
+            };
+            let clipped_bounds = bounds.intersect(&content_mask.bounds);
+            if clipped_bounds.is_empty() {
+                continue;
+            }
+            batch_bounds = Some(match batch_bounds {
+                Some(existing) => existing.union(&clipped_bounds),
+                None => clipped_bounds,
+            });
+
+            let primitive = if glyph.is_emoji {
+                Primitive::from(PolychromeSprite {
+                    order: 0,
+                    pad: 0,
+                    grayscale: false,
+                    bounds,
+                    corner_radii: Default::default(),
+                    content_mask,
+                    tile,
+                    opacity: element_opacity,
+                })
+            } else if subpixel_rendering {
+                Primitive::from(SubpixelSprite {
+                    order: 0,
+                    pad: 0,
+                    bounds,
+                    content_mask,
+                    color: glyph.color.opacity(element_opacity),
+                    tile,
+                    transformation: TransformationMatrix::unit(),
+                })
+            } else {
+                Primitive::from(MonochromeSprite {
+                    order: 0,
+                    pad: 0,
+                    bounds,
+                    content_mask,
+                    color: glyph.color.opacity(element_opacity),
+                    tile,
+                    transformation: TransformationMatrix::unit(),
+                })
+            };
+            primitives.push(primitive);
+        }
+
+        match primitives.len() {
+            0 => {}
+            1 => self
+                .next_frame
+                .scene
+                .insert_transformed_primitive(primitives.pop().unwrap(), current_transform),
+            _ => {
+                self.next_frame
+                    .scene
+                    .push_layer(batch_bounds.expect("non-empty glyph batch has bounds"));
+                for primitive in primitives {
+                    self.next_frame
+                        .scene
+                        .insert_transformed_primitive(primitive, current_transform);
+                }
+                self.next_frame.scene.pop_layer();
+            }
+        }
+        Ok(())
+    }
+
     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
+        self.should_use_subpixel_rendering_for_transform(
+            font_id,
+            font_size,
+            self.current_transform(),
+        )
+    }
+
+    fn should_use_subpixel_rendering_for_transform(
+        &self,
+        font_id: FontId,
+        font_size: Pixels,
+        transform: TransformationMatrix,
+    ) -> bool {
         if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
             return false;
         }
@@ -4176,7 +4384,7 @@ impl Window {
             return false;
         }
 
-        if !transform_allows_subpixel_rendering(self.current_transform()) {
+        if !transform_allows_subpixel_rendering(transform) {
             return false;
         }
 
@@ -6609,7 +6817,13 @@ mod tests {
             None
         }
 
-        fn request_layout(&mut self, _id: Option<&GlobalElementId>, _inspector_id: Option<&InspectorElementId>, window: &mut Window, cx: &mut App) -> (LayoutId, Self::RequestLayoutState) {
+        fn request_layout(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, Self::RequestLayoutState) {
             let layout_id = window.request_layout(
                 Style {
                     display: crate::Display::None,
@@ -6622,9 +6836,27 @@ mod tests {
             (layout_id, ())
         }
 
-        fn prepaint(&mut self, _id: Option<&GlobalElementId>, _inspector_id: Option<&InspectorElementId>, _bounds: Bounds<Pixels>, _request_layout: &mut Self::RequestLayoutState, _window: &mut Window, _cx: &mut App) {}
+        fn prepaint(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) {
+        }
 
-        fn paint(&mut self, _id: Option<&GlobalElementId>, _inspector_id: Option<&InspectorElementId>, _bounds: Bounds<Pixels>, _request_layout: &mut Self::RequestLayoutState, _prepaint: &mut Self::PrepaintState, window: &mut Window, _cx: &mut App) {
+        fn paint(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            _prepaint: &mut Self::PrepaintState,
+            window: &mut Window,
+            _cx: &mut App,
+        ) {
             window.paint_quad(fill(self.bounds, self.color));
         }
     }

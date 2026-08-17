@@ -383,7 +383,7 @@ http-body = "1.0"
 httparse = "1.10"
 idna = "1.0"
 ignore = "0.4.22"
-image = "0.25.1"
+image = { version = "0.25.1", default-features = false, features = ["png", "jpeg", "gif"] }
 imara-diff = "0.1.8"
 indexmap = { version = "2.7.0", features = ["serde"] }
 indoc = "2"
@@ -497,7 +497,6 @@ resvg = { version = "0.46.0", default-features = false, features = [
     "text",
     "system-fonts",
     "memmap-fonts",
-    "raster-images",
 ] }
 rsa = "0.9.6"
 runtimelib = { version = "1.4.0", default-features = false, features = [

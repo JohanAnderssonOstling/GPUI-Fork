@@ -79,6 +79,7 @@ fn apply_contrast_and_gamma_correction3(sample: vec3<f32>, color: vec3<f32>, enh
 
 struct GlobalParams {
     viewport_size: vec2<f32>,
+    render_target_size: vec2<f32>,
     premultiplied_alpha: u32,
     pad: u32,
 }
@@ -1131,7 +1132,7 @@ fn vs_path(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     let device_position = to_device_position(unit_vertex, sprite.bounds);
     // For screen-space intermediate texture, convert screen position to texture coordinates
     let screen_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
-    let texture_coords = screen_position / globals.viewport_size;
+    let texture_coords = screen_position / globals.render_target_size;
 
     var out = PathVarying();
     out.position = device_position;

@@ -36,6 +36,7 @@ pub(crate) struct TestPlatform {
     pub text_system: Arc<dyn PlatformTextSystem>,
     pub expect_restart: RefCell<Option<oneshot::Sender<Option<PathBuf>>>>,
     headless_renderer_factory: Option<Box<dyn Fn() -> Option<Box<dyn PlatformHeadlessRenderer>>>>,
+    scale_factor: f32,
     weak: Weak<Self>,
 }
 
@@ -118,6 +119,25 @@ impl TestPlatform {
             Box<dyn Fn() -> Option<Box<dyn PlatformHeadlessRenderer>>>,
         >,
     ) -> Rc<Self> {
+        Self::with_platform_and_scale_factor(
+            executor,
+            foreground_executor,
+            text_system,
+            headless_renderer_factory,
+            2.0,
+        )
+    }
+
+    pub fn with_platform_and_scale_factor(
+        executor: BackgroundExecutor,
+        foreground_executor: ForegroundExecutor,
+        text_system: Arc<dyn PlatformTextSystem>,
+        headless_renderer_factory: Option<
+            Box<dyn Fn() -> Option<Box<dyn PlatformHeadlessRenderer>>>,
+        >,
+        scale_factor: f32,
+    ) -> Rc<Self> {
+        assert!(scale_factor.is_finite() && scale_factor > 0.0);
         Rc::new_cyclic(|weak| TestPlatform {
             background_executor: executor,
             foreground_executor,
@@ -136,6 +156,7 @@ impl TestPlatform {
             opened_url: Default::default(),
             text_system,
             headless_renderer_factory,
+            scale_factor,
         })
     }
 
@@ -362,6 +383,7 @@ impl Platform for TestPlatform {
             self.weak.clone(),
             self.active_display.clone(),
             renderer,
+            self.scale_factor,
         );
         Ok(Box::new(window))
     }
