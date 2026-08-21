@@ -134,6 +134,7 @@ impl WebWindow {
                 height: DevicePixels(0),
             },
             transparent: false,
+            size_policy: gpui_wgpu::SurfaceSizePolicy::Exact,
             preferred_present_mode: None,
         };
         let renderer = WgpuRenderer::new_from_surface(context, surface, renderer_config)?;

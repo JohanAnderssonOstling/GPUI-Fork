@@ -10,8 +10,9 @@ use crate::{
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
+    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, KeyLocation,
+    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    MonochromeSprite,
     MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
     Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
@@ -74,6 +75,23 @@ use crate::util::{
     round_half_toward_zero_f64, round_stroke_to_device_pixel, round_to_device_pixel,
 };
 pub use prompts::*;
+
+/// A glyph that has already been shaped and is ready to paint.
+#[derive(Clone, Copy, Debug)]
+pub struct PaintGlyph {
+    /// The glyph origin in logical pixels. The y coordinate is the baseline.
+    pub origin: Point<Pixels>,
+    /// The font containing the glyph.
+    pub font_id: FontId,
+    /// The glyph identifier within the font.
+    pub glyph_id: GlyphId,
+    /// The font size used when shaping the glyph.
+    pub font_size: Pixels,
+    /// The glyph color. This is ignored for color emoji.
+    pub color: Hsla,
+    /// Whether this glyph should use color-emoji rasterization.
+    pub is_emoji: bool,
+}
 
 /// Default window size used when no explicit size is provided.
 pub const DEFAULT_WINDOW_SIZE: Size<Pixels> = size(px(1536.), px(1095.));
@@ -4250,6 +4268,40 @@ impl Window {
         });
     }
 
+    /// Returns the maximum distance that a painted glyph extends past its
+    /// horizontal advance, in logical pixels.
+    pub fn glyph_right_overhang(
+        &self,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+        is_emoji: bool,
+    ) -> Result<Pixels> {
+        let subpixel_rendering =
+            !is_emoji && self.should_use_subpixel_rendering(font_id, font_size);
+        let dilation = if is_emoji {
+            0
+        } else {
+            self.text_system().glyph_dilation_for_color(color)
+        };
+        self.text_system().glyph_right_overhang(&RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size,
+            subpixel_variant: Point::default(),
+            scale_factor: self.scale_factor(),
+            is_emoji,
+            subpixel_rendering,
+            dilation,
+        })
+    }
+
+    /// Returns whether the last completed frame contained a focused text input.
+    pub fn is_text_input_active(&self) -> bool {
+        self.platform_window.is_text_input_active()
+    }
+
     /// Paints a monochrome (non-emoji) glyph into the scene for the next frame at the current z-index.
     ///
     /// The y component of the origin is the baseline of the glyph.
@@ -4334,6 +4386,179 @@ impl Window {
             }
         }
         Ok(())
+    }
+
+    /// Paints a batch of glyphs that have already been shaped.
+    ///
+    /// Non-overlapping glyphs share a scene layer. Overlapping glyphs start a
+    /// new layer so batching cannot reorder color or emoji glyphs visually.
+    pub fn paint_glyphs(&mut self, glyphs: impl IntoIterator<Item = PaintGlyph>) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let element_opacity = self.element_opacity();
+        let scale_factor = self.scale_factor();
+        let content_mask = self.snapped_content_mask();
+        let mut primitives = Vec::new();
+        let mut visual_bounds = Vec::new();
+        let mut layer_bounds = None;
+        let mut last_subpixel_mode = None;
+        let mut last_dilation = None;
+
+        for glyph in glyphs {
+            let glyph_origin = glyph.origin.scale(scale_factor);
+            let (integer_origin, subpixel_variant, subpixel_rendering, dilation) = if glyph.is_emoji
+            {
+                (
+                    glyph_origin
+                        .map(|coordinate| ScaledPixels(round_half_toward_zero(coordinate.0))),
+                    Point::default(),
+                    false,
+                    0,
+                )
+            } else {
+                let quantized_origin = Point::new(
+                    round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
+                        / SUBPIXEL_VARIANTS_X as f32,
+                    round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
+                        / SUBPIXEL_VARIANTS_Y as f32,
+                );
+                let subpixel_variant = Point::new(
+                    (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
+                    (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
+                );
+                let subpixel_rendering = match last_subpixel_mode {
+                    Some((font_id, font_size, mode))
+                        if font_id == glyph.font_id && font_size == glyph.font_size =>
+                    {
+                        mode
+                    }
+                    _ => {
+                        let mode =
+                            self.should_use_subpixel_rendering(glyph.font_id, glyph.font_size);
+                        last_subpixel_mode = Some((glyph.font_id, glyph.font_size, mode));
+                        mode
+                    }
+                };
+                let dilation = match last_dilation {
+                    Some((color, dilation)) if color == glyph.color => dilation,
+                    _ => {
+                        let dilation = self.text_system().glyph_dilation_for_color(glyph.color);
+                        last_dilation = Some((glyph.color, dilation));
+                        dilation
+                    }
+                };
+                (
+                    quantized_origin.map(|coordinate| ScaledPixels(coordinate.trunc())),
+                    subpixel_variant,
+                    subpixel_rendering,
+                    dilation,
+                )
+            };
+
+            let params = RenderGlyphParams {
+                font_id: glyph.font_id,
+                glyph_id: glyph.glyph_id,
+                font_size: glyph.font_size,
+                subpixel_variant,
+                scale_factor,
+                is_emoji: glyph.is_emoji,
+                subpixel_rendering,
+                dilation,
+            };
+            let raster_bounds = self.text_system().raster_bounds(&params)?;
+            if raster_bounds.is_zero() {
+                continue;
+            }
+
+            let tile = self
+                .sprite_atlas
+                .get_or_insert_with(&params.clone().into(), &mut || {
+                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                    Ok(Some((size, Cow::Owned(bytes))))
+                })?
+                .expect("Callback above only errors or returns Some");
+            let bounds = Bounds {
+                origin: integer_origin + raster_bounds.origin.map(Into::into),
+                size: tile.bounds.size.map(Into::into),
+            };
+            let clipped_bounds = bounds.intersect(&content_mask.bounds);
+            if clipped_bounds.is_empty() {
+                continue;
+            }
+
+            if visual_bounds
+                .iter()
+                .any(|existing: &Bounds<ScaledPixels>| existing.intersects(&clipped_bounds))
+            {
+                self.flush_glyph_layer(&mut primitives, layer_bounds.take());
+                visual_bounds.clear();
+            }
+
+            let primitive = if glyph.is_emoji {
+                crate::Primitive::from(PolychromeSprite {
+                    order: 0,
+                    pad: 0,
+                    grayscale: false.into(),
+                    bounds,
+                    corner_radii: Default::default(),
+                    content_mask,
+                    tile,
+                    opacity: element_opacity,
+                })
+            } else if subpixel_rendering {
+                crate::Primitive::from(SubpixelSprite {
+                    order: 0,
+                    pad: 0,
+                    bounds,
+                    content_mask,
+                    color: glyph.color.opacity(element_opacity),
+                    tile,
+                    transformation: TransformationMatrix::unit(),
+                })
+            } else {
+                crate::Primitive::from(MonochromeSprite {
+                    order: 0,
+                    pad: 0,
+                    bounds,
+                    content_mask,
+                    color: glyph.color.opacity(element_opacity),
+                    tile,
+                    transformation: TransformationMatrix::unit(),
+                })
+            };
+            layer_bounds = Some(match layer_bounds {
+                Some(existing) => existing.union(&clipped_bounds),
+                None => clipped_bounds,
+            });
+            visual_bounds.push(clipped_bounds);
+            primitives.push(primitive);
+        }
+
+        self.flush_glyph_layer(&mut primitives, layer_bounds);
+        Ok(())
+    }
+
+    fn flush_glyph_layer(
+        &mut self,
+        primitives: &mut Vec<crate::Primitive>,
+        bounds: Option<Bounds<ScaledPixels>>,
+    ) {
+        match primitives.len() {
+            0 => {}
+            1 => self
+                .next_frame
+                .scene
+                .insert_primitive(primitives.pop().unwrap()),
+            _ => {
+                self.next_frame
+                    .scene
+                    .push_layer(bounds.expect("non-empty glyph layer has bounds"));
+                for primitive in primitives.drain(..) {
+                    self.next_frame.scene.insert_primitive(primitive);
+                }
+                self.next_frame.scene.pop_layer();
+            }
+        }
     }
 
     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
@@ -4969,6 +5194,7 @@ impl Window {
         let result = self.dispatch_event(
             PlatformInput::KeyDown(KeyDownEvent {
                 keystroke: keystroke.clone(),
+                key_location: KeyLocation::Standard,
                 is_held: false,
                 prefer_character_input: false,
             }),
@@ -5513,6 +5739,7 @@ impl Window {
         'replay: for replay in replays {
             let event = KeyDownEvent {
                 keystroke: replay.keystroke.clone(),
+                key_location: KeyLocation::Standard,
                 is_held: false,
                 prefer_character_input: true,
             };

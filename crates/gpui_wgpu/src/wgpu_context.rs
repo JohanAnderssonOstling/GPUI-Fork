@@ -113,11 +113,13 @@ impl WgpuContext {
             adapter.get_info().name,
             adapter.get_info().backend
         );
+        let backend = WgpuBackend::Native(adapter.get_info().backend);
         Ok(Self {
             instance,
             adapter,
             device: Arc::new(device),
             queue: Arc::new(queue),
+            backend,
             dual_source_blending,
             color_texture_format,
             device_lost,

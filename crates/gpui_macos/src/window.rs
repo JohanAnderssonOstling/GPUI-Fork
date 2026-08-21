@@ -25,10 +25,10 @@ use cocoa::{
 use dispatch2::DispatchQueue;
 use gpui::{
     AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
-    ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab,
+    ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, KeyLocation, Keystroke,
+    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
+    Point, PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
     WindowParams, point, px, size,
 };
@@ -3161,6 +3161,7 @@ extern "C" fn do_command_by_selector(this: &Object, _: Sel, _: Sel) {
     if let Some((keystroke, callback)) = keystroke.zip(event_callback.as_mut()) {
         let handled = (callback)(PlatformInput::KeyDown(KeyDownEvent {
             keystroke,
+            key_location: KeyLocation::Standard,
             is_held: false,
             prefer_character_input: false,
         }));

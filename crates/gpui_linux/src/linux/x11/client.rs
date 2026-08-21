@@ -50,7 +50,7 @@ use super::{
 
 use crate::linux::{
     DEFAULT_CURSOR_ICON_NAME, LinuxClient, capslock_from_xkb, cursor_style_to_icon_names,
-    get_xkb_compose_state, is_within_click_distance, keystroke_from_xkb,
+    get_xkb_compose_state, is_within_click_distance, key_location_from_xkb, keystroke_from_xkb,
     keystroke_underlying_dead_key, log_cursor_icon_warning, modifiers_from_xkb, new_xkb_context,
     open_uri_internal,
     platform::{DOUBLE_CLICK_INTERVAL, SCROLL_LINES},
@@ -1061,9 +1061,10 @@ impl X11Client {
                 state.modifiers = modifiers;
                 state.pre_key_char_down.take();
                 let key_event_state = xkb_state_for_key_event(&state.xkb, event.state);
+                let code = event.detail.into();
+                let key_location = key_location_from_xkb(&key_event_state, code);
 
                 let keystroke = {
-                    let code = event.detail.into();
                     let mut keystroke = keystroke_from_xkb(&key_event_state, modifiers, code);
                     let keysym = key_event_state.key_get_one_sym(code);
 
@@ -1113,6 +1114,7 @@ impl X11Client {
                 drop(state);
                 window.handle_input(PlatformInput::KeyDown(gpui::KeyDownEvent {
                     keystroke,
+                    key_location,
                     is_held: false,
                     prefer_character_input: false,
                 }));
@@ -1124,9 +1126,10 @@ impl X11Client {
                 let modifiers = modifiers_from_state(event.state);
                 state.modifiers = modifiers;
                 let key_event_state = xkb_state_for_key_event(&state.xkb, event.state);
+                let code = event.detail.into();
+                let key_location = key_location_from_xkb(&key_event_state, code);
 
                 let keystroke = {
-                    let code = event.detail.into();
                     let keystroke = keystroke_from_xkb(&key_event_state, modifiers, code);
                     let keysym = key_event_state.key_get_one_sym(code);
 
@@ -1137,7 +1140,10 @@ impl X11Client {
                     keystroke
                 };
                 drop(state);
-                window.handle_input(PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke }));
+                window.handle_input(PlatformInput::KeyUp(gpui::KeyUpEvent {
+                    keystroke,
+                    key_location,
+                }));
             }
             Event::XinputButtonPress(event) => {
                 let window = self.get_window(event.event)?;

@@ -53,6 +53,7 @@ pub struct FbInkPresenter {
     fd: i32,
     geometry: ScreenGeometry,
     presentations: u64,
+    #[cfg(target_arch = "arm")]
     scratch_pixels: Vec<u8>,
     render_mode: KoboRenderMode,
     monochrome_threshold: u8,

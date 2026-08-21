@@ -1992,6 +1992,7 @@ mod test {
             window.dispatch_event(
                 PlatformInput::KeyDown(KeyDownEvent {
                     keystroke,
+                    key_location: gpui::KeyLocation::Standard,
                     is_held: false,
                     prefer_character_input: false,
                 }),

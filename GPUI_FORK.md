@@ -6,10 +6,8 @@ HTML renderer experiments.
 ## Provenance
 
 - Upstream repository: `https://github.com/zed-industries/zed.git`
-- Upstream base: `ea3d0f7abeb3dc5d0954d6d3fff453af5b0c7af9`
+- Upstream base: `f36aec822be697df9049fed020b593147c93b4cf`
 - Maintained branch: `central/gpui`
-- The transform/text-raster change was validated originally in
-  `ImplVisualizer/gpui-compare/upstream`.
 
 The workspace manifest is intentionally limited to GPUI and its dependency
 closure. The remaining Zed sources are retained so upstream commits can still
@@ -17,27 +15,31 @@ be merged without reconstructing repository history.
 
 ## Patch stack
 
-Each downstream behavior is kept in an independent commit:
+The maintained downstream surface is:
 
 1. Limit the workspace to GPUI and required support crates.
-2. Port transform-aware painting and text rasterization.
-3. Skip line-background glyph traversal when no background is present.
-4. Expose transform-aware painted glyph right-overhang measurement.
+2. Provide the production Kobo platform and CPU/e-ink renderer.
+3. Expose batch glyph painting and painted-glyph right-overhang measurement.
+4. Preserve standard versus numeric-keypad key location on every backend.
 5. Support named extension filters in native file dialogs.
-6. Preserve standard versus numeric-keypad key location.
+6. Gate the broader image formats while retaining optional WebP decoding.
+7. Provide configurable-scale headless contexts and a WGPU headless renderer.
+8. Coalesce Wayland resize work with grow-only WGPU surface capacity.
 
-The old RustTrados patches that suppress text lifecycle panics, restrict image
-formats, hide platform APIs, or alter vendored example targets are deliberately
-not part of the shared fork. Those are either policy decisions or artifacts of
-the older vendored crate.
+The experimental transform-aware widget/text-raster patch is not retained.
+ImplVisualizer's production graph applies its own pan and zoom, and GPUI widgets
+continue to use ordinary window coordinates. `container_query` comes directly
+from upstream GPUI.
 
 ## Validation
 
-Run:
+The host-side compile checks are:
 
 ```sh
-cargo check -p gpui -p gpui_platform -p gpui_wgpu -p gpui_linux -p gpui_web
-cargo test -p gpui --lib
+cargo check --locked -p gpui --lib
+cargo check --locked -p gpui_wgpu --features test-support
+cargo check --locked -p gpui_platform --features test-support,wayland,x11
+cargo check --locked -p gpui_kobo
 ```
 
 Platform-specific changes under `gpui_macos` and `gpui_windows` should also be

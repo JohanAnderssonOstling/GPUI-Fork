@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
@@ -804,21 +805,18 @@ impl PlatformWindow for KoboWindow {
             }
             Err(error) => self.0.render_error.set(Some(error.to_string())),
         }
-    }
+        drop(render);
 
-    fn completed_frame(&self) {
         let input_handler = self.0.input_handler.take();
         let input_active = input_handler.is_some();
         self.0.input_handler.set(input_handler);
-        if self.0.text_input_active.get() == input_active {
-            return;
+        if self.0.text_input_active.replace(input_active) != input_active {
+            self.request_frame(false);
         }
-        self.0.text_input_active.set(input_active);
-        let callback = self.0.request_frame.take();
-        if let Some(mut callback) = callback {
-            callback(RequestFrameOptions::default());
-            self.0.request_frame.set(Some(callback));
-        }
+    }
+
+    fn schedule_frame(&self) {
+        self.request_frame(false);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -1932,7 +1930,7 @@ impl Platform for KoboPlatform {
     fn quit(&self) {
         self.request_quit();
     }
-    fn restart(&self, _binary_path: Option<PathBuf>) {
+    fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<OsString>) {
         self.quit();
     }
     fn activate(&self, _ignoring_other_apps: bool) {}

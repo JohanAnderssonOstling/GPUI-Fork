@@ -29,9 +29,9 @@ use ctor::ctor;
 use dispatch2::DispatchQueue;
 use futures::channel::oneshot;
 use gpui::{
-    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
-    KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, FileDialogFilter,
+    ForegroundExecutor, KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions,
+    Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
     PlatformWindow, Result, SystemMenuType, Task, ThermalState, WindowAppearance, WindowKind,
     WindowParams, popup::PopupNotSupportedError,
 };
@@ -777,6 +777,7 @@ impl Platform for MacPlatform {
     fn prompt_for_paths(
         &self,
         options: PathPromptOptions,
+        filters: Vec<FileDialogFilter>,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
         let (done_tx, done_rx) = oneshot::channel();
         self.foreground_executor()
@@ -789,6 +790,20 @@ impl Platform for MacPlatform {
 
                     panel.setCanCreateDirectories(true.to_objc());
                     panel.setResolvesAliases_(false.to_objc());
+
+                    let extensions: Vec<id> = filters
+                        .iter()
+                        .flat_map(|filter| {
+                            filter
+                                .extensions
+                                .iter()
+                                .map(|extension| ns_string(extension.as_str()))
+                        })
+                        .collect();
+                    if !extensions.is_empty() {
+                        let extensions: id = NSArray::arrayWithObjects(nil, &extensions);
+                        let _: () = msg_send![panel, setAllowedFileTypes: extensions];
+                    }
                     let done_tx = Cell::new(Some(done_tx));
                     let block = ConcreteBlock::new(move |response: NSModalResponse| {
                         let result = if response == NSModalResponse::NSModalResponseOk {
@@ -828,6 +843,7 @@ impl Platform for MacPlatform {
         &self,
         directory: &Path,
         suggested_name: Option<&str>,
+        filters: Vec<FileDialogFilter>,
     ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
         let directory = directory.to_owned();
         let suggested_name = suggested_name.map(|s| s.to_owned());
@@ -843,6 +859,20 @@ impl Platform for MacPlatform {
                     if let Some(suggested_name) = suggested_name {
                         let name_string = ns_string(&suggested_name);
                         let _: () = msg_send![panel, setNameFieldStringValue: name_string];
+                    }
+
+                    let extensions: Vec<id> = filters
+                        .iter()
+                        .flat_map(|filter| {
+                            filter
+                                .extensions
+                                .iter()
+                                .map(|extension| ns_string(extension.as_str()))
+                        })
+                        .collect();
+                    if !extensions.is_empty() {
+                        let extensions: id = NSArray::arrayWithObjects(nil, &extensions);
+                        let _: () = msg_send![panel, setAllowedFileTypes: extensions];
                     }
 
                     let done_tx = Cell::new(Some(done_tx));

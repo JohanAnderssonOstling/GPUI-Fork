@@ -509,7 +509,7 @@ fn underline_fingerprint(underline: &Underline) -> u64 {
     hash_scaled_bounds(&mut hasher, underline.content_mask.bounds);
     hash_color(&mut hasher, underline.color);
     hash_f32(&mut hasher, underline.thickness.0);
-    hasher.write_u32(underline.wavy);
+    hasher.write_u32(underline.wavy.get() as u32);
     hasher.finish()
 }
 
@@ -1122,7 +1122,7 @@ impl KoboRenderer {
     }
 
     fn draw_underline(target: &mut GrayImage, underline: &Underline) -> Result<()> {
-        if underline.wavy == 0 {
+        if !underline.wavy.get() {
             fill_rect(
                 target,
                 underline.bounds,
@@ -1500,7 +1500,7 @@ pub fn extended_renderer_self_test() -> Result<RendererCoverage> {
         content_mask: mask,
         color: rgb(0x181818).into(),
         thickness: ScaledPixels(1.0),
-        wavy: 1,
+        wavy: true.into(),
     };
     KoboRenderer::draw_underline(&mut target, &underline)?;
 

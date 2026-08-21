@@ -2,17 +2,17 @@ use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
     Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
     Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
-    SharedString, SharedUri, StyleRefinement, Styled, Task, Window, decode_static_image,
-    decode_static_image_from_decoder, px,
+    SharedString, SharedUri, StyleRefinement, Styled, Task, Window, decode_static_image, px,
 };
+#[cfg(any(feature = "image-formats", feature = "image-webp"))]
+use crate::decode_static_image_from_decoder;
 use anyhow::Result;
 
 use futures::Future;
 use gpui_util::ResultExt;
-use image::{
-    AnimationDecoder, ImageError, ImageFormat, Rgba,
-    codecs::{gif::GifDecoder, webp::WebPDecoder},
-};
+use image::{AnimationDecoder, ImageError, ImageFormat, codecs::gif::GifDecoder};
+#[cfg(any(feature = "image-formats", feature = "image-webp"))]
+use image::{Rgba, codecs::webp::WebPDecoder};
 use scheduler::Instant;
 use smallvec::SmallVec;
 use std::{
@@ -697,6 +697,7 @@ impl Asset for ImageAssetLoader {
 
                         frames
                     }
+                    #[cfg(any(feature = "image-formats", feature = "image-webp"))]
                     ImageFormat::WebP => {
                         let mut decoder = WebPDecoder::new(Cursor::new(&bytes))?;
 
