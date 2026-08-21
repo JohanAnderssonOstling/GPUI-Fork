@@ -16,9 +16,9 @@ pub use android_activity::AndroidApp;
 pub use platform::{AndroidPlatform, init};
 
 pub fn init_logging() {
-    // Debug for the sync stack, info elsewhere (wgpu and friends are noisy).
+    // Keep the Android backend verbose without enabling noisy dependency logs.
     let filter = android_logger::FilterBuilder::new()
-        .parse("info,deltadb=debug,delta_remote=debug")
+        .parse("info,gpui_android=debug")
         .build();
     android_logger::init_once(
         android_logger::Config::default()

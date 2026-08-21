@@ -4,7 +4,7 @@ use android_activity::input::{
 };
 use android_activity::{AndroidApp, InputStatus};
 use gpui::{
-    KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
+    KeyDownEvent, KeyLocation, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput, Point, ScrollDelta,
     ScrollWheelEvent, TouchPhase, point, px,
 };
@@ -210,11 +210,13 @@ pub(crate) fn handle_input_event(
                 key: key.to_owned(),
                 key_char: key_char.clone(),
             };
+            let key_location = key_location(keycode);
 
             match key_event.action() {
                 KeyAction::Down => {
                     let result = window.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
                         keystroke,
+                        key_location,
                         is_held: false,
                         prefer_character_input: false,
                     }));
@@ -231,13 +233,42 @@ pub(crate) fn handle_input_event(
                     InputStatus::Handled
                 }
                 KeyAction::Up => {
-                    window.dispatch_input(PlatformInput::KeyUp(KeyUpEvent { keystroke }));
+                    window.dispatch_input(PlatformInput::KeyUp(KeyUpEvent {
+                        keystroke,
+                        key_location,
+                    }));
                     InputStatus::Handled
                 }
                 _ => InputStatus::Unhandled,
             }
         }
         _ => InputStatus::Unhandled,
+    }
+}
+
+fn key_location(keycode: Keycode) -> KeyLocation {
+    match keycode {
+        Keycode::Numpad0
+        | Keycode::Numpad1
+        | Keycode::Numpad2
+        | Keycode::Numpad3
+        | Keycode::Numpad4
+        | Keycode::Numpad5
+        | Keycode::Numpad6
+        | Keycode::Numpad7
+        | Keycode::Numpad8
+        | Keycode::Numpad9
+        | Keycode::NumpadDivide
+        | Keycode::NumpadMultiply
+        | Keycode::NumpadSubtract
+        | Keycode::NumpadAdd
+        | Keycode::NumpadDot
+        | Keycode::NumpadComma
+        | Keycode::NumpadEnter
+        | Keycode::NumpadEquals
+        | Keycode::NumpadLeftParen
+        | Keycode::NumpadRightParen => KeyLocation::Numpad,
+        _ => KeyLocation::Standard,
     }
 }
 

@@ -7,8 +7,8 @@
 //! ```sh
 //! cargo ndk -t arm64-v8a build -p hello_android --manifest-path crates/gpui_android/examples/hello_android/Cargo.toml
 //! ```
-//! then run `script/android/package-apk.sh hello_android <path-to-libhello_android.so>`
-//! from the delta repo and `adb install` the result.
+//! Then package the resulting `libhello_android.so` in a NativeActivity APK
+//! with the Android build tools and install it with `adb install`.
 
 use android_activity::AndroidApp;
 use gpui::{

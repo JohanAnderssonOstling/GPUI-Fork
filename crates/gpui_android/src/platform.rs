@@ -9,14 +9,16 @@ use anyhow::Result;
 use futures::channel::oneshot;
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DummyKeyboardMapper,
-    ForegroundExecutor, Keymap, Menu, MenuItem, PathPromptOptions, Platform, PlatformDisplay,
-    PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow,
-    PriorityQueueReceiver, RunnableVariant, Task, ThermalState, WindowAppearance, WindowParams,
+    FileDialogFilter, ForegroundExecutor, Keymap, Menu, MenuItem, PathPromptOptions, Platform,
+    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    PlatformWindow, PriorityQueueReceiver, RunnableVariant, Task, ThermalState, WindowAppearance,
+    WindowParams,
 };
 use gpui_wgpu::GpuContext;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
@@ -278,7 +280,7 @@ impl Platform for AndroidPlatform {
         self.quit_requested.set(true);
     }
 
-    fn restart(&self, _binary_path: Option<PathBuf>) {}
+    fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<OsString>) {}
 
     fn activate(&self, _ignoring_other_apps: bool) {}
 
@@ -343,6 +345,7 @@ impl Platform for AndroidPlatform {
     fn prompt_for_paths(
         &self,
         _options: PathPromptOptions,
+        _filters: Vec<FileDialogFilter>,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
         let (tx, rx) = oneshot::channel();
         tx.send(Err(anyhow::anyhow!(
@@ -356,6 +359,7 @@ impl Platform for AndroidPlatform {
         &self,
         _directory: &Path,
         _suggested_name: Option<&str>,
+        _filters: Vec<FileDialogFilter>,
     ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
         let (tx, rx) = oneshot::channel();
         tx.send(Err(anyhow::anyhow!(

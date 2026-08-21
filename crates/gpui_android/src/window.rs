@@ -8,7 +8,7 @@ use gpui::{
     ResizeEdge, Scene, Size, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
     WindowControlArea, WindowControls, WindowDecorations, WindowParams, px,
 };
-use gpui_wgpu::{GpuContext, WgpuRenderer, WgpuSurfaceConfig};
+use gpui_wgpu::{GpuContext, SurfaceSizePolicy, WgpuRenderer, WgpuSurfaceConfig};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -96,6 +96,7 @@ pub struct AndroidWindow {
 fn surface_config(size: Size<DevicePixels>) -> WgpuSurfaceConfig {
     WgpuSurfaceConfig {
         size,
+        size_policy: SurfaceSizePolicy::Exact,
         transparent: false,
         // Mailbox avoids blocking in get_current_texture() during Android
         // lifecycle transitions; the renderer falls back to Fifo if unsupported.
@@ -454,8 +455,6 @@ impl PlatformWindow for AndroidWindow {
         }
         state.renderer.draw(scene);
     }
-
-    fn completed_frame(&self) {}
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.inner.state.borrow().renderer.sprite_atlas().clone()
