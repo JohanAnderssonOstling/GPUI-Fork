@@ -331,7 +331,7 @@ fn map_open_ai_error(error: open_ai::RequestError) -> LanguageModelCompletionErr
                 retry_after,
             )
         }
-        open_ai::RequestError::Other(error) => LanguageModelCompletionError::Other(error),
+        error => error.into(),
     }
 }
 
@@ -451,7 +451,7 @@ impl LanguageModel for VercelAiGatewayLanguageModel {
             LanguageModelCompletionError,
         >,
     > {
-        let request = crate::provider::open_ai::into_open_ai(
+        let request = match crate::provider::open_ai::into_open_ai(
             request,
             &self.model.name,
             self.model.capabilities.parallel_tool_calls,
@@ -460,7 +460,10 @@ impl LanguageModel for VercelAiGatewayLanguageModel {
             crate::provider::open_ai::ChatCompletionMaxTokensParameter::MaxCompletionTokens,
             None,
             false,
-        );
+        ) {
+            Ok(request) => request,
+            Err(error) => return async move { Err(error.into()) }.boxed(),
+        };
         let completions = self.stream_open_ai(request, cx);
         async move {
             let mapper = crate::provider::open_ai::OpenAiEventMapper::new();
@@ -517,12 +520,14 @@ async fn list_models(
             provider: PROVIDER_NAME,
             error,
         })?;
+    let host = request.uri().host().unwrap_or(api_url).to_owned();
     let mut response =
         client
             .send(request)
             .await
             .map_err(|error| LanguageModelCompletionError::HttpSend {
                 provider: PROVIDER_NAME,
+                host,
                 error,
             })?;
 

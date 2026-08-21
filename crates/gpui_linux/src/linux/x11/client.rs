@@ -50,8 +50,9 @@ use super::{
 
 use crate::linux::{
     DEFAULT_CURSOR_ICON_NAME, LinuxClient, capslock_from_xkb, cursor_style_to_icon_names,
-    get_xkb_compose_state, is_within_click_distance, key_location_from_xkb, keystroke_from_xkb,
-    keystroke_underlying_dead_key, log_cursor_icon_warning, modifiers_from_xkb, open_uri_internal,
+    get_xkb_compose_state, is_within_click_distance, keystroke_from_xkb,
+    keystroke_underlying_dead_key, log_cursor_icon_warning, modifiers_from_xkb, new_xkb_context,
+    open_uri_internal,
     platform::{DOUBLE_CLICK_INTERVAL, SCROLL_LINES},
     reveal_path_internal,
     xdg_desktop_portal::{Event as XDPEvent, XDPEventSource},
@@ -81,7 +82,6 @@ const GPUI_X11_SCALE_FACTOR_ENV: &str = "GPUI_X11_SCALE_FACTOR";
 pub(crate) struct WindowRef {
     window: X11WindowStatePtr,
     refresh_state: Option<RefreshState>,
-    expose_event_received: bool,
     last_visibility: Visibility,
     is_mapped: bool,
 }
@@ -321,12 +321,15 @@ impl X11Client {
                         // Insert the runnables as idle callbacks, so we make sure that user-input and X11
                         // events have higher priority and runnables are only worked off after the event
                         // callbacks.
-                        handle.insert_idle(|_| {
+                        handle.insert_idle(|client| {
                             let location = runnable.metadata().location;
                             let spawned = runnable.metadata().spawned;
                             profiler::update_running_task(spawned, location);
                             runnable.run();
                             profiler::save_task_timing();
+
+                            let xcb_connection = client.0.borrow().xcb_connection.clone();
+                            client.process_x11_events(&xcb_connection).log_err();
                         });
                     }
                 }
@@ -421,7 +424,7 @@ impl X11Client {
             ),
         )?;
 
-        let xkb_context = xkbc::Context::new(xkbc::CONTEXT_NO_FLAGS);
+        let xkb_context = new_xkb_context()?;
         let xkb_device_id = xkbc::x11::get_core_keyboard_device_id(&xcb_connection);
         let xkb_state = {
             let xkb_keymap = xkbc::x11::keymap_new_from_device(
@@ -657,13 +660,6 @@ impl X11Client {
                 break;
             }
 
-            for window in windows_to_refresh.into_iter() {
-                let mut state = self.0.borrow_mut();
-                if let Some(window) = state.windows.get_mut(&window) {
-                    window.expose_event_received = true;
-                }
-            }
-
             for event in events.into_iter() {
                 let mut state = self.0.borrow_mut();
                 if !state.has_xim() {
@@ -711,6 +707,21 @@ impl X11Client {
                         drop(state);
                         self.handle_event(event);
                     }
+                }
+            }
+
+            for x_window in windows_to_refresh {
+                let window = self
+                    .0
+                    .borrow()
+                    .windows
+                    .get(&x_window)
+                    .and_then(|window| window.is_mapped.then(|| window.window.clone()));
+                if let Some(window) = window {
+                    window.refresh(RequestFrameOptions {
+                        require_presentation: true,
+                        force_render: false,
+                    });
                 }
             }
         }
@@ -1050,10 +1061,9 @@ impl X11Client {
                 state.modifiers = modifiers;
                 state.pre_key_char_down.take();
                 let key_event_state = xkb_state_for_key_event(&state.xkb, event.state);
-                let code = event.detail.into();
-                let key_location = key_location_from_xkb(&key_event_state, code);
 
                 let keystroke = {
+                    let code = event.detail.into();
                     let mut keystroke = keystroke_from_xkb(&key_event_state, modifiers, code);
                     let keysym = key_event_state.key_get_one_sym(code);
 
@@ -1103,7 +1113,6 @@ impl X11Client {
                 drop(state);
                 window.handle_input(PlatformInput::KeyDown(gpui::KeyDownEvent {
                     keystroke,
-                    key_location,
                     is_held: false,
                     prefer_character_input: false,
                 }));
@@ -1115,10 +1124,9 @@ impl X11Client {
                 let modifiers = modifiers_from_state(event.state);
                 state.modifiers = modifiers;
                 let key_event_state = xkb_state_for_key_event(&state.xkb, event.state);
-                let code = event.detail.into();
-                let key_location = key_location_from_xkb(&key_event_state, code);
 
                 let keystroke = {
+                    let code = event.detail.into();
                     let keystroke = keystroke_from_xkb(&key_event_state, modifiers, code);
                     let keysym = key_event_state.key_get_one_sym(code);
 
@@ -1129,10 +1137,7 @@ impl X11Client {
                     keystroke
                 };
                 drop(state);
-                window.handle_input(PlatformInput::KeyUp(gpui::KeyUpEvent {
-                    keystroke,
-                    key_location,
-                }));
+                window.handle_input(PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke }));
             }
             Event::XinputButtonPress(event) => {
                 let window = self.get_window(event.event)?;
@@ -1654,7 +1659,6 @@ impl LinuxClient for X11Client {
         let window_ref = WindowRef {
             window: window.0.clone(),
             refresh_state: None,
-            expose_event_received: false,
             last_visibility: Visibility::UNOBSCURED,
             is_mapped: false,
         };
@@ -1985,15 +1989,13 @@ impl X11ClientState {
                         let mut state = client.0.borrow_mut();
                         let xcb_connection = state.xcb_connection.clone();
                         if let Some(window) = state.windows.get_mut(&x_window) {
-                            let expose_event_received = window.expose_event_received;
-                            window.expose_event_received = false;
                             let force_render = std::mem::take(
                                 &mut window.window.state.borrow_mut().force_render_after_recovery,
                             );
                             let window = window.window.clone();
                             drop(state);
                             window.refresh(RequestFrameOptions {
-                                require_presentation: expose_event_received,
+                                require_presentation: false,
                                 force_render,
                             });
                         }
@@ -2813,7 +2815,7 @@ mod tests {
     }
 
     fn test_keymap_with_variant(layouts: &str, variant: &str) -> xkbc::Keymap {
-        let context = xkbc::Context::new(xkbc::CONTEXT_NO_FLAGS);
+        let context = new_xkb_context().expect("test XKB context should initialize");
         xkbc::Keymap::new_from_names(
             &context,
             "",
