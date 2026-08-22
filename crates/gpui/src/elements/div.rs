@@ -3072,7 +3072,7 @@ impl Interactivity {
                     let pending_mouse_down = pending_mouse_down.clone();
                     let source_bounds = hitbox.bounds;
                     move |window: &Window| {
-                        !window.last_input_was_keyboard()
+                        window.last_input_supports_hover()
                             && pending_mouse_down.borrow().is_none()
                             && source_bounds.contains(&window.mouse_position())
                     }

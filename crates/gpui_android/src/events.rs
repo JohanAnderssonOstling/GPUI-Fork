@@ -6,7 +6,7 @@ use android_activity::{AndroidApp, InputStatus};
 use gpui::{
     KeyDownEvent, KeyLocation, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput, Point, ScrollDelta,
-    ScrollWheelEvent, TouchPhase, point, px,
+    ScrollWheelEvent, TouchEvent, TouchId, TouchPhase, point, px,
 };
 use std::collections::HashMap;
 use std::time::Instant;
@@ -16,6 +16,24 @@ use std::time::Instant;
 const TOUCH_SLOP: f32 = 8.0;
 const DOUBLE_TAP_MILLIS: u128 = 400;
 const DOUBLE_TAP_DISTANCE: f32 = 16.0;
+
+pub(crate) fn dispatch_reader_page_key(window: &AndroidWindowInner, next: bool) {
+    let keystroke = Keystroke {
+        modifiers: Modifiers::default(),
+        key: if next { "pagedown" } else { "pageup" }.to_owned(),
+        key_char: None,
+    };
+    window.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
+        keystroke: keystroke.clone(),
+        key_location: KeyLocation::Standard,
+        is_held: false,
+        prefer_character_input: false,
+    }));
+    window.dispatch_input(PlatformInput::KeyUp(KeyUpEvent {
+        keystroke,
+        key_location: KeyLocation::Standard,
+    }));
+}
 
 pub(crate) struct ClickState {
     last_position: Point<Pixels>,
@@ -55,9 +73,10 @@ impl ClickState {
     }
 }
 
-/// Single-finger gesture recognizer. GPUI has no touch event variants, so we
-/// synthesize: a tap becomes MouseDown + MouseUp, and a drag past the slop
-/// becomes a ScrollWheel stream with touch phases (content follows the finger).
+/// Single-finger gesture recognizer. Raw touch events preserve input modality;
+/// a tap additionally becomes MouseDown + MouseUp for GPUI's existing click
+/// handlers, and a drag past the slop becomes a ScrollWheel stream with touch
+/// phases so content follows the finger.
 #[derive(Default)]
 pub(crate) enum TouchGesture {
     #[default]
@@ -77,6 +96,7 @@ pub(crate) fn handle_input_event(
     gesture: &mut TouchGesture,
     key_maps: &mut HashMap<i32, KeyCharacterMap>,
     app: &AndroidApp,
+    finish_activity: &mut bool,
 ) -> InputStatus {
     match event {
         InputEvent::MotionEvent(motion_event) => {
@@ -84,85 +104,108 @@ pub(crate) fn handle_input_event(
             let pointer_index = motion_event.pointer_index();
             let pointer = motion_event.pointer_at_index(pointer_index);
             let position = point(px(pointer.x() / scale), px(pointer.y() / scale));
+            let touch_id = TouchId(pointer.pointer_id().max(0) as u64);
             window.state.borrow_mut().mouse_position = position;
 
             match motion_event.action() {
                 MotionAction::Down => {
+                    window.dispatch_input(PlatformInput::Touch(TouchEvent {
+                        id: touch_id,
+                        phase: TouchPhase::Started,
+                        position,
+                        force: None,
+                    }));
                     *gesture = TouchGesture::Pending {
                         start: position,
                         last: position,
                     };
                 }
-                MotionAction::Move => match gesture {
-                    TouchGesture::Pending { start, last } => {
-                        let moved = ((f32::from(position.x) - f32::from(start.x)).powi(2)
-                            + (f32::from(position.y) - f32::from(start.y)).powi(2))
-                        .sqrt();
-                        if moved > TOUCH_SLOP {
+                MotionAction::Move => {
+                    window.dispatch_input(PlatformInput::Touch(TouchEvent {
+                        id: touch_id,
+                        phase: TouchPhase::Moved,
+                        position,
+                        force: None,
+                    }));
+                    match gesture {
+                        TouchGesture::Pending { start, last } => {
+                            let moved = ((f32::from(position.x) - f32::from(start.x)).powi(2)
+                                + (f32::from(position.y) - f32::from(start.y)).powi(2))
+                            .sqrt();
+                            if moved > TOUCH_SLOP {
+                                let delta = point(position.x - last.x, position.y - last.y);
+                                let anchor = *start;
+                                *gesture = TouchGesture::Scrolling { last: position };
+                                window.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                                    position: anchor,
+                                    delta: ScrollDelta::Pixels(delta),
+                                    modifiers: Modifiers::default(),
+                                    touch_phase: TouchPhase::Started,
+                                }));
+                            } else {
+                                *last = position;
+                            }
+                        }
+                        TouchGesture::Scrolling { last } => {
                             let delta = point(position.x - last.x, position.y - last.y);
-                            let anchor = *start;
-                            *gesture = TouchGesture::Scrolling { last: position };
+                            *last = position;
                             window.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
-                                position: anchor,
+                                position,
                                 delta: ScrollDelta::Pixels(delta),
                                 modifiers: Modifiers::default(),
-                                touch_phase: TouchPhase::Started,
+                                touch_phase: TouchPhase::Moved,
                             }));
-                        } else {
-                            *last = position;
                         }
+                        TouchGesture::None => {}
                     }
-                    TouchGesture::Scrolling { last } => {
-                        let delta = point(position.x - last.x, position.y - last.y);
-                        *last = position;
-                        window.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
-                            position,
-                            delta: ScrollDelta::Pixels(delta),
-                            modifiers: Modifiers::default(),
-                            touch_phase: TouchPhase::Moved,
-                        }));
-                    }
-                    TouchGesture::None => {}
-                },
-                MotionAction::Up => match std::mem::take(gesture) {
-                    TouchGesture::Pending { start, .. } => {
-                        let click_count = window.click_state.borrow_mut().register_click(start);
-                        window.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
-                            position: start,
-                            pressed_button: None,
-                            modifiers: Modifiers::default(),
-                        }));
-                        window.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
-                            button: MouseButton::Left,
-                            position: start,
-                            modifiers: Modifiers::default(),
-                            click_count,
-                            first_mouse: false,
-                        }));
-                        window.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
-                            button: MouseButton::Left,
-                            position: start,
-                            modifiers: Modifiers::default(),
-                            click_count,
-                        }));
-                        // Mobile keyboard UX: a tap summons the IME when an
-                        // editable has focus after the click lands; dismissal
-                        // then sticks until the next tap (set_input_handler
-                        // deliberately never requests the keyboard).
-                        if window.state.borrow().input_handler.is_some() {
-                            app.show_soft_input(true);
+                }
+                MotionAction::Up => {
+                    match std::mem::take(gesture) {
+                        TouchGesture::Pending { start, .. } => {
+                            let click_count = window.click_state.borrow_mut().register_click(start);
+                            window.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
+                                position: start,
+                                pressed_button: None,
+                                modifiers: Modifiers::default(),
+                            }));
+                            window.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
+                                button: MouseButton::Left,
+                                position: start,
+                                modifiers: Modifiers::default(),
+                                click_count,
+                                first_mouse: false,
+                            }));
+                            window.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+                                button: MouseButton::Left,
+                                position: start,
+                                modifiers: Modifiers::default(),
+                                click_count,
+                            }));
+                            // Mobile keyboard UX: a tap summons the IME when an
+                            // editable has focus after the click lands; dismissal
+                            // then sticks until the next tap (set_input_handler
+                            // deliberately never requests the keyboard).
+                            if window.state.borrow().input_handler.is_some() {
+                                app.show_soft_input(true);
+                            }
                         }
+                        TouchGesture::Scrolling { .. } => {
+                            window.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                                position,
+                                delta: ScrollDelta::Pixels(Point::default()),
+                                modifiers: Modifiers::default(),
+                                touch_phase: TouchPhase::Ended,
+                            }));
+                        }
+                        TouchGesture::None => {}
                     }
-                    TouchGesture::Scrolling { .. } => {
-                        window.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
-                            position,
-                            delta: ScrollDelta::Pixels(Point::default()),
-                            modifiers: Modifiers::default(),
-                            touch_phase: TouchPhase::Ended,
-                        }));
-                    }
-                    TouchGesture::None => {}
-                },
+                    window.dispatch_input(PlatformInput::Touch(TouchEvent {
+                        id: touch_id,
+                        phase: TouchPhase::Ended,
+                        position,
+                        force: None,
+                    }));
+                }
                 MotionAction::Cancel => {
                     if matches!(gesture, TouchGesture::Scrolling { .. }) {
                         window.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
@@ -173,6 +216,12 @@ pub(crate) fn handle_input_event(
                         }));
                     }
                     *gesture = TouchGesture::None;
+                    window.dispatch_input(PlatformInput::Touch(TouchEvent {
+                        id: touch_id,
+                        phase: TouchPhase::Cancelled,
+                        position,
+                        force: None,
+                    }));
                 }
                 _ => return InputStatus::Unhandled,
             }
@@ -221,7 +270,11 @@ pub(crate) fn handle_input_event(
                         prefer_character_input: false,
                     }));
 
-                    let propagate = result.is_none_or(|result| result.propagate);
+                    let propagate = result.as_ref().is_none_or(|result| result.propagate);
+                    if keycode == Keycode::Back && propagate {
+                        *finish_activity = true;
+                    }
+
                     if propagate
                         && modifiers.is_subset_of(&Modifiers::shift())
                         && let Some(text) = key_char
@@ -326,7 +379,7 @@ fn modifiers_from_meta_state(meta_state: MetaState) -> Modifiers {
 /// Maps an Android keycode to GPUI's key names (see `Keystroke::parse`).
 /// Returns `Some("")` for modifier keys (handled via ModifiersChanged) and
 /// `None` for keys we don't handle so the OS can apply default behavior
-/// (volume, back, etc.).
+/// (volume, media controls, etc.).
 fn keycode_to_key(keycode: Keycode) -> Option<&'static str> {
     use Keycode::*;
     Some(match keycode {
@@ -371,6 +424,7 @@ fn keycode_to_key(keycode: Keycode) -> Option<&'static str> {
         Tab => "tab",
         Del => "backspace",
         ForwardDel => "delete",
+        Back => "back",
         Escape => "escape",
         DpadUp => "up",
         DpadDown => "down",

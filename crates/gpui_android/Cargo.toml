@@ -12,12 +12,13 @@ workspace = true
 path = "src/gpui_android.rs"
 
 [target.'cfg(target_os = "android")'.dependencies]
-android-activity = { version = "0.6", features = ["native-activity"] }
+android-activity = { version = "0.6", features = ["game-activity"] }
 android_logger = "0.15"
 anyhow.workspace = true
 futures.workspace = true
 gpui.workspace = true
 gpui_wgpu.workspace = true
+jni = "0.22.4"
 libc.workspace = true
 log.workspace = true
 parking_lot.workspace = true

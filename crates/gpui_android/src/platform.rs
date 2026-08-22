@@ -2,35 +2,283 @@ use crate::dispatcher::AndroidDispatcher;
 use crate::display::AndroidDisplay;
 use crate::events::{self, TouchGesture};
 use crate::keyboard::AndroidKeyboardLayout;
-use crate::window::{AndroidWindow, AndroidWindowInner};
+use crate::window::{
+    AndroidPhysicalEdges, AndroidPhysicalInsets, AndroidWindow, AndroidWindowInner,
+};
 use android_activity::input::KeyCharacterMap;
 use android_activity::{AndroidApp, MainEvent, PollEvent};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use futures::channel::oneshot;
 use gpui::{
-    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DummyKeyboardMapper,
-    FileDialogFilter, ForegroundExecutor, Keymap, Menu, MenuItem, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, PriorityQueueReceiver, RunnableVariant, Task, ThermalState, WindowAppearance,
-    WindowParams,
+    Action, AnyWindowHandle, AppLifecyclePhase, BackgroundExecutor, ClipboardItem, CursorStyle,
+    DummyKeyboardMapper, FileDialogFilter, ForegroundExecutor, Keymap, Menu, MenuItem,
+    PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper,
+    PlatformTextSystem, PlatformWindow, PriorityQueueReceiver, RunnableVariant, SelectedDirectory,
+    SelectedDirectoryFile, SelectedDirectoryReader, SelectedFile, Task, ThermalState,
+    WindowAppearance, WindowParams,
 };
 use gpui_wgpu::GpuContext;
+use jni::objects::{JObject, JString};
+use jni::refs::Global;
+use jni::strings::JNIString;
+use jni::{JValue, JavaVM, jni_sig, jni_str};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
+use std::fs::File;
+use std::io::Read as _;
+use std::os::fd::FromRawFd as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 static ANDROID_APP: OnceLock<AndroidApp> = OnceLock::new();
+static NEXT_PATH_PROMPT_ID: AtomicU64 = AtomicU64::new(1);
+static PENDING_FILE_PROMPTS: OnceLock<Mutex<HashMap<u64, PendingFilePrompt>>> = OnceLock::new();
+static PENDING_DIRECTORY_PROMPTS: OnceLock<Mutex<HashMap<u64, PendingDirectoryPrompt>>> = OnceLock::new();
+static PENDING_VOLUME_BUTTONS: OnceLock<Mutex<VecDeque<bool>>> = OnceLock::new();
+static PENDING_WINDOW_INSETS: OnceLock<Mutex<Option<AndroidPhysicalInsets>>> = OnceLock::new();
+
+struct PendingSelectedFile {
+    name: String,
+    file: File,
+}
+
+struct PendingFilePrompt {
+    sender: oneshot::Sender<Result<Option<Vec<SelectedFile>>>>,
+    executor: BackgroundExecutor,
+    files: Vec<PendingSelectedFile>,
+}
+
+struct PendingDirectoryFile {
+    path: Vec<String>,
+    uri: String,
+}
+
+struct PendingDirectoryPrompt {
+    sender: oneshot::Sender<Result<Option<Vec<SelectedDirectory>>>>,
+    name: Option<String>,
+    directories: Vec<Vec<String>>,
+    files: Vec<PendingDirectoryFile>,
+}
+
+fn pending_file_prompts() -> &'static Mutex<HashMap<u64, PendingFilePrompt>> {
+    PENDING_FILE_PROMPTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn pending_directory_prompts() -> &'static Mutex<HashMap<u64, PendingDirectoryPrompt>> {
+    PENDING_DIRECTORY_PROMPTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn pending_volume_buttons() -> &'static Mutex<VecDeque<bool>> {
+    PENDING_VOLUME_BUTTONS.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn pending_window_insets() -> &'static Mutex<Option<AndroidPhysicalInsets>> {
+    PENDING_WINDOW_INSETS.get_or_init(|| Mutex::new(None))
+}
+
+/// Adds one provider-owned file descriptor to an Android file prompt. The
+/// caller transfers ownership of `file` to GPUI.
+pub fn selected_file_descriptor(request_id: u64, name: String, file: File) {
+    let mut prompts = pending_file_prompts().lock().unwrap();
+    if let Some(prompt) = prompts.get_mut(&request_id) {
+        prompt.files.push(PendingSelectedFile { name, file });
+    } else {
+        log::warn!("received a file descriptor for unknown Android file prompt {request_id}");
+    }
+}
+
+/// Completes an Android file prompt after all selected descriptors have been
+/// transferred. Descriptor reads run on a dedicated background thread.
+pub fn complete_file_prompt(request_id: u64, error: Option<anyhow::Error>, cancelled: bool) {
+    let prompt = pending_file_prompts().lock().unwrap().remove(&request_id);
+    let Some(prompt) = prompt else {
+        log::warn!("received completion for unknown Android file prompt {request_id}");
+        return;
+    };
+
+    if cancelled {
+        prompt.sender.send(Ok(None)).ok();
+        return;
+    }
+    if let Some(error) = error {
+        prompt.sender.send(Err(error)).ok();
+        return;
+    }
+
+    let PendingFilePrompt {
+        sender,
+        executor,
+        files,
+    } = prompt;
+    executor
+        .spawn_dedicated(move |_| async move {
+            let result = files
+                .into_iter()
+                .map(|mut selected| {
+                    let mut bytes = Vec::new();
+                    selected
+                        .file
+                        .read_to_end(&mut bytes)
+                        .with_context(|| format!("failed to read selected Android file {}", selected.name))?;
+                    Ok(SelectedFile {
+                        name: selected.name,
+                        bytes,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(Some);
+            sender.send(result).ok();
+        })
+        .detach();
+}
+
+pub fn selected_directory_root(request_id: u64, name: String) {
+    let mut prompts = pending_directory_prompts().lock().unwrap();
+    if let Some(prompt) = prompts.get_mut(&request_id) {
+        prompt.name = Some(name);
+    } else {
+        log::warn!("received a root for unknown Android directory prompt {request_id}");
+    }
+}
+
+pub fn selected_directory_path(request_id: u64, path: Vec<String>) {
+    let mut prompts = pending_directory_prompts().lock().unwrap();
+    if let Some(prompt) = prompts.get_mut(&request_id) {
+        prompt.directories.push(path);
+    } else {
+        log::warn!("received a path for unknown Android directory prompt {request_id}");
+    }
+}
+
+pub fn selected_directory_file(request_id: u64, path: Vec<String>, uri: String) {
+    let mut prompts = pending_directory_prompts().lock().unwrap();
+    if let Some(prompt) = prompts.get_mut(&request_id) {
+        prompt.files.push(PendingDirectoryFile { path, uri });
+    } else {
+        log::warn!("received a file for unknown Android directory prompt {request_id}");
+    }
+}
+
+pub fn complete_directory_prompt(request_id: u64, error: Option<anyhow::Error>, cancelled: bool) {
+    let prompt = pending_directory_prompts().lock().unwrap().remove(&request_id);
+    let Some(prompt) = prompt else {
+        log::warn!("received completion for unknown Android directory prompt {request_id}");
+        return;
+    };
+    if cancelled {
+        prompt.sender.send(Ok(None)).ok();
+        return;
+    }
+    if let Some(error) = error {
+        prompt.sender.send(Err(error)).ok();
+        return;
+    }
+    let Some(name) = prompt.name else {
+        prompt.sender.send(Err(anyhow::anyhow!("Android directory picker returned no root"))).ok();
+        return;
+    };
+    let files = prompt
+        .files
+        .into_iter()
+        .map(|file| {
+            SelectedDirectoryFile::new(file.path, move || open_android_document(&file.uri))
+        })
+        .collect();
+    prompt.sender.send(Ok(Some(vec![SelectedDirectory { name, directories: prompt.directories, files }]))).ok();
+}
+
+fn open_android_document(uri: &str) -> Result<SelectedDirectoryReader> {
+    let app = ANDROID_APP.get().ok_or_else(|| anyhow::anyhow!("Android application is not initialized"))?;
+    let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) };
+    let descriptor = vm.attach_current_thread(|env| {
+        let raw_activity = app.activity_as_ptr() as jni::sys::jobject;
+        let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw_activity)? };
+        let uri = JString::from_str(env, uri)?;
+        env.call_method(
+            activity.as_ref(),
+            jni_str!("openDocumentDescriptor"),
+            jni_sig!("(Ljava/lang/String;)I"),
+            &[JValue::Object(uri.as_ref())],
+        )?
+        .i()
+    })?;
+    if descriptor < 0 {
+        anyhow::bail!("Android document provider could not open {uri}");
+    }
+    // SAFETY: MainActivity detaches this descriptor from its
+    // ParcelFileDescriptor and transfers ownership to the native caller.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    Ok(Box::new(file))
+}
+
+/// Queues a captured Android volume button as reader navigation.
+/// `next` maps to Page Down; `false` maps to Page Up.
+pub fn volume_button_pressed(next: bool) {
+    pending_volume_buttons().lock().unwrap().push_back(next);
+    if let Some(app) = ANDROID_APP.get() {
+        app.create_waker().wake();
+    }
+}
+
+/// Publishes physical Android system/cutout and IME insets. The latest value
+/// is consumed on GPUI's Android event-loop thread.
+pub fn window_insets_changed(
+    safe_left: i32,
+    safe_top: i32,
+    safe_right: i32,
+    safe_bottom: i32,
+    ime_left: i32,
+    ime_top: i32,
+    ime_right: i32,
+    ime_bottom: i32,
+) {
+    *pending_window_insets().lock().unwrap() = Some(AndroidPhysicalInsets {
+        safe_area: AndroidPhysicalEdges::from_android(
+            safe_left,
+            safe_top,
+            safe_right,
+            safe_bottom,
+        ),
+        ime: AndroidPhysicalEdges::from_android(ime_left, ime_top, ime_right, ime_bottom),
+    });
+    if let Some(app) = ANDROID_APP.get() {
+        app.create_waker().wake();
+    }
+}
 
 /// Stores the `AndroidApp` handed to `android_main` so that
 /// `gpui_platform::current_platform` (which takes no arguments) can reach it.
 /// Must be called before constructing the platform.
 pub fn init(app: AndroidApp) {
     ANDROID_APP.set(app).ok();
+}
+
+fn call_activity_boolean_method(app: AndroidApp, method: &'static str, value: bool) {
+    let app_for_call = app.clone();
+    app.run_on_java_main_thread(Box::new(move || {
+        let result = (|| -> jni::errors::Result<()> {
+            let vm = unsafe { JavaVM::from_raw(app_for_call.vm_as_ptr().cast()) };
+            vm.attach_current_thread(|env| {
+                let raw_activity = app_for_call.activity_as_ptr() as jni::sys::jobject;
+                let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw_activity)? };
+                env.call_method(
+                    activity.as_ref(),
+                    JNIString::new(method),
+                    jni_sig!("(Z)V"),
+                    &[JValue::Bool(value as jni::sys::jboolean)],
+                )?;
+                Ok(())
+            })
+        })();
+        if let Err(error) = result {
+            log::error!("failed to call Android activity method {method}: {error}");
+        }
+    }));
 }
 
 const POLL_TIMEOUT: Duration = Duration::from_millis(8);
@@ -51,6 +299,7 @@ pub struct AndroidPlatform {
     key_maps: RefCell<HashMap<i32, KeyCharacterMap>>,
     touch_gesture: RefCell<TouchGesture>,
     last_frame: Cell<Instant>,
+    backgrounded: Cell<bool>,
 }
 
 #[derive(Default)]
@@ -63,6 +312,8 @@ struct AndroidPlatformCallbacks {
     validate_app_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
     keyboard_layout_change: Option<Box<dyn FnMut()>>,
     thermal_state_change: Option<Box<dyn FnMut()>>,
+    app_lifecycle: Option<Box<dyn FnMut(AppLifecyclePhase)>>,
+    memory_warning: Option<Box<dyn FnMut()>>,
 }
 
 impl AndroidPlatform {
@@ -99,6 +350,7 @@ impl AndroidPlatform {
             key_maps: RefCell::new(HashMap::new()),
             touch_gesture: RefCell::new(TouchGesture::default()),
             last_frame: Cell::new(Instant::now()),
+            backgrounded: Cell::new(false),
         }
     }
 
@@ -126,20 +378,11 @@ impl AndroidPlatform {
                 }
             }
             MainEvent::WindowResized { .. } | MainEvent::ContentRectChanged { .. } => {
-                log::info!(
-                    "window/content-rect change: content_rect={:?}",
-                    self.app.content_rect()
-                );
                 if let Some(window) = self.window() {
                     window.update_size();
                 }
             }
-            MainEvent::InsetsChanged { .. } => {
-                log::info!(
-                    "insets changed: content_rect={:?}",
-                    self.app.content_rect()
-                );
-            }
+            MainEvent::InsetsChanged { .. } => {}
             MainEvent::ConfigChanged { .. } => {
                 if let Some(window) = self.window() {
                     window.update_size();
@@ -163,6 +406,34 @@ impl AndroidPlatform {
                     window.set_active(false);
                 }
             }
+            MainEvent::Start => {
+                self.backgrounded.set(false);
+                if let Some(callback) = self.callbacks.borrow_mut().app_lifecycle.as_mut() {
+                    callback(AppLifecyclePhase::Foreground);
+                }
+            }
+            MainEvent::Resume { .. } => {
+                self.backgrounded.set(false);
+                if let Some(callback) = self.callbacks.borrow_mut().app_lifecycle.as_mut() {
+                    callback(AppLifecyclePhase::Active);
+                }
+            }
+            MainEvent::Pause => {
+                if let Some(callback) = self.callbacks.borrow_mut().app_lifecycle.as_mut() {
+                    callback(AppLifecyclePhase::Inactive);
+                }
+            }
+            MainEvent::Stop => {
+                self.backgrounded.set(true);
+                if let Some(callback) = self.callbacks.borrow_mut().app_lifecycle.as_mut() {
+                    callback(AppLifecyclePhase::Background);
+                }
+            }
+            MainEvent::LowMemory => {
+                if let Some(callback) = self.callbacks.borrow_mut().memory_warning.as_mut() {
+                    callback();
+                }
+            }
             MainEvent::Destroy => self.quit_requested.set(true),
             _ => {}
         }
@@ -182,9 +453,21 @@ impl AndroidPlatform {
         let mut key_maps = self.key_maps.borrow_mut();
         let mut gesture = self.touch_gesture.borrow_mut();
         loop {
+            let mut finish_activity = false;
             let more = iter.next(|event| {
-                events::handle_input_event(event, &window, &mut gesture, &mut key_maps, &self.app)
+                events::handle_input_event(
+                    event,
+                    &window,
+                    &mut gesture,
+                    &mut key_maps,
+                    &self.app,
+                    &mut finish_activity,
+                )
             });
+            if finish_activity {
+                self.quit_requested.set(true);
+                return;
+            }
             if !more {
                 break;
             }
@@ -203,8 +486,29 @@ impl AndroidPlatform {
         }
     }
 
+    fn drain_volume_buttons(&self) {
+        let Some(window) = self.window() else {
+            pending_volume_buttons().lock().unwrap().clear();
+            return;
+        };
+        let buttons = pending_volume_buttons().lock().unwrap().drain(..).collect::<Vec<_>>();
+        for next in buttons {
+            events::dispatch_reader_page_key(&window, next);
+        }
+    }
+
+    fn drain_window_insets(&self) {
+        let Some(window) = self.window() else {
+            return;
+        };
+        let insets = pending_window_insets().lock().unwrap().take();
+        if let Some(insets) = insets {
+            window.update_physical_insets(insets);
+        }
+    }
+
     fn maybe_request_frame(&self) {
-        if self.last_frame.get().elapsed() < FRAME_INTERVAL {
+        if self.backgrounded.get() || self.last_frame.get().elapsed() < FRAME_INTERVAL {
             return;
         }
         if let Some(window) = self.window() {
@@ -260,13 +564,16 @@ impl Platform for AndroidPlatform {
         *self.pending_launch.borrow_mut() = Some(on_finish_launching);
         let app = self.app.clone();
         while !self.quit_requested.get() {
-            app.poll_events(Some(POLL_TIMEOUT), |event| {
+            let timeout = if self.backgrounded.get() { None } else { Some(POLL_TIMEOUT) };
+            app.poll_events(timeout, |event| {
                 match event {
                     PollEvent::Wake | PollEvent::Timeout => {}
                     PollEvent::Main(main_event) => self.handle_main_event(main_event),
                     _ => {}
                 }
                 self.drain_main_runnables();
+                self.drain_volume_buttons();
+                self.drain_window_insets();
                 self.maybe_request_frame();
             });
         }
@@ -348,10 +655,123 @@ impl Platform for AndroidPlatform {
         _filters: Vec<FileDialogFilter>,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
         let (tx, rx) = oneshot::channel();
-        tx.send(Err(anyhow::anyhow!(
-            "prompt_for_paths is not supported on Android"
-        )))
-        .ok();
+        tx.send(Err(anyhow::anyhow!("Android selections do not expose filesystem paths; use prompt_for_files or prompt_for_directories"))).ok();
+        rx
+    }
+
+    fn prompt_for_files(
+        &self,
+        options: PathPromptOptions,
+        filters: Vec<FileDialogFilter>,
+    ) -> oneshot::Receiver<Result<Option<Vec<SelectedFile>>>> {
+        let (tx, rx) = oneshot::channel();
+        if !options.files || options.directories {
+            tx.send(Err(anyhow::anyhow!(
+                "Android file prompts select files only"
+            )))
+            .ok();
+            return rx;
+        }
+
+        let request_id = NEXT_PATH_PROMPT_ID.fetch_add(1, Ordering::Relaxed);
+        let extensions = filters
+            .into_iter()
+            .flat_map(|filter| filter.extensions)
+            .map(|extension| extension.trim_start_matches('.').to_ascii_lowercase())
+            .filter(|extension| !extension.is_empty())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("\n");
+        pending_file_prompts().lock().unwrap().insert(
+            request_id,
+            PendingFilePrompt {
+                sender: tx,
+                executor: self.background_executor.clone(),
+                files: Vec::new(),
+            },
+        );
+
+        let app = self.app.clone();
+        let app_for_call = app.clone();
+        app.run_on_java_main_thread(Box::new(move || {
+            let result = (|| -> jni::errors::Result<()> {
+                let vm = unsafe { JavaVM::from_raw(app_for_call.vm_as_ptr().cast()) };
+                vm.attach_current_thread(|env| {
+                    let raw_activity = app_for_call.activity_as_ptr() as jni::sys::jobject;
+                    let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw_activity)? };
+                    let extensions = JString::from_str(env, &extensions)?;
+                    env.call_method(
+                        activity.as_ref(),
+                        jni_str!("openFilePrompt"),
+                        jni_sig!("(JZLjava/lang/String;)V"),
+                        &[
+                            JValue::Long(request_id as i64),
+                            JValue::Bool(options.multiple as jni::sys::jboolean),
+                            JValue::Object(extensions.as_ref()),
+                        ],
+                    )?;
+                    Ok(())
+                })
+            })();
+            if let Err(error) = result {
+                complete_file_prompt(
+                    request_id,
+                    Some(anyhow::anyhow!("failed to open Android file prompt: {error}")),
+                    false,
+                );
+            }
+        }));
+        rx
+    }
+
+    fn prompt_for_directories(
+        &self,
+        options: PathPromptOptions,
+        filters: Vec<FileDialogFilter>,
+    ) -> oneshot::Receiver<Result<Option<Vec<SelectedDirectory>>>> {
+        let (tx, rx) = oneshot::channel();
+        if options.files || !options.directories {
+            tx.send(Err(anyhow::anyhow!("Android directory prompts select directories only"))).ok();
+            return rx;
+        }
+        let request_id = NEXT_PATH_PROMPT_ID.fetch_add(1, Ordering::Relaxed);
+        let extensions = filters
+            .into_iter()
+            .flat_map(|filter| filter.extensions)
+            .map(|extension| extension.trim_start_matches('.').to_ascii_lowercase())
+            .filter(|extension| !extension.is_empty())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("\n");
+        pending_directory_prompts().lock().unwrap().insert(
+            request_id,
+            PendingDirectoryPrompt { sender: tx, name: None, directories: Vec::new(), files: Vec::new() },
+        );
+
+        let app = self.app.clone();
+        let app_for_call = app.clone();
+        app.run_on_java_main_thread(Box::new(move || {
+            let result = (|| -> jni::errors::Result<()> {
+                let vm = unsafe { JavaVM::from_raw(app_for_call.vm_as_ptr().cast()) };
+                vm.attach_current_thread(|env| {
+                    let raw_activity = app_for_call.activity_as_ptr() as jni::sys::jobject;
+                    let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw_activity)? };
+                    let extensions = JString::from_str(env, &extensions)?;
+                    env.call_method(
+                        activity.as_ref(),
+                        jni_str!("openDirectoryPrompt"),
+                        jni_sig!("(JLjava/lang/String;)V"),
+                        &[JValue::Long(request_id as i64), JValue::Object(extensions.as_ref())],
+                    )?;
+                    Ok(())
+                })
+            })();
+            if let Err(error) = result {
+                complete_directory_prompt(request_id, Some(anyhow::anyhow!("failed to open Android directory prompt: {error}")), false);
+            }
+        }));
         rx
     }
 
@@ -373,6 +793,22 @@ impl Platform for AndroidPlatform {
         false
     }
 
+    fn set_volume_button_capture(&self, enabled: bool) {
+        call_activity_boolean_method(self.app.clone(), "setVolumeButtonCapture", enabled);
+    }
+
+    fn supports_touch_input(&self) -> bool {
+        true
+    }
+
+    fn set_system_bars_visible(&self, visible: bool) {
+        call_activity_boolean_method(self.app.clone(), "setSystemBarsVisible", visible);
+    }
+
+    fn set_keep_screen_awake(&self, awake: bool) {
+        call_activity_boolean_method(self.app.clone(), "setKeepScreenAwake", awake);
+    }
+
     fn reveal_path(&self, _path: &Path) {}
 
     fn open_with_system(&self, _path: &Path) {}
@@ -385,6 +821,14 @@ impl Platform for AndroidPlatform {
 
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
         self.callbacks.borrow_mut().reopen = Some(callback);
+    }
+
+    fn on_app_lifecycle(&self, callback: Box<dyn FnMut(AppLifecyclePhase)>) {
+        self.callbacks.borrow_mut().app_lifecycle = Some(callback);
+    }
+
+    fn on_memory_warning(&self, callback: Box<dyn FnMut()>) {
+        self.callbacks.borrow_mut().memory_warning = Some(callback);
     }
 
     fn set_menus(&self, _menus: Vec<Menu>, _keymap: &Keymap) {}

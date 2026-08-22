@@ -61,7 +61,7 @@ struct GlobalParams {
     viewport_size: [f32; 2],
     render_target_size: [f32; 2],
     premultiplied_alpha: u32,
-    pad: u32,
+    pad: [u32; 3],
 }
 
 #[repr(C)]
@@ -1590,7 +1590,7 @@ impl WgpuRenderer {
                 self.surface_config.height as f32,
             ],
             premultiplied_alpha: 0,
-            pad: 0,
+            pad: [0; 3],
         };
         {
             let resources = self.resources();
@@ -1855,7 +1855,7 @@ impl WgpuRenderer {
             } else {
                 0
             },
-            pad: 0,
+            pad: [0; 3],
         };
 
         let path_globals = GlobalParams {

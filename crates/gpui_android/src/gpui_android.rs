@@ -1,6 +1,6 @@
 #![cfg(target_os = "android")]
 
-//! GPUI backend for Android, driven by `android-activity`'s `NativeActivity`
+//! GPUI backend for Android, driven by `android-activity`'s `GameActivity`
 //! glue. The OS owns the activity lifecycle; `AndroidPlatform::run` blocks in
 //! the `android_main` thread pumping `AndroidApp::poll_events`. Rendering and
 //! text are provided by `gpui_wgpu` (Vulkan/GL + cosmic-text).
@@ -13,7 +13,11 @@ mod platform;
 mod window;
 
 pub use android_activity::AndroidApp;
-pub use platform::{AndroidPlatform, init};
+pub use platform::{
+    AndroidPlatform, complete_directory_prompt, complete_file_prompt, init,
+    selected_directory_file, selected_directory_path, selected_directory_root,
+    selected_file_descriptor, volume_button_pressed, window_insets_changed,
+};
 
 pub fn init_logging() {
     // Keep the Android backend verbose without enabling noisy dependency logs.

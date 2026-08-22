@@ -60,7 +60,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::ops;
 use std::time::Duration;
 use std::{
@@ -192,6 +192,71 @@ pub trait Platform: 'static {
         options: PathPromptOptions,
         filters: Vec<FileDialogFilter>,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>>;
+    fn prompt_for_files(
+        &self,
+        options: PathPromptOptions,
+        filters: Vec<FileDialogFilter>,
+    ) -> oneshot::Receiver<Result<Option<Vec<SelectedFile>>>> {
+        let paths = self.prompt_for_paths(options, filters);
+        let (sender, receiver) = oneshot::channel();
+        self.background_executor()
+            .spawn(async move {
+                let result = match paths.await {
+                    Ok(Ok(Some(paths))) => paths
+                        .into_iter()
+                        .map(|path| {
+                            let name = path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("selected file has no valid UTF-8 name")
+                                })?
+                                .to_owned();
+                            let bytes = std::fs::read(&path)
+                                .with_context(|| format!("failed to read {}", path.display()))?;
+                            Ok(SelectedFile { name, bytes })
+                        })
+                        .collect::<Result<Vec<_>>>()
+                        .map(Some),
+                    Ok(Ok(None)) => Ok(None),
+                    Ok(Err(error)) => Err(error),
+                    Err(error) => Err(anyhow::anyhow!("file picker was dropped: {error}")),
+                };
+                sender.send(result).ok();
+            })
+            .detach();
+        receiver
+    }
+    fn prompt_for_directories(
+        &self,
+        options: PathPromptOptions,
+        filters: Vec<FileDialogFilter>,
+    ) -> oneshot::Receiver<Result<Option<Vec<SelectedDirectory>>>> {
+        let paths = self.prompt_for_paths(options, filters.clone());
+        let (sender, receiver) = oneshot::channel();
+        self.background_executor()
+            .spawn(async move {
+                let extensions = filters
+                    .into_iter()
+                    .flat_map(|filter| filter.extensions)
+                    .map(|extension| extension.trim_start_matches('.').to_ascii_lowercase())
+                    .filter(|extension| !extension.is_empty())
+                    .collect::<std::collections::BTreeSet<_>>();
+                let result = match paths.await {
+                    Ok(Ok(Some(paths))) => paths
+                        .into_iter()
+                        .map(|path| selected_directory_from_path(&path, &extensions))
+                        .collect::<Result<Vec<_>>>()
+                        .map(Some),
+                    Ok(Ok(None)) => Ok(None),
+                    Ok(Err(error)) => Err(error),
+                    Err(error) => Err(anyhow::anyhow!("directory picker was dropped: {error}")),
+                };
+                sender.send(result).ok();
+            })
+            .detach();
+        receiver
+    }
     fn prompt_for_new_path(
         &self,
         directory: &Path,
@@ -222,6 +287,26 @@ pub trait Platform: 'static {
     ///
     /// Desktop platforms never invoke this.
     fn on_memory_warning(&self, _callback: Box<dyn FnMut()>) {}
+
+    /// Enables interception of the device volume buttons for application
+    /// navigation. Mobile platforms leave the buttons to the OS while this is
+    /// disabled.
+    fn set_volume_button_capture(&self, _enabled: bool) {}
+
+    /// Returns whether this platform's application surface is primarily
+    /// operated through touch input.
+    fn supports_touch_input(&self) -> bool {
+        false
+    }
+
+    /// Shows or hides the mobile operating system's status and navigation
+    /// bars. Desktop platforms ignore this.
+    fn set_system_bars_visible(&self, _visible: bool) {}
+
+    /// Prevents the display from sleeping while the application is active.
+    /// Mobile platforms ignore the request while the application is in the
+    /// background. Desktop platforms ignore this.
+    fn set_keep_screen_awake(&self, _awake: bool) {}
 
     /// The platform's gesture recognition services, if it provides any
     /// beyond gpui's portable recognizers. See
@@ -2161,6 +2246,85 @@ pub struct FileDialogFilter {
     pub name: String,
     /// Extensions without a leading dot, for example `html` or `htm`.
     pub extensions: Vec<String>,
+}
+
+/// A file selected by the user, independent of whether the platform exposes
+/// it through a filesystem path, browser `File`, or content URI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectedFile {
+    /// User-visible filename supplied by the selecting platform.
+    pub name: String,
+    /// Complete file contents.
+    pub bytes: Vec<u8>,
+}
+
+/// A selected directory tree independent of filesystem paths. Files are
+/// opened lazily so importing a large tree does not retain every descriptor.
+pub struct SelectedDirectory {
+    /// User-visible name of the selected root directory.
+    pub name: String,
+    /// Relative directory paths, split into filesystem-name components.
+    pub directories: Vec<Vec<String>>,
+    /// Selected files beneath the root directory.
+    pub files: Vec<SelectedDirectoryFile>,
+}
+
+/// A readable selected file opened only for the duration of its consumer.
+pub type SelectedDirectoryReader = Box<dyn Read + Send>;
+
+/// One lazily opened file within a selected directory tree.
+pub struct SelectedDirectoryFile {
+    /// Relative path, split into directory components and a final filename.
+    pub path: Vec<String>,
+    opener: Box<dyn FnOnce() -> Result<SelectedDirectoryReader> + Send>,
+}
+
+impl SelectedDirectoryFile {
+    /// Creates an entry backed by a one-shot reader opener.
+    pub fn new(path: Vec<String>, opener: impl FnOnce() -> Result<SelectedDirectoryReader> + Send + 'static) -> Self {
+        Self { path, opener: Box::new(opener) }
+    }
+
+    /// Opens this entry for reading, consuming its one-shot capability.
+    pub fn open(self) -> Result<SelectedDirectoryReader> {
+        (self.opener)()
+    }
+}
+
+fn selected_directory_from_path(path: &Path, extensions: &std::collections::BTreeSet<String>) -> Result<SelectedDirectory> {
+    let name = path.file_name().ok_or_else(|| anyhow::anyhow!("selected directory has no name"))?.to_string_lossy().into_owned();
+    let mut directory = SelectedDirectory { name, directories: Vec::new(), files: Vec::new() };
+    collect_selected_directory(path, &mut Vec::new(), extensions, &mut directory)?;
+    Ok(directory)
+}
+
+fn collect_selected_directory(path: &Path, relative: &mut Vec<String>, extensions: &std::collections::BTreeSet<String>, selected: &mut SelectedDirectory) -> Result<()> {
+    let mut entries = std::fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        relative.push(name);
+        if file_type.is_dir() {
+            selected.directories.push(relative.clone());
+            collect_selected_directory(&entry.path(), relative, extensions, selected)?;
+        } else if file_type.is_file() {
+            let accepted = extensions.is_empty()
+                || entry.path().extension().and_then(|extension| extension.to_str()).is_some_and(|extension| extensions.contains(&extension.to_ascii_lowercase()));
+            if accepted {
+                let file_path = entry.path();
+                selected.files.push(SelectedDirectoryFile::new(relative.clone(), move || {
+                    let reader: SelectedDirectoryReader = Box::new(std::fs::File::open(&file_path).with_context(|| format!("failed to open {}", file_path.display()))?);
+                    Ok(reader)
+                }));
+            }
+        }
+        relative.pop();
+    }
+    Ok(())
 }
 
 /// What kind of prompt styling to show

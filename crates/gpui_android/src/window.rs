@@ -2,11 +2,11 @@ use crate::events::ClickState;
 use android_activity::AndroidApp;
 use anyhow::Context as _;
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult, GpuSpecs,
-    Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult, Edges,
+    GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
     ResizeEdge, Scene, Size, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowControls, WindowDecorations, WindowParams, px,
+    WindowControlArea, WindowControls, WindowDecorations, WindowInsets, WindowParams, px,
 };
 use gpui_wgpu::{GpuContext, SurfaceSizePolicy, WgpuRenderer, WgpuSurfaceConfig};
 use std::cell::{Cell, RefCell};
@@ -59,6 +59,7 @@ pub(crate) struct AndroidWindowCallbacks {
     pub(crate) should_close: Option<Box<dyn FnMut() -> bool>>,
     pub(crate) close: Option<Box<dyn FnOnce()>>,
     pub(crate) appearance_changed: Option<Box<dyn FnMut()>>,
+    pub(crate) insets_changed: Option<Box<dyn FnMut(WindowInsets)>>,
     pub(crate) hit_test_window_control: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
 }
 
@@ -73,6 +74,33 @@ pub(crate) struct AndroidWindowState {
     pub(crate) mouse_position: Point<Pixels>,
     pub(crate) modifiers: Modifiers,
     pub(crate) capslock: Capslock,
+    physical_insets: AndroidPhysicalInsets,
+    insets: WindowInsets,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AndroidPhysicalEdges {
+    top: u32,
+    right: u32,
+    bottom: u32,
+    left: u32,
+}
+
+impl AndroidPhysicalEdges {
+    pub(crate) fn from_android(left: i32, top: i32, right: i32, bottom: i32) -> Self {
+        Self {
+            top: top.max(0) as u32,
+            right: right.max(0) as u32,
+            bottom: bottom.max(0) as u32,
+            left: left.max(0) as u32,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AndroidPhysicalInsets {
+    pub(crate) safe_area: AndroidPhysicalEdges,
+    pub(crate) ime: AndroidPhysicalEdges,
 }
 
 pub(crate) struct AndroidWindowInner {
@@ -147,6 +175,8 @@ impl AndroidWindow {
             mouse_position: Point::default(),
             modifiers: Modifiers::default(),
             capslock: Capslock::default(),
+            physical_insets: AndroidPhysicalInsets::default(),
+            insets: WindowInsets::default(),
         };
 
         let inner = Rc::new(AndroidWindowInner {
@@ -175,7 +205,50 @@ fn logical_size(physical: Size<DevicePixels>, scale: f32) -> Size<Pixels> {
     }
 }
 
+fn logical_edges(edges: AndroidPhysicalEdges, scale: f32) -> Edges<Pixels> {
+    if !scale.is_finite() || scale <= 0.0 {
+        return Edges::default();
+    }
+    Edges {
+        top: px(edges.top as f32 / scale),
+        right: px(edges.right as f32 / scale),
+        bottom: px(edges.bottom as f32 / scale),
+        left: px(edges.left as f32 / scale),
+    }
+}
+
+fn logical_insets(insets: AndroidPhysicalInsets, scale: f32) -> WindowInsets {
+    WindowInsets {
+        safe_area: logical_edges(insets.safe_area, scale),
+        ime: logical_edges(insets.ime, scale),
+    }
+}
+
 impl AndroidWindowInner {
+    fn insets(&self) -> WindowInsets {
+        self.state.borrow().insets.clone()
+    }
+
+    fn notify_insets_changed(&self, insets: WindowInsets) {
+        if let Some(callback) = self.callbacks.borrow_mut().insets_changed.as_mut() {
+            callback(insets);
+        }
+    }
+
+    pub(crate) fn update_physical_insets(&self, physical_insets: AndroidPhysicalInsets) {
+        let insets = {
+            let mut state = self.state.borrow_mut();
+            let insets = logical_insets(physical_insets, state.scale_factor);
+            state.physical_insets = physical_insets;
+            if state.insets == insets {
+                return;
+            }
+            state.insets = insets.clone();
+            insets
+        };
+        self.notify_insets_changed(insets);
+    }
+
     /// Called on `MainEvent::InitWindow` after the native window was destroyed
     /// and recreated (backgrounding, rotation). Recreates the wgpu surface on
     /// the same device so cached atlas textures stay valid.
@@ -221,25 +294,30 @@ impl AndroidWindowInner {
 
     pub(crate) fn update_size(&self) {
         let scale = scale_factor(&self.app);
-        let (physical_size, changed) = {
+        let (physical_size, changed, changed_insets) = {
             let mut state = self.state.borrow_mut();
             let physical_size = state.raw_window.physical_size();
             let logical = logical_size(physical_size, scale);
             let changed = state.bounds.size != logical || state.scale_factor != scale;
             state.bounds.size = logical;
             state.scale_factor = scale;
-            (physical_size, changed)
+            let insets = logical_insets(state.physical_insets, scale);
+            let changed_insets = (state.insets != insets).then_some(insets.clone());
+            state.insets = insets;
+            (physical_size, changed, changed_insets)
         };
 
-        if !changed {
-            return;
-        }
-        self.pending_physical_size.set(Some(physical_size));
+        if changed {
+            self.pending_physical_size.set(Some(physical_size));
 
-        let logical = logical_size(physical_size, scale);
-        let mut callbacks = self.callbacks.borrow_mut();
-        if let Some(ref mut callback) = callbacks.resize {
-            callback(logical, scale);
+            let logical = logical_size(physical_size, scale);
+            let mut callbacks = self.callbacks.borrow_mut();
+            if let Some(ref mut callback) = callbacks.resize {
+                callback(logical, scale);
+            }
+        }
+        if let Some(insets) = changed_insets {
+            self.notify_insets_changed(insets);
         }
     }
 
@@ -498,4 +576,12 @@ impl PlatformWindow for AndroidWindow {
     }
 
     fn set_client_inset(&self, _inset: Pixels) {}
+
+    fn insets(&self) -> WindowInsets {
+        self.inner.insets()
+    }
+
+    fn on_insets_changed(&self, callback: Box<dyn FnMut(WindowInsets)>) {
+        self.inner.callbacks.borrow_mut().insets_changed = Some(callback);
+    }
 }

@@ -44,18 +44,17 @@ pub use visual_test_context::*;
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::InspectorElementRegistry;
 use crate::{
-    Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Arena,
-    ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem, ClipboardReadError,
-    CursorStyle, DispatchPhase, DisplayId, EventEmitter, ExternalDragPayload, FileDialogFilter,
-    FocusHandle,
-    FocusMap, ForegroundExecutor, Global, KeyBinding, KeyContext, Keymap, Keystroke, LayoutId,
-    Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay,
-    PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton,
-    PromptHandle, PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation,
-    ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer,
-    SystemNotification, SystemNotificationResponse, Task, TextRenderingMode, TextSystem,
-    ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
-    WindowInvalidator,
+    Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext,
+    AppLifecyclePhase, Arena, ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds,
+    ClipboardItem, ClipboardReadError, CursorStyle, DispatchPhase, DisplayId, EventEmitter,
+    ExternalDragPayload, FileDialogFilter, FocusHandle, FocusMap, ForegroundExecutor, Global,
+    KeyBinding, KeyContext, Keymap, Keystroke, LayoutId, Menu, MenuItem, OwnedMenu,
+    PathPromptOptions, Pixels, Platform, PlatformDisplay, PlatformKeyboardLayout,
+    PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton, PromptHandle,
+    PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation, ScreenCaptureSource,
+    SelectedDirectory, SelectedFile, SharedString, SubscriberSet, Subscription, SvgRenderer, SystemNotification,
+    SystemNotificationResponse, Task, TextRenderingMode, TextSystem, ThermalState, Window,
+    WindowAppearance, WindowButtonLayout, WindowHandle, WindowId, WindowInvalidator,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
 };
@@ -312,6 +311,7 @@ impl Application {
 }
 
 type Handler = Box<dyn FnMut(&mut App) -> bool + 'static>;
+type AppLifecycleHandler = Box<dyn FnMut(AppLifecyclePhase, &mut App) -> bool + 'static>;
 type Listener = Box<dyn FnMut(&dyn Any, &mut App) -> bool + 'static>;
 pub(crate) type KeystrokeObserver =
     Box<dyn FnMut(&KeystrokeEvent, &mut Window, &mut App) -> bool + 'static>;
@@ -711,6 +711,8 @@ pub struct App {
     pub(crate) keyboard_layout_observers: SubscriberSet<(), Handler>,
     pub(crate) thermal_state_observers: SubscriberSet<(), Handler>,
     pub(crate) system_wake_observers: SubscriberSet<(), Handler>,
+    pub(crate) app_lifecycle_observers: SubscriberSet<(), AppLifecycleHandler>,
+    pub(crate) memory_warning_observers: SubscriberSet<(), Handler>,
     pub(crate) release_listeners: SubscriberSet<EntityId, ReleaseListener>,
     pub(crate) global_observers: SubscriberSet<TypeId, Handler>,
     pub(crate) quit_observers: SubscriberSet<(), QuitHandler>,
@@ -845,6 +847,8 @@ impl App {
                 keyboard_layout_observers: SubscriberSet::new(),
                 thermal_state_observers: SubscriberSet::new(),
                 system_wake_observers: SubscriberSet::new(),
+                app_lifecycle_observers: SubscriberSet::new(),
+                memory_warning_observers: SubscriberSet::new(),
                 global_observers: SubscriberSet::new(),
                 quit_observers: SubscriberSet::new(),
                 restart_observers: SubscriberSet::new(),
@@ -910,6 +914,30 @@ impl App {
                 if let Some(app) = app.upgrade() {
                     let cx = &mut app.borrow_mut();
                     cx.system_wake_observers
+                        .clone()
+                        .retain(&(), move |callback| (callback)(cx));
+                }
+            }
+        }));
+
+        platform.on_app_lifecycle(Box::new({
+            let app = Rc::downgrade(&app);
+            move |phase| {
+                if let Some(app) = app.upgrade() {
+                    let cx = &mut app.borrow_mut();
+                    cx.app_lifecycle_observers
+                        .clone()
+                        .retain(&(), move |callback| (callback)(phase, cx));
+                }
+            }
+        }));
+
+        platform.on_memory_warning(Box::new({
+            let app = Rc::downgrade(&app);
+            move || {
+                if let Some(app) = app.upgrade() {
+                    let cx = &mut app.borrow_mut();
+                    cx.memory_warning_observers
                         .clone()
                         .retain(&(), move |callback| (callback)(cx));
                 }
@@ -1368,6 +1396,41 @@ impl App {
         subscription
     }
 
+    /// Invokes a handler whenever a mobile operating system changes the
+    /// application's lifecycle phase. Desktop platforms do not emit these
+    /// events.
+    pub fn on_app_lifecycle<F>(&self, mut callback: F) -> Subscription
+    where
+        F: 'static + FnMut(AppLifecyclePhase, &mut App),
+    {
+        let (subscription, activate) = self.app_lifecycle_observers.insert(
+            (),
+            Box::new(move |phase, cx| {
+                callback(phase, cx);
+                true
+            }),
+        );
+        activate();
+        subscription
+    }
+
+    /// Invokes a handler when a mobile operating system asks the application
+    /// to reduce its memory usage.
+    pub fn on_memory_warning<F>(&self, mut callback: F) -> Subscription
+    where
+        F: 'static + FnMut(&mut App),
+    {
+        let (subscription, activate) = self.memory_warning_observers.insert(
+            (),
+            Box::new(move |cx| {
+                callback(cx);
+                true
+            }),
+        );
+        activate();
+        subscription
+    }
+
     /// Returns the appearance of the application's windows.
     pub fn window_appearance(&self) -> WindowAppearance {
         self.platform.window_appearance()
@@ -1557,6 +1620,28 @@ impl App {
         self.platform.path_for_auxiliary_executable(name)
     }
 
+    /// Enables or disables application handling of the device volume buttons.
+    /// When disabled, the operating system retains its normal volume behavior.
+    pub fn set_volume_button_capture(&self, enabled: bool) {
+        self.platform.set_volume_button_capture(enabled);
+    }
+
+    /// Returns whether the application surface is primarily operated through
+    /// touch input.
+    pub fn supports_touch_input(&self) -> bool {
+        self.platform.supports_touch_input()
+    }
+
+    /// Shows or hides the mobile operating system's status and navigation bars.
+    pub fn set_system_bars_visible(&self, visible: bool) {
+        self.platform.set_system_bars_visible(visible);
+    }
+
+    /// Prevents the display from sleeping while the application is active.
+    pub fn set_keep_screen_awake(&self, awake: bool) {
+        self.platform.set_keep_screen_awake(awake);
+    }
+
     /// Displays a platform modal for selecting paths.
     ///
     /// When one or more paths are selected, they'll be relayed asynchronously via the returned oneshot channel.
@@ -1577,6 +1662,46 @@ impl App {
         filters: Vec<FileDialogFilter>,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
         self.platform.prompt_for_paths(options, filters)
+    }
+
+    /// Displays a platform file picker and returns the selected file contents.
+    ///
+    /// Unlike [`Self::prompt_for_paths`], this works on platforms where a
+    /// selected file does not have a usable filesystem path.
+    pub fn prompt_for_files(
+        &self,
+        options: PathPromptOptions,
+    ) -> oneshot::Receiver<Result<Option<Vec<SelectedFile>>>> {
+        self.platform.prompt_for_files(options, Vec::new())
+    }
+
+    /// Displays a platform file picker restricted by the given extension
+    /// filters and returns the selected file contents.
+    pub fn prompt_for_files_with_filters(
+        &self,
+        options: PathPromptOptions,
+        filters: Vec<FileDialogFilter>,
+    ) -> oneshot::Receiver<Result<Option<Vec<SelectedFile>>>> {
+        self.platform.prompt_for_files(options, filters)
+    }
+
+    /// Displays a platform directory picker and returns a path-free tree whose
+    /// selected files are opened lazily during import.
+    pub fn prompt_for_directories(
+        &self,
+        options: PathPromptOptions,
+    ) -> oneshot::Receiver<Result<Option<Vec<SelectedDirectory>>>> {
+        self.platform.prompt_for_directories(options, Vec::new())
+    }
+
+    /// Displays a platform directory picker restricted to files matching the
+    /// given extension filters.
+    pub fn prompt_for_directories_with_filters(
+        &self,
+        options: PathPromptOptions,
+        filters: Vec<FileDialogFilter>,
+    ) -> oneshot::Receiver<Result<Option<Vec<SelectedDirectory>>>> {
+        self.platform.prompt_for_directories(options, filters)
     }
 
     /// Displays a platform modal for selecting a new path where a file can be saved.

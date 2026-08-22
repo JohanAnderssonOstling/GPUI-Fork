@@ -181,6 +181,7 @@ dependencies = [
  "ndk-context",
  "ndk-sys",
  "num_enum",
+ "simd_cesu8",
  "thiserror 2.0.17",
 ]
 
@@ -2678,6 +2679,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui_wgpu",
+ "jni 0.22.4",
  "libc",
  "log",
  "parking_lot",

@@ -81,7 +81,9 @@ struct GlobalParams {
     viewport_size: vec2<f32>,
     render_target_size: vec2<f32>,
     premultiplied_alpha: u32,
-    pad: u32,
+    pad_0: u32,
+    pad_1: u32,
+    pad_2: u32,
 }
 
 struct GammaParams {

@@ -18,8 +18,8 @@ use gpui::{
     PlatformAtlas, PlatformDispatcher, PlatformDisplay, PlatformInput, PlatformInputHandler,
     PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, Point,
     Priority, PromptButton, PromptLevel, RequestFrameOptions, RunnableVariant, Scene, ScrollDelta,
-    ScrollWheelEvent, Size, Task, ThermalState, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowParams, point, px, size,
+    ScrollWheelEvent, Size, Task, ThermalState, TouchEvent, TouchId, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams, point, px, size,
 };
 use gpui_wgpu::CosmicTextSystem;
 use image::{GrayImage, Luma};
@@ -1668,6 +1668,15 @@ impl KoboPlatform {
                 dispatch_started.elapsed().as_millis(),
             );
         }
+        window.dispatch_input(
+            PlatformInput::Touch(TouchEvent {
+                id: TouchId(0),
+                phase: gpui::TouchPhase::Ended,
+                position,
+                force: None,
+            }),
+            position,
+        );
         // A mouse callback can remove its own GPUI window. Release the platform
         // window before resolving the next active window so a previous logical
         // window (for example, the library behind a reader) can be promoted.
@@ -1904,6 +1913,10 @@ impl KoboPlatform {
 }
 
 impl Platform for KoboPlatform {
+    fn supports_touch_input(&self) -> bool {
+        true
+    }
+
     fn background_executor(&self) -> BackgroundExecutor {
         self.background_executor.clone()
     }

@@ -22,7 +22,7 @@ use crate::{
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
     TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
+    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
     transparent_black,
 };
 
@@ -792,7 +792,7 @@ impl HitboxId {
         if window.captured_hitbox == Some(self) {
             return true;
         }
-        if window.last_input_was_keyboard() {
+        if !window.last_input_supports_hover() {
             return false;
         }
         self.hit_test(window)
@@ -1696,6 +1696,12 @@ impl Window {
                     .log_err();
             }
         }));
+        platform_window.on_insets_changed(Box::new({
+            let mut cx = cx.to_async();
+            move |_| {
+                handle.update(&mut cx, |_, window, _| window.refresh()).log_err();
+            }
+        }));
         platform_window.on_moved(Box::new({
             let mut cx = cx.to_async();
             move || {
@@ -1892,7 +1898,11 @@ impl Window {
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
-            last_input_modality: InputModality::Mouse,
+            last_input_modality: if cx.platform.supports_touch_input() {
+                InputModality::Touch
+            } else {
+                InputModality::Mouse
+            },
             refreshing: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
@@ -2528,6 +2538,11 @@ impl Window {
         self.viewport_size
     }
 
+    /// Returns the regions currently obscured or reserved by system UI.
+    pub fn insets(&self) -> WindowInsets {
+        self.platform_window.insets()
+    }
+
     /// Returns whether this window is focused by the operating system (receiving key events).
     pub fn is_window_active(&self) -> bool {
         self.active.get()
@@ -2859,6 +2874,10 @@ impl Window {
     /// This is used for focus-visible styling to show focus indicators only for keyboard navigation.
     pub fn last_input_was_keyboard(&self) -> bool {
         self.last_input_modality == InputModality::Keyboard
+    }
+
+    pub(crate) fn last_input_supports_hover(&self) -> bool {
+        self.last_input_modality == InputModality::Mouse
     }
 
     /// The current state of the keyboard's capslock

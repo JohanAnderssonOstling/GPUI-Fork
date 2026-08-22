@@ -10,7 +10,7 @@ use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardEntry, ClipboardItem, ClipboardReadError,
     ClipboardString, CursorStyle, DummyKeyboardMapper, ForegroundExecutor, Image, ImageFormat,
     Keymap, Menu, MenuItem, PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout,
-    PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, Task, ThermalState,
+    PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, SelectedFile, Task, ThermalState,
     WindowAppearance, WindowKind, WindowParams, popup::PopupNotSupportedError,
 };
 use gpui_wgpu::{PreparedWebGraphics, WebBackendPreference, WgpuContext, wgpu};
@@ -22,6 +22,52 @@ use std::{
     sync::Arc,
 };
 use wasm_bindgen::prelude::*;
+
+#[wasm_bindgen(inline_js = r#"
+export function gpuiPromptForFiles(accept, multiple) {
+    return new Promise((resolve, reject) => {
+        const input = document.createElement("input");
+        input.type = "file";
+        input.accept = accept;
+        input.multiple = multiple;
+        input.style.display = "none";
+        document.body.appendChild(input);
+
+        let settled = false;
+        const finish = (value) => {
+            if (settled) return;
+            settled = true;
+            input.remove();
+            resolve(value);
+        };
+        input.addEventListener("cancel", () => finish(null), { once: true });
+        input.addEventListener("change", async () => {
+            try {
+                const selected = await Promise.all(Array.from(input.files ?? []).map(async file => ({
+                    name: file.name,
+                    bytes: new Uint8Array(await file.arrayBuffer()),
+                })));
+                finish(selected);
+            } catch (error) {
+                input.remove();
+                reject(error);
+            }
+        }, { once: true });
+
+        try {
+            if (typeof input.showPicker === "function") input.showPicker();
+            else input.click();
+        } catch (error) {
+            input.remove();
+            reject(error);
+        }
+    });
+}
+"#)]
+extern "C" {
+    #[wasm_bindgen(js_name = gpuiPromptForFiles)]
+    fn prompt_for_browser_files(accept: &str, multiple: bool) -> js_sys::Promise;
+}
 
 static BUNDLED_FONTS: &[&[u8]] = &[
     include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"),
@@ -437,6 +483,38 @@ impl Platform for WebPlatform {
         rx
     }
 
+    fn prompt_for_files(
+        &self,
+        options: PathPromptOptions,
+        filters: Vec<gpui::FileDialogFilter>,
+    ) -> oneshot::Receiver<Result<Option<Vec<SelectedFile>>>> {
+        let (sender, receiver) = oneshot::channel();
+        if !options.files || options.directories {
+            sender
+                .send(Err(anyhow::anyhow!(
+                    "web file-content prompts support files only"
+                )))
+                .ok();
+            return receiver;
+        }
+
+        let accept = filters
+            .iter()
+            .flat_map(|filter| filter.extensions.iter())
+            .map(|extension| format!(".{}", extension.trim_start_matches('.')))
+            .collect::<Vec<_>>()
+            .join(",");
+        let promise = prompt_for_browser_files(&accept, options.multiple);
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = wasm_bindgen_futures::JsFuture::from(promise)
+                .await
+                .map_err(|error| anyhow::anyhow!(js_error_message(&error)))
+                .and_then(selected_files_from_js);
+            sender.send(result).ok();
+        });
+        receiver
+    }
+
     fn prompt_for_new_path(
         &self,
         _directory: &Path,
@@ -716,6 +794,31 @@ pub(crate) fn js_error_message(error: &JsValue) -> String {
         .and_then(|message| message.as_string())
         .or_else(|| error.as_string())
         .unwrap_or_else(|| "unknown browser error".to_string())
+}
+
+fn selected_files_from_js(value: JsValue) -> Result<Option<Vec<SelectedFile>>> {
+    if value.is_null() || value.is_undefined() {
+        return Ok(None);
+    }
+    if !js_sys::Array::is_array(&value) {
+        return Err(anyhow::anyhow!(
+            "browser file picker returned an invalid result"
+        ));
+    }
+    let mut selected = Vec::new();
+    for entry in js_sys::Array::from(&value) {
+        let name = js_sys::Reflect::get(&entry, &JsValue::from_str("name"))
+            .map_err(|error| anyhow::anyhow!(js_error_message(&error)))?
+            .as_string()
+            .ok_or_else(|| anyhow::anyhow!("selected browser file has no name"))?;
+        let bytes = js_sys::Reflect::get(&entry, &JsValue::from_str("bytes"))
+            .map_err(|error| anyhow::anyhow!(js_error_message(&error)))?;
+        selected.push(SelectedFile {
+            name,
+            bytes: js_sys::Uint8Array::new(&bytes).to_vec(),
+        });
+    }
+    Ok(Some(selected))
 }
 
 fn log_clipboard_entry_error(mime_type: &str, error: &JsValue) {
