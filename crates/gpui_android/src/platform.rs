@@ -27,7 +27,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::Read as _;
 use std::os::fd::FromRawFd as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -35,11 +34,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-static ANDROID_APP: OnceLock<AndroidApp> = OnceLock::new();
+static ANDROID_APP: OnceLock<Mutex<AndroidApp>> = OnceLock::new();
 static NEXT_PATH_PROMPT_ID: AtomicU64 = AtomicU64::new(1);
 static PENDING_FILE_PROMPTS: OnceLock<Mutex<HashMap<u64, PendingFilePrompt>>> = OnceLock::new();
-static PENDING_DIRECTORY_PROMPTS: OnceLock<Mutex<HashMap<u64, PendingDirectoryPrompt>>> = OnceLock::new();
+static PENDING_DIRECTORY_PROMPTS: OnceLock<Mutex<HashMap<u64, PendingDirectoryPrompt>>> =
+    OnceLock::new();
 static PENDING_VOLUME_BUTTONS: OnceLock<Mutex<VecDeque<bool>>> = OnceLock::new();
+static PENDING_READER_CHROME_REVEALS: OnceLock<Mutex<u32>> = OnceLock::new();
 static PENDING_WINDOW_INSETS: OnceLock<Mutex<Option<AndroidPhysicalInsets>>> = OnceLock::new();
 
 struct PendingSelectedFile {
@@ -49,11 +50,11 @@ struct PendingSelectedFile {
 
 struct PendingFilePrompt {
     sender: oneshot::Sender<Result<Option<Vec<SelectedFile>>>>,
-    executor: BackgroundExecutor,
     files: Vec<PendingSelectedFile>,
 }
 
 struct PendingDirectoryFile {
+    size_bytes: Option<u64>,
     path: Vec<String>,
     uri: String,
 }
@@ -61,6 +62,7 @@ struct PendingDirectoryFile {
 struct PendingDirectoryPrompt {
     sender: oneshot::Sender<Result<Option<Vec<SelectedDirectory>>>>,
     name: Option<String>,
+    local_path: Option<PathBuf>,
     directories: Vec<Vec<String>>,
     files: Vec<PendingDirectoryFile>,
 }
@@ -76,6 +78,11 @@ fn pending_directory_prompts() -> &'static Mutex<HashMap<u64, PendingDirectoryPr
 fn pending_volume_buttons() -> &'static Mutex<VecDeque<bool>> {
     PENDING_VOLUME_BUTTONS.get_or_init(|| Mutex::new(VecDeque::new()))
 }
+
+fn pending_reader_chrome_reveals() -> &'static Mutex<u32> {
+    PENDING_READER_CHROME_REVEALS.get_or_init(|| Mutex::new(0))
+}
+
 
 fn pending_window_insets() -> &'static Mutex<Option<AndroidPhysicalInsets>> {
     PENDING_WINDOW_INSETS.get_or_init(|| Mutex::new(None))
@@ -93,7 +100,7 @@ pub fn selected_file_descriptor(request_id: u64, name: String, file: File) {
 }
 
 /// Completes an Android file prompt after all selected descriptors have been
-/// transferred. Descriptor reads run on a dedicated background thread.
+/// transferred. The consumer owns the descriptors and decides when to read.
 pub fn complete_file_prompt(request_id: u64, error: Option<anyhow::Error>, cancelled: bool) {
     let prompt = pending_file_prompts().lock().unwrap().remove(&request_id);
     let Some(prompt) = prompt else {
@@ -110,31 +117,13 @@ pub fn complete_file_prompt(request_id: u64, error: Option<anyhow::Error>, cance
         return;
     }
 
-    let PendingFilePrompt {
-        sender,
-        executor,
-        files,
-    } = prompt;
-    executor
-        .spawn_dedicated(move |_| async move {
-            let result = files
-                .into_iter()
-                .map(|mut selected| {
-                    let mut bytes = Vec::new();
-                    selected
-                        .file
-                        .read_to_end(&mut bytes)
-                        .with_context(|| format!("failed to read selected Android file {}", selected.name))?;
-                    Ok(SelectedFile {
-                        name: selected.name,
-                        bytes,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()
-                .map(Some);
-            sender.send(result).ok();
-        })
-        .detach();
+    let files = prompt.files.into_iter().map(|selected| SelectedFile {
+        name: selected.name,
+        source: SelectedDirectoryFile::new(Vec::new(), move || Box::pin(async move {
+            Ok(Box::new(selected.file) as SelectedDirectoryReader)
+        })),
+    }).collect();
+    prompt.sender.send(Ok(Some(files))).ok();
 }
 
 pub fn selected_directory_root(request_id: u64, name: String) {
@@ -143,6 +132,12 @@ pub fn selected_directory_root(request_id: u64, name: String) {
         prompt.name = Some(name);
     } else {
         log::warn!("received a root for unknown Android directory prompt {request_id}");
+    }
+}
+
+pub fn selected_directory_local_root(request_id: u64, path: PathBuf) {
+    if let Some(prompt) = pending_directory_prompts().lock().unwrap().get_mut(&request_id) {
+        prompt.local_path = Some(path);
     }
 }
 
@@ -155,17 +150,20 @@ pub fn selected_directory_path(request_id: u64, path: Vec<String>) {
     }
 }
 
-pub fn selected_directory_file(request_id: u64, path: Vec<String>, uri: String) {
+pub fn selected_directory_file(request_id: u64, path: Vec<String>, uri: String, size_bytes: Option<u64>) {
     let mut prompts = pending_directory_prompts().lock().unwrap();
     if let Some(prompt) = prompts.get_mut(&request_id) {
-        prompt.files.push(PendingDirectoryFile { path, uri });
+        prompt.files.push(PendingDirectoryFile { path, uri, size_bytes });
     } else {
         log::warn!("received a file for unknown Android directory prompt {request_id}");
     }
 }
 
 pub fn complete_directory_prompt(request_id: u64, error: Option<anyhow::Error>, cancelled: bool) {
-    let prompt = pending_directory_prompts().lock().unwrap().remove(&request_id);
+    let prompt = pending_directory_prompts()
+        .lock()
+        .unwrap()
+        .remove(&request_id);
     let Some(prompt) = prompt else {
         log::warn!("received completion for unknown Android directory prompt {request_id}");
         return;
@@ -179,21 +177,42 @@ pub fn complete_directory_prompt(request_id: u64, error: Option<anyhow::Error>, 
         return;
     }
     let Some(name) = prompt.name else {
-        prompt.sender.send(Err(anyhow::anyhow!("Android directory picker returned no root"))).ok();
+        prompt
+            .sender
+            .send(Err(anyhow::anyhow!(
+                "Android directory picker returned no root"
+            )))
+            .ok();
         return;
     };
     let files = prompt
         .files
         .into_iter()
         .map(|file| {
-            SelectedDirectoryFile::new(file.path, move || open_android_document(&file.uri))
+            let uri = file.uri;
+            SelectedDirectoryFile::new(file.path, move || {
+                Box::pin(async move { open_android_document(&uri) })
+            }).with_size_bytes(file.size_bytes)
         })
         .collect();
-    prompt.sender.send(Ok(Some(vec![SelectedDirectory { name, directories: prompt.directories, files }]))).ok();
+    prompt
+        .sender
+        .send(Ok(Some(vec![SelectedDirectory {
+            local_path: prompt.local_path,
+            name,
+            directories: prompt.directories,
+            files,
+        }])))
+        .ok();
 }
 
 fn open_android_document(uri: &str) -> Result<SelectedDirectoryReader> {
-    let app = ANDROID_APP.get().ok_or_else(|| anyhow::anyhow!("Android application is not initialized"))?;
+    let app = ANDROID_APP
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("Android application is not initialized"))?
+        .lock()
+        .unwrap()
+        .clone();
     let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) };
     let descriptor = vm.attach_current_thread(|env| {
         let raw_activity = app.activity_as_ptr() as jni::sys::jobject;
@@ -216,14 +235,40 @@ fn open_android_document(uri: &str) -> Result<SelectedDirectoryReader> {
     Ok(Box::new(file))
 }
 
+pub fn request_all_files_access() {
+    let Some(app) = ANDROID_APP.get() else { return };
+    let app = app.lock().unwrap().clone();
+    let activity_app = app.clone();
+    app.run_on_java_main_thread(Box::new(move || {
+        let vm = unsafe { JavaVM::from_raw(activity_app.vm_as_ptr().cast()) };
+        let result = vm.attach_current_thread(|env| {
+            let raw = activity_app.activity_as_ptr() as jni::sys::jobject;
+            let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw)? };
+            env.call_method(activity.as_ref(), jni_str!("requestAllFilesAccess"), jni_sig!("()V"), &[])?;
+            Ok::<_, jni::errors::Error>(())
+        });
+        if let Err(error) = result {
+            log::error!("Could not open Android file access settings: {error}");
+        }
+    }));
+}
+
 /// Queues a captured Android volume button as reader navigation.
 /// `next` maps to Page Down; `false` maps to Page Up.
 pub fn volume_button_pressed(next: bool) {
     pending_volume_buttons().lock().unwrap().push_back(next);
     if let Some(app) = ANDROID_APP.get() {
-        app.create_waker().wake();
+        app.lock().unwrap().create_waker().wake();
     }
 }
+
+pub fn reader_chrome_revealed() {
+    *pending_reader_chrome_reveals().lock().unwrap() += 1;
+    if let Some(app) = ANDROID_APP.get() {
+        app.lock().unwrap().create_waker().wake();
+    }
+}
+
 
 /// Publishes physical Android system/cutout and IME insets. The latest value
 /// is consumed on GPUI's Android event-loop thread.
@@ -238,16 +283,11 @@ pub fn window_insets_changed(
     ime_bottom: i32,
 ) {
     *pending_window_insets().lock().unwrap() = Some(AndroidPhysicalInsets {
-        safe_area: AndroidPhysicalEdges::from_android(
-            safe_left,
-            safe_top,
-            safe_right,
-            safe_bottom,
-        ),
+        safe_area: AndroidPhysicalEdges::from_android(safe_left, safe_top, safe_right, safe_bottom),
         ime: AndroidPhysicalEdges::from_android(ime_left, ime_top, ime_right, ime_bottom),
     });
     if let Some(app) = ANDROID_APP.get() {
-        app.create_waker().wake();
+        app.lock().unwrap().create_waker().wake();
     }
 }
 
@@ -255,7 +295,12 @@ pub fn window_insets_changed(
 /// `gpui_platform::current_platform` (which takes no arguments) can reach it.
 /// Must be called before constructing the platform.
 pub fn init(app: AndroidApp) {
-    ANDROID_APP.set(app).ok();
+    match ANDROID_APP.get() {
+        Some(current) => *current.lock().unwrap() = app,
+        None => {
+            let _ = ANDROID_APP.set(Mutex::new(app));
+        }
+    }
 }
 
 fn call_activity_boolean_method(app: AndroidApp, method: &'static str, value: bool) {
@@ -321,6 +366,8 @@ impl AndroidPlatform {
         let app = ANDROID_APP
             .get()
             .expect("gpui_android::init(app) must be called from android_main before building the platform")
+            .lock()
+            .unwrap()
             .clone();
 
         let (main_sender, main_receiver) = PriorityQueueReceiver::new();
@@ -491,9 +538,24 @@ impl AndroidPlatform {
             pending_volume_buttons().lock().unwrap().clear();
             return;
         };
-        let buttons = pending_volume_buttons().lock().unwrap().drain(..).collect::<Vec<_>>();
+        let buttons = pending_volume_buttons()
+            .lock()
+            .unwrap()
+            .drain(..)
+            .collect::<Vec<_>>();
         for next in buttons {
             events::dispatch_reader_page_key(&window, next);
+        }
+    }
+
+    fn drain_reader_chrome_reveals(&self) {
+        let Some(window) = self.window() else {
+            *pending_reader_chrome_reveals().lock().unwrap() = 0;
+            return;
+        };
+        let count = std::mem::take(&mut *pending_reader_chrome_reveals().lock().unwrap());
+        for _ in 0..count {
+            events::dispatch_reader_chrome_reveal(&window);
         }
     }
 
@@ -542,7 +604,9 @@ fn system_fonts() -> Vec<Cow<'static, [u8]>> {
         }
     }
     if fonts.is_empty() {
-        log::warn!("no Roboto fonts found in /system/fonts; text rendering will fail unless the app bundles fonts");
+        log::warn!(
+            "no Roboto fonts found in /system/fonts; text rendering will fail unless the app bundles fonts"
+        );
     }
     fonts
 }
@@ -564,7 +628,11 @@ impl Platform for AndroidPlatform {
         *self.pending_launch.borrow_mut() = Some(on_finish_launching);
         let app = self.app.clone();
         while !self.quit_requested.get() {
-            let timeout = if self.backgrounded.get() { None } else { Some(POLL_TIMEOUT) };
+            let timeout = if self.backgrounded.get() {
+                None
+            } else {
+                Some(POLL_TIMEOUT)
+            };
             app.poll_events(timeout, |event| {
                 match event {
                     PollEvent::Wake | PollEvent::Timeout => {}
@@ -573,6 +641,7 @@ impl Platform for AndroidPlatform {
                 }
                 self.drain_main_runnables();
                 self.drain_volume_buttons();
+                self.drain_reader_chrome_reveals();
                 self.drain_window_insets();
                 self.maybe_request_frame();
             });
@@ -625,7 +694,8 @@ impl Platform for AndroidPlatform {
             self.display.clone(),
             self.window_appearance(),
         )?;
-        self.display.set_size(window.inner.state.borrow().bounds.size);
+        self.display
+            .set_size(window.inner.state.borrow().bounds.size);
         *self.active_window.borrow_mut() = Some((handle, Rc::clone(&window.inner)));
         Ok(Box::new(window))
     }
@@ -687,7 +757,6 @@ impl Platform for AndroidPlatform {
             request_id,
             PendingFilePrompt {
                 sender: tx,
-                executor: self.background_executor.clone(),
                 files: Vec::new(),
             },
         );
@@ -717,7 +786,9 @@ impl Platform for AndroidPlatform {
             if let Err(error) = result {
                 complete_file_prompt(
                     request_id,
-                    Some(anyhow::anyhow!("failed to open Android file prompt: {error}")),
+                    Some(anyhow::anyhow!(
+                        "failed to open Android file prompt: {error}"
+                    )),
                     false,
                 );
             }
@@ -732,7 +803,10 @@ impl Platform for AndroidPlatform {
     ) -> oneshot::Receiver<Result<Option<Vec<SelectedDirectory>>>> {
         let (tx, rx) = oneshot::channel();
         if options.files || !options.directories {
-            tx.send(Err(anyhow::anyhow!("Android directory prompts select directories only"))).ok();
+            tx.send(Err(anyhow::anyhow!(
+                "Android directory prompts select directories only"
+            )))
+            .ok();
             return rx;
         }
         let request_id = NEXT_PATH_PROMPT_ID.fetch_add(1, Ordering::Relaxed);
@@ -747,7 +821,13 @@ impl Platform for AndroidPlatform {
             .join("\n");
         pending_directory_prompts().lock().unwrap().insert(
             request_id,
-            PendingDirectoryPrompt { sender: tx, name: None, directories: Vec::new(), files: Vec::new() },
+            PendingDirectoryPrompt {
+                sender: tx,
+                name: None,
+                local_path: None,
+                directories: Vec::new(),
+                files: Vec::new(),
+            },
         );
 
         let app = self.app.clone();
@@ -763,13 +843,22 @@ impl Platform for AndroidPlatform {
                         activity.as_ref(),
                         jni_str!("openDirectoryPrompt"),
                         jni_sig!("(JLjava/lang/String;)V"),
-                        &[JValue::Long(request_id as i64), JValue::Object(extensions.as_ref())],
+                        &[
+                            JValue::Long(request_id as i64),
+                            JValue::Object(extensions.as_ref()),
+                        ],
                     )?;
                     Ok(())
                 })
             })();
             if let Err(error) = result {
-                complete_directory_prompt(request_id, Some(anyhow::anyhow!("failed to open Android directory prompt: {error}")), false);
+                complete_directory_prompt(
+                    request_id,
+                    Some(anyhow::anyhow!(
+                        "failed to open Android directory prompt: {error}"
+                    )),
+                    false,
+                );
             }
         }));
         rx

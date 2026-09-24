@@ -1,5 +1,6 @@
 use crate::events::ClickState;
 use android_activity::AndroidApp;
+use android_activity::input::{TextInputState, TextSpan};
 use anyhow::Context as _;
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult, Edges,
@@ -33,8 +34,9 @@ impl raw_window_handle::HasWindowHandle for RawWindow {
     fn window_handle(
         &self,
     ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
-        let ptr = std::ptr::NonNull::new(self.native_window.ptr().as_ptr().cast::<std::ffi::c_void>())
-            .ok_or(raw_window_handle::HandleError::Unavailable)?;
+        let ptr =
+            std::ptr::NonNull::new(self.native_window.ptr().as_ptr().cast::<std::ffi::c_void>())
+                .ok_or(raw_window_handle::HandleError::Unavailable)?;
         let handle = raw_window_handle::AndroidNdkWindowHandle::new(ptr);
         Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(handle.into()) })
     }
@@ -111,6 +113,10 @@ pub(crate) struct AndroidWindowInner {
     pub(crate) click_state: RefCell<ClickState>,
     pub(crate) surface_configured: Cell<bool>,
     pub(crate) appearance: Cell<WindowAppearance>,
+    pub(crate) pending_ime_tap: Cell<Option<Point<Pixels>>>,
+    pub(crate) pending_ime_tap_had_handler: Cell<bool>,
+    pub(crate) pending_ime_previous_bounds: Cell<Option<Bounds<Pixels>>>,
+    pub(crate) pending_ime_registrations: Cell<u8>,
     pending_physical_size: Cell<Option<Size<DevicePixels>>>,
 }
 
@@ -187,6 +193,10 @@ impl AndroidWindow {
             click_state: RefCell::new(ClickState::default()),
             surface_configured: Cell::new(true),
             appearance: Cell::new(appearance),
+            pending_ime_tap: Cell::new(None),
+            pending_ime_tap_had_handler: Cell::new(false),
+            pending_ime_previous_bounds: Cell::new(None),
+            pending_ime_registrations: Cell::new(0),
             pending_physical_size: Cell::new(None),
         });
 
@@ -225,6 +235,49 @@ fn logical_insets(insets: AndroidPhysicalInsets, scale: f32) -> WindowInsets {
 }
 
 impl AndroidWindowInner {
+    pub(crate) fn input_handler_text(input_handler: &mut PlatformInputHandler) -> Option<String> {
+        let text_length = input_handler.text_length_utf16().unwrap_or(65_536);
+        let mut adjusted_range = None;
+        input_handler.text_for_range(0..text_length, &mut adjusted_range)
+    }
+
+    fn text_input_state(input_handler: &mut PlatformInputHandler) -> Option<TextInputState> {
+        let text = Self::input_handler_text(input_handler)?;
+        let selection = input_handler.selected_text_range(true)?;
+        let selection = if selection.reversed {
+            TextSpan {
+                start: selection.range.end,
+                end: selection.range.start,
+            }
+        } else {
+            TextSpan {
+                start: selection.range.start,
+                end: selection.range.end,
+            }
+        };
+        let compose_region = input_handler.marked_text_range().map(|range| TextSpan {
+            start: range.start,
+            end: range.end,
+        });
+        Some(TextInputState {
+            text,
+            selection,
+            compose_region,
+        })
+    }
+
+    pub(crate) fn sync_text_input_state(&self) {
+        let text_input_state = self
+            .state
+            .borrow_mut()
+            .input_handler
+            .as_mut()
+            .and_then(Self::text_input_state);
+        if let Some(text_input_state) = text_input_state {
+            self.app.set_text_input_state(text_input_state);
+        }
+    }
+
     fn insets(&self) -> WindowInsets {
         self.state.borrow().insets.clone()
     }
@@ -271,11 +324,11 @@ impl AndroidWindowInner {
 
         {
             let mut state = self.state.borrow_mut();
-            if let Err(error) =
-                state
-                    .renderer
-                    .replace_surface(&raw_window, surface_config(physical_size), &instance)
-            {
+            if let Err(error) = state.renderer.replace_surface(
+                &raw_window,
+                surface_config(physical_size),
+                &instance,
+            ) {
                 log::error!("failed to replace wgpu surface: {error:#}");
                 return;
             }
@@ -430,10 +483,49 @@ impl PlatformWindow for AndroidWindow {
         self.inner.state.borrow().capslock
     }
 
-    fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
-        // Deliberately does not summon the soft keyboard: GPUI re-registers
-        // the handler every frame, so requesting it here re-opens a keyboard
-        // the user just dismissed. Taps summon it instead (events.rs).
+    fn set_input_handler(&mut self, mut input_handler: PlatformInputHandler) {
+        // Focus changes can briefly re-register the old handler before the new
+        // one. Keep the tap alive for those immediate registrations instead of
+        // letting the old handler consume the request.
+        if let Some(tap_position) = self.inner.pending_ime_tap.get() {
+            let had_handler = self.inner.pending_ime_tap_had_handler.get();
+            let previous_bounds = self.inner.pending_ime_previous_bounds.get();
+            let input_bounds = input_handler.element_bounds();
+            // A handler created by this tap is itself proof that the tap hit an
+            // editable. Its bounds can lag by one paint on Android, which used
+            // to discard the first tap and require a second one. A changed bound
+            // means the tap moved focus to another editable, so that transition
+            // is also an explicit keyboard request. Otherwise keep the bounds
+            // check so taps elsewhere do not re-open the keyboard merely because
+            // the cursor is still visible.
+            let changed_handler = had_handler
+                && previous_bounds.is_some()
+                && input_bounds.is_some()
+                && previous_bounds != input_bounds;
+            let tapped_input = !had_handler
+                || changed_handler
+                || input_bounds.is_some_and(|bounds| bounds.contains(&tap_position));
+            if tapped_input {
+                self.inner.pending_ime_tap.set(None);
+                self.inner.pending_ime_tap_had_handler.set(false);
+                self.inner.pending_ime_previous_bounds.set(None);
+                self.inner.pending_ime_registrations.set(0);
+                if let Some(text_input_state) =
+                    AndroidWindowInner::text_input_state(&mut input_handler)
+                {
+                    self.inner.app.set_text_input_state(text_input_state);
+                }
+                self.inner.app.show_soft_input(false);
+            } else {
+                let registrations = self.inner.pending_ime_registrations.get().saturating_sub(1);
+                self.inner.pending_ime_registrations.set(registrations);
+                if registrations == 0 {
+                    self.inner.pending_ime_tap.set(None);
+                    self.inner.pending_ime_tap_had_handler.set(false);
+                    self.inner.pending_ime_previous_bounds.set(None);
+                }
+            }
+        }
         self.inner.state.borrow_mut().input_handler = Some(input_handler);
     }
 

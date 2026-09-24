@@ -15,8 +15,8 @@ mod window;
 pub use android_activity::AndroidApp;
 pub use platform::{
     AndroidPlatform, complete_directory_prompt, complete_file_prompt, init,
-    selected_directory_file, selected_directory_path, selected_directory_root,
-    selected_file_descriptor, volume_button_pressed, window_insets_changed,
+    selected_directory_file, selected_directory_path, selected_directory_root, selected_directory_local_root, request_all_files_access,
+    reader_chrome_revealed, selected_file_descriptor, volume_button_pressed, window_insets_changed,
 };
 
 pub fn init_logging() {
