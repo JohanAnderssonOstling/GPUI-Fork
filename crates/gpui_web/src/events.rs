@@ -2,9 +2,10 @@ use std::rc::Rc;
 
 use gpui::{
     Capslock, ClipboardEntry, ClipboardItem, ClipboardString, DispatchEventResult, Image,
-    ImageFormat, KeyDownEvent, KeyLocation, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
-    Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px,
+    ImageFormat, KeyDownEvent, KeyLocation, KeyUpEvent, Keystroke, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
+    MouseUpEvent, NavigationDirection, Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent,
+    TouchPhase, point, px,
 };
 use wasm_bindgen::prelude::*;
 

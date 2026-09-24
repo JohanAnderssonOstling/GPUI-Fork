@@ -59,9 +59,11 @@ use seahash::SeaHasher;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Read};
 use std::ops;
+use std::pin::Pin;
 use std::time::Duration;
 use std::{
     ffi::OsString,
@@ -212,9 +214,18 @@ pub trait Platform: 'static {
                                     anyhow::anyhow!("selected file has no valid UTF-8 name")
                                 })?
                                 .to_owned();
-                            let bytes = std::fs::read(&path)
-                                .with_context(|| format!("failed to read {}", path.display()))?;
-                            Ok(SelectedFile { name, bytes })
+                            Ok(SelectedFile {
+                                name,
+                                source: SelectedDirectoryFile::new(Vec::new(), move || Box::pin(async move {
+                                    let file = std::fs::File::open(&path)
+                                        .with_context(|| format!("failed to open {}", path.display()))?;
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    let reader: SelectedDirectoryReader = Box::new(file);
+                                    #[cfg(target_arch = "wasm32")]
+                                    let reader: SelectedDirectoryReader = Box::pin(futures::io::AllowStdIo::new(file));
+                                    Ok(reader)
+                                })),
+                            })
                         })
                         .collect::<Result<Vec<_>>>()
                         .map(Some),
@@ -232,20 +243,14 @@ pub trait Platform: 'static {
         options: PathPromptOptions,
         filters: Vec<FileDialogFilter>,
     ) -> oneshot::Receiver<Result<Option<Vec<SelectedDirectory>>>> {
-        let paths = self.prompt_for_paths(options, filters.clone());
+        let paths = self.prompt_for_paths(options, filters);
         let (sender, receiver) = oneshot::channel();
         self.background_executor()
             .spawn(async move {
-                let extensions = filters
-                    .into_iter()
-                    .flat_map(|filter| filter.extensions)
-                    .map(|extension| extension.trim_start_matches('.').to_ascii_lowercase())
-                    .filter(|extension| !extension.is_empty())
-                    .collect::<std::collections::BTreeSet<_>>();
                 let result = match paths.await {
                     Ok(Ok(Some(paths))) => paths
                         .into_iter()
-                        .map(|path| selected_directory_from_path(&path, &extensions))
+                        .map(SelectedDirectory::root)
                         .collect::<Result<Vec<_>>>()
                         .map(Some),
                     Ok(Ok(None)) => Ok(None),
@@ -292,6 +297,12 @@ pub trait Platform: 'static {
     /// navigation. Mobile platforms leave the buttons to the OS while this is
     /// disabled.
     fn set_volume_button_capture(&self, _enabled: bool) {}
+
+    /// Whether decorative animation is supported by the display.
+    /// E-ink platforms disable it regardless of application preferences.
+    fn supports_animations(&self) -> bool {
+        true
+    }
 
     /// Returns whether this platform's application surface is primarily
     /// operated through touch input.
@@ -2250,17 +2261,19 @@ pub struct FileDialogFilter {
 
 /// A file selected by the user, independent of whether the platform exposes
 /// it through a filesystem path, browser `File`, or content URI.
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelectedFile {
     /// User-visible filename supplied by the selecting platform.
     pub name: String,
-    /// Complete file contents.
-    pub bytes: Vec<u8>,
+    /// File capability opened only when its consumer starts reading.
+    pub source: SelectedDirectoryFile,
 }
 
 /// A selected directory tree independent of filesystem paths. Files are
 /// opened lazily so importing a large tree does not retain every descriptor.
 pub struct SelectedDirectory {
+    /// Directly accessible root, when the platform grants filesystem access.
+    /// Platforms may omit the enumerated contents when this is provided.
+    pub local_path: Option<PathBuf>,
     /// User-visible name of the selected root directory.
     pub name: String,
     /// Relative directory paths, split into filesystem-name components.
@@ -2270,36 +2283,98 @@ pub struct SelectedDirectory {
 }
 
 /// A readable selected file opened only for the duration of its consumer.
+#[cfg(not(target_arch = "wasm32"))]
 pub type SelectedDirectoryReader = Box<dyn Read + Send>;
+#[cfg(target_arch = "wasm32")]
+pub type SelectedDirectoryReader = Pin<Box<dyn futures::io::AsyncRead>>;
+
+/// An asynchronous selected-file opener. Browser files require an asynchronous
+/// transfer even though native files can resolve this future immediately.
+pub type SelectedDirectoryReaderFuture =
+    Pin<Box<dyn Future<Output = Result<SelectedDirectoryReader>> + Send + 'static>>;
 
 /// One lazily opened file within a selected directory tree.
 pub struct SelectedDirectoryFile {
+    /// Provider metadata; absent when the provider cannot report a file size.
+    pub size_bytes: Option<u64>,
     /// Relative path, split into directory components and a final filename.
     pub path: Vec<String>,
-    opener: Box<dyn FnOnce() -> Result<SelectedDirectoryReader> + Send>,
+    opener: Box<dyn FnOnce() -> SelectedDirectoryReaderFuture + Send>,
+    #[cfg(target_arch = "wasm32")]
+    browser_file: Option<Box<dyn FnOnce() -> wasm_bindgen::JsValue + Send>>,
 }
 
 impl SelectedDirectoryFile {
     /// Creates an entry backed by a one-shot reader opener.
-    pub fn new(path: Vec<String>, opener: impl FnOnce() -> Result<SelectedDirectoryReader> + Send + 'static) -> Self {
-        Self { path, opener: Box::new(opener) }
+    pub fn new(
+        path: Vec<String>,
+        opener: impl FnOnce() -> SelectedDirectoryReaderFuture + Send + 'static,
+    ) -> Self {
+        Self {
+            size_bytes: None,
+            path,
+            opener: Box::new(opener),
+            #[cfg(target_arch = "wasm32")]
+            browser_file: None,
+        }
+    }
+
+    /// Attaches a provider-reported size without opening the file.
+    pub fn with_size_bytes(mut self, size_bytes: Option<u64>) -> Self {
+        self.size_bytes = size_bytes;
+        self
+    }
+
+    /// Transfers a browser File capability without loading its bytes.
+    #[cfg(target_arch = "wasm32")]
+    pub fn with_browser_file(mut self, export: impl FnOnce() -> wasm_bindgen::JsValue + Send + 'static) -> Self {
+        self.browser_file = Some(Box::new(export));
+        self
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub fn take_browser_file(&mut self) -> Option<Box<dyn FnOnce() -> wasm_bindgen::JsValue + Send>> {
+        self.browser_file.take()
     }
 
     /// Opens this entry for reading, consuming its one-shot capability.
-    pub fn open(self) -> Result<SelectedDirectoryReader> {
-        (self.opener)()
+    pub async fn open(self) -> Result<SelectedDirectoryReader> {
+        (self.opener)().await
     }
 }
 
-fn selected_directory_from_path(path: &Path, extensions: &std::collections::BTreeSet<String>) -> Result<SelectedDirectory> {
-    let name = path.file_name().ok_or_else(|| anyhow::anyhow!("selected directory has no name"))?.to_string_lossy().into_owned();
-    let mut directory = SelectedDirectory { name, directories: Vec::new(), files: Vec::new() };
-    collect_selected_directory(path, &mut Vec::new(), extensions, &mut directory)?;
-    Ok(directory)
+impl SelectedDirectory {
+    /// Selects a filesystem root without walking it. A library can register the
+    /// path directly; an importer can enumerate it later on a background thread.
+    pub fn root(path: PathBuf) -> Result<Self> {
+        let name = path.file_name()
+            .ok_or_else(|| anyhow::anyhow!("selected directory has no name"))?
+            .to_string_lossy().into_owned();
+        Ok(Self { local_path: Some(path), name, directories: Vec::new(), files: Vec::new() })
+    }
+
+    /// Enumerates a filesystem directory. Call on a background thread:
+    /// traversal performs I/O. Files are opened lazily, symlinks are skipped,
+    /// and unreadable paths fail selection. Empty filters accept all files.
+    pub fn from_path(path: &Path, extensions: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Self> {
+        let extensions = extensions.into_iter()
+            .map(|extension| extension.as_ref().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|extension| !extension.is_empty())
+            .collect();
+        let mut directory = Self::root(path.to_path_buf())?;
+        collect_selected_directory(path, &mut Vec::new(), &extensions, &mut directory)?;
+        Ok(directory)
+    }
 }
 
-fn collect_selected_directory(path: &Path, relative: &mut Vec<String>, extensions: &std::collections::BTreeSet<String>, selected: &mut SelectedDirectory) -> Result<()> {
-    let mut entries = std::fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?.collect::<std::io::Result<Vec<_>>>()?;
+fn collect_selected_directory(
+    path: &Path,
+    relative: &mut Vec<String>,
+    extensions: &std::collections::BTreeSet<String>,
+    selected: &mut SelectedDirectory,
+) -> Result<()> {
+    let mut entries = std::fs::read_dir(path)
+        .with_context(|| format!("failed to read {}", path.display()))?
+        .collect::<std::io::Result<Vec<_>>>()?;
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let file_type = entry.file_type()?;
@@ -2313,13 +2388,29 @@ fn collect_selected_directory(path: &Path, relative: &mut Vec<String>, extension
             collect_selected_directory(&entry.path(), relative, extensions, selected)?;
         } else if file_type.is_file() {
             let accepted = extensions.is_empty()
-                || entry.path().extension().and_then(|extension| extension.to_str()).is_some_and(|extension| extensions.contains(&extension.to_ascii_lowercase()));
+                || entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extensions.contains(&extension.to_ascii_lowercase()));
             if accepted {
                 let file_path = entry.path();
-                selected.files.push(SelectedDirectoryFile::new(relative.clone(), move || {
-                    let reader: SelectedDirectoryReader = Box::new(std::fs::File::open(&file_path).with_context(|| format!("failed to open {}", file_path.display()))?);
-                    Ok(reader)
-                }));
+                let size_bytes = entry.metadata().ok().map(|metadata| metadata.len());
+                selected
+                    .files
+                    .push(SelectedDirectoryFile::new(relative.clone(), move || {
+                        Box::pin(async move {
+                            let file = std::fs::File::open(&file_path).with_context(|| {
+                                format!("failed to open {}", file_path.display())
+                            })?;
+                            #[cfg(not(target_arch = "wasm32"))]
+                            let reader: SelectedDirectoryReader = Box::new(file);
+                            #[cfg(target_arch = "wasm32")]
+                            let reader: SelectedDirectoryReader =
+                                Box::pin(futures::io::AllowStdIo::new(file));
+                            Ok(reader)
+                        })
+                    }).with_size_bytes(size_bytes));
             }
         }
         relative.pop();

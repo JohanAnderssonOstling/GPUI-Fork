@@ -52,9 +52,10 @@ use crate::{
     PathPromptOptions, Pixels, Platform, PlatformDisplay, PlatformKeyboardLayout,
     PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton, PromptHandle,
     PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation, ScreenCaptureSource,
-    SelectedDirectory, SelectedFile, SharedString, SubscriberSet, Subscription, SvgRenderer, SystemNotification,
-    SystemNotificationResponse, Task, TextRenderingMode, TextSystem, ThermalState, Window,
-    WindowAppearance, WindowButtonLayout, WindowHandle, WindowId, WindowInvalidator,
+    SelectedDirectory, SelectedFile, SharedString, SubscriberSet, Subscription, SvgRenderer,
+    SystemNotification, SystemNotificationResponse, Task, TextRenderingMode, TextSystem,
+    ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
+    WindowInvalidator,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
 };
@@ -112,6 +113,11 @@ impl AppCell {
             eprintln!("borrowed {thread_id:?}");
         }
         Ok(AppRefMut(self.app.try_borrow_mut()?))
+    }
+
+    #[doc(hidden)]
+    pub fn is_borrowed(&self) -> bool {
+        self.app.try_borrow_mut().is_err()
     }
 }
 
@@ -770,6 +776,7 @@ pub struct App {
     pending_updates: usize,
     quit_mode: QuitMode,
     quitting: bool,
+    shutdown_timeout: Duration,
 
     // We need to ensure the leak detector drops last, after all tasks, callbacks and things have been dropped.
     // Otherwise it may report false positives.
@@ -864,6 +871,7 @@ impl App {
                 inspector_element_registry: InspectorElementRegistry::default(),
                 quit_mode: QuitMode::default(),
                 quitting: false,
+                shutdown_timeout: SHUTDOWN_TIMEOUT,
                 cursor_hide_mode: CursorHideMode::default(),
                 reduce_motion: false,
                 synced_animation_epoch,
@@ -987,8 +995,15 @@ impl App {
         self.entities.assert_no_new_leaks(snapshot)
     }
 
-    /// Quit the application gracefully. Handlers registered with [`Context::on_app_quit`]
-    /// will be given `SHUTDOWN_TIMEOUT` to complete before exiting.
+    /// Extend this application's grace period for quit handlers. Components may
+    /// request more time, but cannot shorten another component's existing request.
+    /// This does not keep the native event loop running: quit futures must not
+    /// depend on foreground dispatch. The default remains [`SHUTDOWN_TIMEOUT`].
+    pub fn extend_shutdown_timeout(&mut self, timeout: Duration) {
+        self.shutdown_timeout = self.shutdown_timeout.max(timeout);
+    }
+
+    /// Quit gracefully, waiting at most the configured grace period for handlers.
     pub fn shutdown(&mut self) {
         let mut futures = Vec::new();
 
@@ -1004,7 +1019,7 @@ impl App {
         let futures = futures::future::join_all(futures);
         if self
             .foreground_executor
-            .block_with_timeout(SHUTDOWN_TIMEOUT, futures)
+            .block_with_timeout(self.shutdown_timeout, futures)
             .is_err()
         {
             log::error!("timed out waiting on app_will_quit");
@@ -1068,7 +1083,7 @@ impl App {
     /// Returns whether non-essential animations (e.g. loading spinners) should
     /// be rendered in a static state instead of animating.
     pub fn reduce_motion(&self) -> bool {
-        self.reduce_motion
+        self.reduce_motion || !self.platform.supports_animations()
     }
 
     /// Sets whether non-essential animations (e.g. loading spinners) should be
@@ -1685,8 +1700,9 @@ impl App {
         self.platform.prompt_for_files(options, filters)
     }
 
-    /// Displays a platform directory picker and returns a path-free tree whose
-    /// selected files are opened lazily during import.
+    /// Displays a directory picker and returns filesystem roots or provider
+    /// file trees. Enumerate a local root with [`SelectedDirectory::from_path`]
+    /// only when its contents are needed; selected files are opened lazily.
     pub fn prompt_for_directories(
         &self,
         options: PathPromptOptions,
@@ -1694,8 +1710,8 @@ impl App {
         self.platform.prompt_for_directories(options, Vec::new())
     }
 
-    /// Displays a platform directory picker restricted to files matching the
-    /// given extension filters.
+    /// Displays a directory picker with extension filters. For selections that
+    /// return a local root, pass the same extensions when enumerating its contents.
     pub fn prompt_for_directories_with_filters(
         &self,
         options: PathPromptOptions,
@@ -3244,6 +3260,17 @@ mod test {
     use std::os::unix::ffi::OsStringExt;
 
     use crate::{AppContext, Context, Empty, IntoElement, Render, TestAppContext, Window};
+
+    #[gpui::test]
+    fn shutdown_grace_period_can_only_be_extended(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            assert_eq!(cx.shutdown_timeout, super::SHUTDOWN_TIMEOUT);
+            cx.extend_shutdown_timeout(std::time::Duration::from_secs(45));
+            assert_eq!(cx.shutdown_timeout, std::time::Duration::from_secs(45));
+            cx.extend_shutdown_timeout(std::time::Duration::ZERO);
+            assert_eq!(cx.shutdown_timeout, std::time::Duration::from_secs(45));
+        });
+    }
 
     struct RenderCounter(Rc<Cell<usize>>);
 

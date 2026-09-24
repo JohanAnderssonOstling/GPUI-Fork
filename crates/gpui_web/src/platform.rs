@@ -10,8 +10,9 @@ use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardEntry, ClipboardItem, ClipboardReadError,
     ClipboardString, CursorStyle, DummyKeyboardMapper, ForegroundExecutor, Image, ImageFormat,
     Keymap, Menu, MenuItem, PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout,
-    PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, SelectedFile, Task, ThermalState,
-    WindowAppearance, WindowKind, WindowParams, popup::PopupNotSupportedError,
+    PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, SelectedDirectory,
+    SelectedDirectoryFile, SelectedFile, Task, ThermalState, WindowAppearance, WindowKind,
+    WindowParams, popup::PopupNotSupportedError,
 };
 use gpui_wgpu::{PreparedWebGraphics, WebBackendPreference, WgpuContext, wgpu};
 use std::{
@@ -24,6 +25,38 @@ use std::{
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(inline_js = r#"
+const gpuiDirectoryFiles = new Map();
+let gpuiDirectoryFileSequence = 0;
+
+function retainDirectoryFile(file) {
+    const token = `gpui-directory-${Date.now()}-${gpuiDirectoryFileSequence++}`;
+    gpuiDirectoryFiles.set(token, { file, createdAt: Date.now() });
+    return token;
+}
+
+function discardExpiredDirectoryFiles() {
+    const cutoff = Date.now() - 60 * 60 * 1000;
+    for (const [token, retained] of gpuiDirectoryFiles) {
+        if (retained.createdAt < cutoff) gpuiDirectoryFiles.delete(token);
+    }
+}
+
+export async function gpuiReadDirectoryFile(token, offset, length) {
+    const retained = gpuiDirectoryFiles.get(token);
+    if (!retained) throw new Error("selected browser file is no longer available");
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isInteger(length) || length < 1 || length > 256 * 1024)
+        throw new Error("invalid selected-file range");
+    retained.createdAt = Date.now();
+    return new Uint8Array(await retained.file.slice(offset, offset + length).arrayBuffer());
+}
+export function gpuiTakeDirectoryFile(token) {
+    const entry = gpuiDirectoryFiles.get(token);
+    if (!entry) throw new Error('Selected file is no longer available');
+    gpuiDirectoryFiles.delete(token);
+    return entry.file;
+}
+export function gpuiReleaseDirectoryFile(token) { gpuiDirectoryFiles.delete(token); }
+
 export function gpuiPromptForFiles(accept, multiple) {
     return new Promise((resolve, reject) => {
         const input = document.createElement("input");
@@ -41,13 +74,73 @@ export function gpuiPromptForFiles(accept, multiple) {
             resolve(value);
         };
         input.addEventListener("cancel", () => finish(null), { once: true });
-        input.addEventListener("change", async () => {
+        input.addEventListener("change", () => {
             try {
-                const selected = await Promise.all(Array.from(input.files ?? []).map(async file => ({
+                discardExpiredDirectoryFiles();
+                const selected = Array.from(input.files ?? []).map(file => ({
                     name: file.name,
-                    bytes: new Uint8Array(await file.arrayBuffer()),
-                })));
+                    token: retainDirectoryFile(file),
+                }));
                 finish(selected);
+            } catch (error) {
+                input.remove();
+                reject(error);
+            }
+        }, { once: true });
+
+        try {
+            if (typeof input.showPicker === "function") input.showPicker();
+            else input.click();
+        } catch (error) {
+            input.remove();
+            reject(error);
+        }
+    });
+}
+
+export function gpuiPromptForDirectory(accept) {
+    return new Promise((resolve, reject) => {
+        discardExpiredDirectoryFiles();
+        const input = document.createElement("input");
+        input.type = "file";
+        input.webkitdirectory = true;
+        input.multiple = true;
+        input.style.display = "none";
+        document.body.appendChild(input);
+
+        const extensions = new Set(
+            accept.split(",")
+                .map(extension => extension.trim().toLowerCase())
+                .filter(Boolean),
+        );
+        const accepted = file => extensions.size === 0 ||
+            Array.from(extensions).some(extension =>
+                file.name.toLowerCase().endsWith(extension),
+            );
+        let settled = false;
+        const finish = value => {
+            if (settled) return;
+            settled = true;
+            input.remove();
+            resolve(value);
+        };
+        input.addEventListener("cancel", () => finish(null), { once: true });
+        input.addEventListener("change", () => {
+            try {
+                const files = Array.from(input.files ?? []);
+                const rootName = files
+                    .map(file => file.webkitRelativePath.split("/")[0])
+                    .find(Boolean);
+                if (!rootName) {
+                    finish(null);
+                    return;
+                }
+                const entries = files.map(file => ({
+                    path: file.webkitRelativePath,
+                    size: file.size,
+                    token: accepted(file) ? retainDirectoryFile(file) : null,
+                }));
+                finish({ name: rootName, entries });
             } catch (error) {
                 input.remove();
                 reject(error);
@@ -67,6 +160,16 @@ export function gpuiPromptForFiles(accept, multiple) {
 extern "C" {
     #[wasm_bindgen(js_name = gpuiPromptForFiles)]
     fn prompt_for_browser_files(accept: &str, multiple: bool) -> js_sys::Promise;
+
+    #[wasm_bindgen(js_name = gpuiPromptForDirectory)]
+    fn prompt_for_browser_directory(accept: &str) -> js_sys::Promise;
+
+    #[wasm_bindgen(js_name = gpuiReadDirectoryFile)]
+    fn read_browser_directory_file(token: &str, offset: f64, length: u32) -> js_sys::Promise;
+    #[wasm_bindgen(js_name = gpuiTakeDirectoryFile)]
+    fn take_browser_directory_file(token: &str) -> JsValue;
+    #[wasm_bindgen(js_name = gpuiReleaseDirectoryFile)]
+    fn release_browser_directory_file(token: &str);
 }
 
 static BUNDLED_FONTS: &[&[u8]] = &[
@@ -515,6 +618,39 @@ impl Platform for WebPlatform {
         receiver
     }
 
+    fn prompt_for_directories(
+        &self,
+        options: PathPromptOptions,
+        filters: Vec<gpui::FileDialogFilter>,
+    ) -> oneshot::Receiver<Result<Option<Vec<SelectedDirectory>>>> {
+        let (sender, receiver) = oneshot::channel();
+        if options.files || !options.directories {
+            sender
+                .send(Err(anyhow::anyhow!(
+                    "web directory-content prompts support directories only"
+                )))
+                .ok();
+            return receiver;
+        }
+
+        let accept = filters
+            .iter()
+            .flat_map(|filter| filter.extensions.iter())
+            .map(|extension| format!(".{}", extension.trim_start_matches('.')))
+            .collect::<Vec<_>>()
+            .join(",");
+        let promise = prompt_for_browser_directory(&accept);
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = wasm_bindgen_futures::JsFuture::from(promise)
+                .await
+                .map_err(|error| anyhow::anyhow!(js_error_message(&error)))
+                .and_then(selected_directory_from_js)
+                .map(|directory| directory.map(|directory| vec![directory]));
+            sender.send(result).ok();
+        });
+        receiver
+    }
+
     fn prompt_for_new_path(
         &self,
         _directory: &Path,
@@ -796,6 +932,46 @@ pub(crate) fn js_error_message(error: &JsValue) -> String {
         .unwrap_or_else(|| "unknown browser error".to_string())
 }
 
+struct SelectedBrowserToken(String);
+impl Drop for SelectedBrowserToken {
+    fn drop(&mut self) {
+        release_browser_directory_file(&self.0);
+    }
+}
+
+fn selected_browser_file(path: Vec<String>, token: String) -> SelectedDirectoryFile {
+    // Either consumer must keep the browser File alive after the other
+    // capability is dropped. The last owner releases an unused token.
+    let token = Arc::new(SelectedBrowserToken(token));
+    let reader_token = token.clone();
+    SelectedDirectoryFile::new(path, move || Box::pin(async move { Ok(selected_browser_reader(reader_token)) }))
+        .with_browser_file(move || take_browser_directory_file(&token.0))
+}
+
+fn selected_browser_reader(token: Arc<SelectedBrowserToken>) -> gpui::SelectedDirectoryReader {
+    let stream = futures::stream::try_unfold(
+        (token, 0_u64),
+        |(token, offset)| async move {
+            let bytes = wasm_bindgen_futures::JsFuture::from(read_browser_directory_file(
+                &token.0,
+                offset as f64,
+                256 * 1024,
+            ))
+            .await
+            .map_err(|error| std::io::Error::other(js_error_message(&error)))?;
+            let bytes = js_sys::Uint8Array::new(&bytes).to_vec();
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            let next = offset + bytes.len() as u64;
+            Ok(Some((bytes, (token, next))))
+        },
+    );
+    let reader: gpui::SelectedDirectoryReader =
+        Box::pin(futures::TryStreamExt::into_async_read(stream));
+    reader
+}
+
 fn selected_files_from_js(value: JsValue) -> Result<Option<Vec<SelectedFile>>> {
     if value.is_null() || value.is_undefined() {
         return Ok(None);
@@ -811,14 +987,84 @@ fn selected_files_from_js(value: JsValue) -> Result<Option<Vec<SelectedFile>>> {
             .map_err(|error| anyhow::anyhow!(js_error_message(&error)))?
             .as_string()
             .ok_or_else(|| anyhow::anyhow!("selected browser file has no name"))?;
-        let bytes = js_sys::Reflect::get(&entry, &JsValue::from_str("bytes"))
-            .map_err(|error| anyhow::anyhow!(js_error_message(&error)))?;
+        let token = js_sys::Reflect::get(&entry, &JsValue::from_str("token"))
+            .map_err(|error| anyhow::anyhow!(js_error_message(&error)))?
+            .as_string()
+            .ok_or_else(|| anyhow::anyhow!("selected browser file has no transfer token"))?;
         selected.push(SelectedFile {
             name,
-            bytes: js_sys::Uint8Array::new(&bytes).to_vec(),
+            source: selected_browser_file(Vec::new(), token),
         });
     }
     Ok(Some(selected))
+}
+
+fn selected_directory_from_js(value: JsValue) -> Result<Option<SelectedDirectory>> {
+    if value.is_null() || value.is_undefined() {
+        return Ok(None);
+    }
+    let name = js_sys::Reflect::get(&value, &JsValue::from_str("name"))
+        .map_err(|error| anyhow::anyhow!(js_error_message(&error)))?
+        .as_string()
+        .ok_or_else(|| anyhow::anyhow!("selected browser directory has no name"))?;
+    let entries = js_sys::Reflect::get(&value, &JsValue::from_str("entries"))
+        .map_err(|error| anyhow::anyhow!(js_error_message(&error)))?;
+    if !js_sys::Array::is_array(&entries) {
+        return Err(anyhow::anyhow!(
+            "browser directory picker returned invalid entries"
+        ));
+    }
+
+    let mut directories = std::collections::BTreeSet::new();
+    let mut files = Vec::new();
+    for entry in js_sys::Array::from(&entries) {
+        let path = js_sys::Reflect::get(&entry, &JsValue::from_str("path"))
+            .map_err(|error| anyhow::anyhow!(js_error_message(&error)))?
+            .as_string()
+            .ok_or_else(|| anyhow::anyhow!("selected browser file has no relative path"))?;
+        let mut components = path
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if components.first().is_none_or(|root| root != &name) {
+            return Err(anyhow::anyhow!(
+                "selected browser file is outside the selected directory"
+            ));
+        }
+        components.remove(0);
+        if components.is_empty()
+            || components
+                .iter()
+                .any(|component| component == "." || component == "..")
+        {
+            return Err(anyhow::anyhow!(
+                "selected browser file has an invalid relative path"
+            ));
+        }
+        for end in 1..components.len() {
+            directories.insert(components[..end].to_vec());
+        }
+
+        let token = js_sys::Reflect::get(&entry, &JsValue::from_str("token"))
+            .map_err(|error| anyhow::anyhow!(js_error_message(&error)))?;
+        if token.is_null() || token.is_undefined() {
+            continue;
+        }
+        let token = token
+            .as_string()
+            .ok_or_else(|| anyhow::anyhow!("selected browser file has no transfer token"))?;
+        let size = js_sys::Reflect::get(&entry, &JsValue::from_str("size")).ok().and_then(|value| value.as_f64())
+            .filter(|size| size.is_finite() && *size >= 0.0 && size.fract() == 0.0 && *size <= 9_007_199_254_740_991.0).map(|size| size as u64);
+        files.push(selected_browser_file(components, token).with_size_bytes(size));
+    }
+
+    Ok(Some(SelectedDirectory {
+        local_path: None,
+        name,
+        directories: directories.into_iter().collect(),
+        files,
+    }))
 }
 
 fn log_clipboard_entry_error(mime_type: &str, error: &JsValue) {

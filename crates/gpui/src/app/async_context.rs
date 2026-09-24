@@ -8,7 +8,7 @@ use anyhow::{Context as _, bail};
 use derive_more::{Deref, DerefMut};
 use futures::channel::oneshot;
 use futures::future::FutureExt;
-use std::{future::Future, rc::Weak};
+use std::{future::Future, rc::Weak, time::Duration};
 
 use super::{Context, WeakEntity};
 
@@ -26,6 +26,36 @@ pub struct AsyncApp {
 }
 
 impl AsyncApp {
+    /// Wait until the application is not being updated by another callback.
+    ///
+    /// Browser worker and promise callbacks can otherwise resume a foreground
+    /// task while the web event handler still owns the application's `RefCell`.
+    /// Native platform dispatchers already serialize this case, so this is a
+    /// no-op there.
+    pub async fn wait_for_update_slot(&self) {
+        #[cfg(target_arch = "wasm32")]
+        while self.app().is_borrowed() {
+            self.background_executor.timer(Duration::ZERO).await;
+        }
+    }
+
+    /// Applies a state update after the current web callback has released the
+    /// application. Use this for results delivered by browser workers,
+    /// promises, and timers instead of updating an entity directly from that
+    /// callback.
+    pub fn defer_update<T, F>(&mut self, entity: WeakEntity<T>, update: F)
+    where
+        T: 'static,
+        F: FnOnce(&mut T, &mut Context<T>) + 'static,
+    {
+        self.spawn(async move |cx| {
+            cx.wait_for_update_slot().await;
+            let _ = entity.update(cx, update);
+        })
+        .detach();
+    }
+
+
     fn app(&self) -> std::rc::Rc<AppCell> {
         self.app
             .upgrade()

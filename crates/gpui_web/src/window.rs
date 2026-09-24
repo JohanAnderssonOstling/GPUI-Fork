@@ -58,6 +58,7 @@ pub(crate) struct WebWindowInner {
     pub(crate) is_composing: Cell<bool>,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
+    raf_timer_pending: Cell<bool>,
     raf_id: Cell<Option<i32>>,
     raf_function: RefCell<Option<js_sys::Function>>,
 }
@@ -194,6 +195,7 @@ impl WebWindow {
             is_composing: Cell::new(false),
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
+            raf_timer_pending: Cell::new(false),
             raf_id: Cell::new(None),
             raf_function: RefCell::new(None),
         });
@@ -372,14 +374,36 @@ impl WebWindowInner {
         closure
     }
 
-    pub(crate) fn wake_frame_loop(&self) {
-        if self.raf_id.get().is_some() {
+    pub(crate) fn wake_frame_loop(self: &Rc<Self>) {
+        if self.raf_id.get().is_some() || self.raf_timer_pending.replace(true) {
             return;
         }
-        let raf_function = self.raf_function.borrow();
-        if let Some(func) = raf_function.as_ref() {
-            self.raf_id
-                .set(self.browser_window.request_animation_frame(func).ok());
+
+        // Register the animation frame after the current browser callback has
+        // returned. Firefox may otherwise deliver it while GPUI is still
+        // dispatching the input event that requested the frame, when `App` is
+        // already mutably borrowed.
+        let this = Rc::downgrade(self);
+        let callback = Closure::once_into_js(move || {
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.raf_timer_pending.set(false);
+            if this.raf_id.get().is_some() {
+                return;
+            }
+            let raf_function = this.raf_function.borrow();
+            if let Some(func) = raf_function.as_ref() {
+                this.raf_id
+                    .set(this.browser_window.request_animation_frame(func).ok());
+            }
+        });
+        if self
+            .browser_window
+            .set_timeout_with_callback_and_timeout_and_arguments_0(callback.unchecked_ref(), 0)
+            .is_err()
+        {
+            self.raf_timer_pending.set(false);
         }
     }
 

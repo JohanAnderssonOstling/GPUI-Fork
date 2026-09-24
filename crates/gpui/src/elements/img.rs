@@ -1,11 +1,11 @@
+#[cfg(any(feature = "image-formats", feature = "image-webp"))]
+use crate::decode_static_image_from_decoder;
 use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
     Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
     Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
     SharedString, SharedUri, StyleRefinement, Styled, Task, Window, decode_static_image, px,
 };
-#[cfg(any(feature = "image-formats", feature = "image-webp"))]
-use crate::decode_static_image_from_decoder;
 use anyhow::Result;
 
 use futures::Future;
