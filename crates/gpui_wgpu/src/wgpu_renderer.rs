@@ -751,14 +751,12 @@ impl WgpuRenderer {
             .min(device.limits().max_storage_buffer_binding_size)
             .min(MAX_INSTANCE_BUFFER_SIZE);
         let instance_data_capacity = (2 * 1024 * 1024).min(max_instance_data_size);
-        let instance_data = InstanceData::Storage(device.create_buffer(
-            &wgpu::BufferDescriptor {
-                label: Some("instance_buffer"),
-                size: instance_data_capacity,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            },
-        ));
+        let instance_data = InstanceData::Storage(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("instance_buffer"),
+            size: instance_data_capacity,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
         let instance_data_alignment = device.limits().min_storage_buffer_offset_alignment as u64;
 
         let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -811,12 +809,8 @@ impl WgpuRenderer {
         device.on_uncaptured_error(Arc::new(move |error| {
             *last_error_clone.lock().unwrap() = Some(error.to_string());
         }));
-        let target = WgpuTarget::Headless(Self::create_headless_target(
-            &device,
-            1,
-            1,
-            surface_format,
-        ));
+        let target =
+            WgpuTarget::Headless(Self::create_headless_target(&device, 1, 1, surface_format));
         let resources = WgpuResources {
             device,
             queue,
@@ -1628,11 +1622,12 @@ impl WgpuRenderer {
         };
         let width = self.surface_config.width;
         let height = self.surface_config.height;
-        let mut encoder = self.resources().device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor {
-                label: Some("gpui_headless_readback_encoder"),
-            },
-        );
+        let mut encoder =
+            self.resources()
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("gpui_headless_readback_encoder"),
+                });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &target.texture,
