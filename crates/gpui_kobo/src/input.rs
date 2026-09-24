@@ -4,7 +4,6 @@ use std::mem::{self, MaybeUninit};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use std::{fs::OpenOptions, io::Write};
 
 use anyhow::{Context as _, Result, bail};
 
@@ -38,7 +37,6 @@ const GYROSCOPE_ROTATIONS: [i32; 4] = [
     MSC_RAW_GSENSOR_PORTRAIT_DOWN,
 ];
 
-const POWER_BUTTON_CODES: [u16; 7] = [104, 105, 106, 109, 102, 116, 142];
 pub const GYROSCOPE_ROTATION_OFFSET: u8 = 3;
 
 fn adjusted_rotation(rotation: u8) -> u8 {
@@ -640,9 +638,7 @@ impl ButtonDevice {
                 })
             })
             .collect();
-        let device = Self { sources };
-        device.enable_wakeup_for_power_buttons();
-        Ok(device)
+        Ok(Self { sources })
     }
 
     pub fn description(&self) -> String {
@@ -654,21 +650,6 @@ impl ButtonDevice {
             .map(|source| source.path.display().to_string())
             .collect::<Vec<_>>()
             .join(", ")
-    }
-
-    fn enable_wakeup_for_power_buttons(&self) {
-        for source in &self.sources {
-            if page_buttons_supported_on_device(&source.path).unwrap_or(false) {
-                let event_name = source
-                    .path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("unknown");
-                if set_power_button_wakeup(&source.path, true) {
-                    println!("Kobo wakeup enabled for {event_name}");
-                }
-            }
-        }
     }
 
     pub fn next_event(&mut self, timeout: Duration) -> Result<Option<ButtonEvent>> {
@@ -808,89 +789,4 @@ fn ioctl_read_request(kind: u8, number: u8, size: usize) -> libc::c_ulong {
         | ((kind as libc::c_ulong) << IOC_TYPESHIFT)
         | ((number as libc::c_ulong) << IOC_NRSHIFT)
         | ((size as libc::c_ulong) << IOC_SIZESHIFT)
-}
-
-fn page_buttons_supported_on_device(path: &Path) -> Option<bool> {
-    let event_name = path.file_name()?.to_str()?;
-    let key_path = Path::new("/sys/class/input")
-        .join(event_name)
-        .join("device")
-        .join("capabilities")
-        .join("key");
-    let key_bitmap = fs::read_to_string(&key_path).ok()?;
-    let values = parse_hex_word_bitmap(&key_bitmap);
-    let mut has_any = false;
-    for code in POWER_BUTTON_CODES {
-        if key_has_code(&values, code) {
-            has_any = true;
-            break;
-        }
-    }
-    if has_any {
-        println!(
-            "Kobo hardware button device {} exposes page/power/sleep keys",
-            event_name
-        );
-    }
-    Some(has_any)
-}
-
-fn parse_hex_word_bitmap(value: &str) -> Vec<u64> {
-    let mut values = Vec::new();
-    for token in value.split_whitespace() {
-        if let Ok(value) = u64::from_str_radix(token, 16).or_else(|_| token.parse::<u64>()) {
-            values.push(value);
-        }
-    }
-    values
-}
-
-fn key_has_code(values: &[u64], key_code: u16) -> bool {
-    let index = (key_code / 32) as usize;
-    let bit = 1u64 << (key_code % 32);
-    values.get(index).is_some_and(|value| value & bit != 0)
-}
-
-fn set_power_button_wakeup(path: &Path, enabled: bool) -> bool {
-    let event_name = match path.file_name().and_then(|name| name.to_str()) {
-        Some(name) => name,
-        None => return false,
-    };
-    let wakeup_path = Path::new("/sys/class/input")
-        .join(event_name)
-        .join("device")
-        .join("power")
-        .join("wakeup");
-    if !wakeup_path.exists() {
-        return false;
-    }
-    let states = if enabled {
-        ["enabled", "1"]
-    } else {
-        ["disabled", "0"]
-    };
-    for state in states {
-        let mut file = match OpenOptions::new().write(true).open(&wakeup_path) {
-            Ok(file) => file,
-            Err(error) => {
-                println!(
-                    "Kobo wakeup sysfs open failed: {} ({error})",
-                    wakeup_path.display()
-                );
-                return false;
-            }
-        };
-        if file.write_all(format!("{state}\n").as_bytes()).is_err() {
-            continue;
-        }
-        println!(
-            "Kobo wakeup set {state} for {} ({})",
-            wakeup_path.display(),
-            event_name
-        );
-        return true;
-    }
-
-    println!("Kobo wakeup write failed for {}", wakeup_path.display());
-    false
 }

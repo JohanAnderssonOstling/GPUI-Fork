@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use gpui::{
-    AppContext, Application, Bounds, Context, IntoElement, ParentElement, Render, Window, WindowBounds,
-    WindowOptions, Styled, div, point, px, rgb, size,
+    AppContext, Application, Bounds, Context, IntoElement, ParentElement, Render, Styled, Window,
+    WindowBounds, WindowOptions, div, point, px, rgb, size,
 };
 use gpui_kobo::{KoboPlatform, KoboPlatformOptions, PageButtonBehavior};
 
@@ -62,7 +62,10 @@ fn production_platform_renders_one_button() {
         .expect("production Kobo test window should open");
     });
 
-    assert!(platform.take_error().is_none(), "Kobo platform reported an error");
+    assert!(
+        platform.take_error().is_none(),
+        "Kobo platform reported an error"
+    );
     let image = platform
         .last_frame()
         .expect("production Kobo platform should render a framebuffer");
@@ -78,5 +81,8 @@ fn production_platform_renders_one_button() {
             (140..460).contains(x) && (104..216).contains(y) && pixel.0[0] > 224
         })
         .count();
-    assert!(light_button_pixels > 20, "button label glyphs were not rendered");
+    assert!(
+        light_button_pixels > 20,
+        "button label glyphs were not rendered"
+    );
 }

@@ -1,11 +1,12 @@
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, mpsc};
-use std::thread::{self, ThreadId};
+use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -23,12 +24,12 @@ use gpui::{
 };
 use gpui_wgpu::CosmicTextSystem;
 use image::{GrayImage, Luma};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
 use uuid::Uuid;
 
 use crate::{
-    ButtonEvent, DeviceRefreshProfile, FbInkPresenter, FrameUpdate, GYROSCOPE_ROTATION_OFFSET,
+    ButtonEvent, DeviceRefreshProfile, FbInkPresenter, FrameUpdate,
     Gesture, HardwareButton, KoboRenderMode, KoboRenderer, KoboRuntime, PixelRect, RefreshMode,
     RepaintScheduler, RuntimeEvent, TouchPhase, changed_pixel_bounds_in, render_profiling_enabled,
 };
@@ -38,7 +39,6 @@ thread_local! {
 }
 
 const RESOURCE_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
-const TOUCH_ROTATION_OFFSET_FROM_GYRO: u8 = (4 - GYROSCOPE_ROTATION_OFFSET) % 4;
 
 #[derive(Clone, Copy)]
 struct ProcessMemorySample {
@@ -60,6 +60,7 @@ struct KoboRunState {
     resource_monitor: KoboResourceMonitor,
     touch: TouchAccumulator,
     suppress_next_power_release: bool,
+    wake_frame_pending: bool,
 }
 
 impl KoboResourceMonitor {
@@ -170,6 +171,14 @@ pub fn request_full_repaint() -> Result<()> {
     Ok(())
 }
 
+thread_local! {
+    static POWER_MENU_PENDING: Cell<bool> = const { Cell::new(false) };
+    static SLEEP_PENDING: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn take_power_menu_request() -> bool { POWER_MENU_PENDING.with(|pending| pending.replace(false)) }
+pub fn request_sleep() { SLEEP_PENDING.with(|pending| pending.set(true)); }
+
 pub fn current_render_mode() -> Result<KoboRenderMode> {
     let platform = active_kobo_platform()?;
     if let Some(experience_mode) = platform.requested_experience_mode.get() {
@@ -216,7 +225,7 @@ pub enum KoboExperienceMode {
 impl KoboExperienceMode {
     fn render_mode(self) -> KoboRenderMode {
         match self {
-            Self::LibraryFast => KoboRenderMode::FastMonochrome,
+            Self::LibraryFast => KoboRenderMode::QualityGrayscale,
             Self::ReaderQuality => KoboRenderMode::QualityGrayscale,
         }
     }
@@ -296,6 +305,10 @@ pub struct KoboPlatformOptions {
     pub page_buttons: PageButtonBehavior,
     /// Application-owned Kobo suspend operation invoked on power-button release.
     pub power_button_handler: Option<fn() -> std::result::Result<(), String>>,
+    pub power_button_opens_menu: bool,
+    /// Called after the restored application frame is presented following suspend.
+    /// Must only enqueue background work, without blocking the event loop.
+    pub wake_ui_ready_handler: Option<fn()>,
     /// Draw and handle a persistent control that exits to the Kobo shell.
     pub show_exit_button: bool,
     pub experience_mode: KoboExperienceMode,
@@ -309,7 +322,17 @@ pub enum PageButtonBehavior {
     /// Emit a scroll gesture, useful for generic scrolling views and the smoke test.
     Scroll,
     /// Emit left/right keystrokes, reusing the desktop reader's existing key bindings.
+    ///
+    /// Note these move a *selection* in list and grid views rather than turning
+    /// a page: the library browser binds left/right to its card cursor.
     ArrowKeys,
+    /// Emit pageup/pagedown keystrokes.
+    ///
+    /// The reader binds these alongside the arrow keys, so it behaves
+    /// identically either way, while views that paginate get a page turn
+    /// instead of a cursor step. This matches what Android's volume buttons
+    /// already dispatch.
+    PageKeys,
 }
 
 impl Default for KoboPlatformOptions {
@@ -323,6 +346,8 @@ impl Default for KoboPlatformOptions {
             timeout: Duration::from_secs(45),
             page_buttons: PageButtonBehavior::Scroll,
             power_button_handler: None,
+            power_button_opens_menu: false,
+            wake_ui_ready_handler: None,
             show_exit_button: false,
             experience_mode: KoboExperienceMode::ReaderQuality,
             render_mode: KoboRenderMode::QualityGrayscale,
@@ -336,6 +361,93 @@ struct KoboDispatcher {
     main_tx: mpsc::Sender<RunnableVariant>,
     main_rx: Mutex<mpsc::Receiver<RunnableVariant>>,
     background_tx: mpsc::Sender<RunnableVariant>,
+    timers: Arc<KoboTimerQueue>,
+    timer_thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct KoboTimerQueue {
+    state: Mutex<KoboTimerState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct KoboTimerState {
+    tasks: BinaryHeap<KoboTimerEntry>,
+    next_sequence: u64,
+    shutdown: bool,
+}
+
+struct KoboTimerEntry {
+    deadline: Instant,
+    sequence: u64,
+    runnable: RunnableVariant,
+}
+
+impl PartialEq for KoboTimerEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline && self.sequence == other.sequence
+    }
+}
+
+impl Eq for KoboTimerEntry {}
+
+impl PartialOrd for KoboTimerEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for KoboTimerEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .deadline
+            .cmp(&self.deadline)
+            .then_with(|| other.sequence.cmp(&self.sequence))
+    }
+}
+
+impl KoboTimerQueue {
+    fn schedule(&self, duration: Duration, runnable: RunnableVariant) {
+        let mut state = self.state.lock();
+        let sequence = state.next_sequence;
+        state.next_sequence = state.next_sequence.wrapping_add(1);
+        state.tasks.push(KoboTimerEntry {
+            deadline: Instant::now() + duration,
+            sequence,
+            runnable,
+        });
+        self.changed.notify_one();
+    }
+
+    fn shutdown(&self) {
+        self.state.lock().shutdown = true;
+        self.changed.notify_one();
+    }
+
+    fn run(&self, main_tx: mpsc::Sender<RunnableVariant>) {
+        let mut state = self.state.lock();
+        loop {
+            if state.shutdown {
+                return;
+            }
+            let Some(deadline) = state.tasks.peek().map(|entry| entry.deadline) else {
+                self.changed.wait(&mut state);
+                continue;
+            };
+            let now = Instant::now();
+            if deadline > now {
+                self.changed.wait_for(&mut state, deadline - now);
+                continue;
+            }
+            let entry = state.tasks.pop().expect("timer entry was present");
+            drop(state);
+            if main_tx.send(entry.runnable).is_err() {
+                return;
+            }
+            state = self.state.lock();
+        }
+    }
 }
 
 impl KoboDispatcher {
@@ -358,11 +470,22 @@ impl KoboDispatcher {
                 })
                 .expect("failed to start Kobo GPUI worker");
         }
+        let timers = Arc::new(KoboTimerQueue::default());
+        let timer_thread = {
+            let timers = Arc::clone(&timers);
+            let main_tx = main_tx.clone();
+            thread::Builder::new()
+                .name("gpui-kobo-timer".into())
+                .spawn(move || timers.run(main_tx))
+                .expect("failed to start Kobo GPUI timer worker")
+        };
         Arc::new(Self {
             main_thread: thread::current().id(),
             main_tx,
             main_rx: Mutex::new(main_rx),
             background_tx,
+            timers,
+            timer_thread: Some(timer_thread),
         })
     }
 
@@ -390,15 +513,20 @@ impl PlatformDispatcher for KoboDispatcher {
     }
 
     fn dispatch_after(&self, duration: Duration, runnable: RunnableVariant) {
-        let tx = self.main_tx.clone();
-        thread::spawn(move || {
-            thread::sleep(duration);
-            let _ = tx.send(runnable);
-        });
+        self.timers.schedule(duration, runnable);
     }
 
     fn spawn_realtime(&self, f: Box<dyn FnOnce() + Send>) {
         thread::spawn(f);
+    }
+}
+
+impl Drop for KoboDispatcher {
+    fn drop(&mut self) {
+        self.timers.shutdown();
+        if let Some(timer_thread) = self.timer_thread.take() {
+            let _ = timer_thread.join();
+        }
     }
 }
 
@@ -454,7 +582,10 @@ struct KoboWindowState {
     input_handler: Cell<Option<PlatformInputHandler>>,
     text_input_active: Cell<bool>,
     request_frame: Cell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
+    frame_requested: Rc<Cell<bool>>,
+    activation_requested: Cell<bool>,
     input: Cell<Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>>,
+    active: Cell<bool>,
     active_changed: Cell<Option<Box<dyn FnMut(bool)>>>,
     hover_changed: Cell<Option<Box<dyn FnMut(bool)>>>,
     resized: Cell<Option<Box<dyn FnMut(Size<Pixels>, f32)>>>,
@@ -493,7 +624,10 @@ impl KoboWindow {
             input_handler: Cell::new(None),
             text_input_active: Cell::new(false),
             request_frame: Cell::new(None),
+            frame_requested: Rc::new(Cell::new(false)),
+            activation_requested: Cell::new(false),
             input: Cell::new(None),
+            active: Cell::new(true),
             active_changed: Cell::new(None),
             hover_changed: Cell::new(None),
             resized: Cell::new(None),
@@ -513,6 +647,8 @@ impl KoboWindow {
     }
 
     fn request_frame(&self, force: bool) {
+        // Clear before dispatch so demand raised by this frame survives.
+        self.0.frame_requested.set(false);
         let callback = self.0.request_frame.take();
         if let Some(mut callback) = callback {
             callback(RequestFrameOptions {
@@ -558,12 +694,19 @@ impl KoboWindow {
         }
     }
 
-    fn activate_callbacks(&self) {
-        let active = self.0.active_changed.take();
-        if let Some(mut active) = active {
-            active(true);
-            self.0.active_changed.set(Some(active));
+    fn set_active(&self, value: bool) {
+        self.0.active.set(value);
+        if let Some(mut callback) = self.0.active_changed.take() {
+            callback(value);
+            self.0.active_changed.set(Some(callback));
         }
+    }
+
+    fn activate_callbacks(&self) {
+        if !self.0.activation_requested.replace(false) {
+            return;
+        }
+        self.set_active(true);
         let hovered = self.0.hover_changed.take();
         if let Some(mut hovered) = hovered {
             hovered(true);
@@ -692,10 +835,10 @@ impl PlatformWindow for KoboWindow {
         None
     }
     fn activate(&self) {
-        self.activate_callbacks();
+        self.0.activation_requested.set(true);
     }
     fn is_active(&self) -> bool {
-        true
+        self.0.active.get()
     }
     fn is_hovered(&self) -> bool {
         true
@@ -811,12 +954,13 @@ impl PlatformWindow for KoboWindow {
         let input_active = input_handler.is_some();
         self.0.input_handler.set(input_handler);
         if self.0.text_input_active.replace(input_active) != input_active {
-            self.request_frame(false);
+            self.0.frame_requested.set(true);
         }
     }
 
-    fn schedule_frame(&self) {
-        self.request_frame(false);
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let requested = self.0.frame_requested.clone();
+        Some(Rc::new(move || requested.set(true)))
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -886,14 +1030,23 @@ fn glyph_rows(character: char) -> [u8; 7] {
         'K' => [
             0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
         ],
+        'L' => [
+            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+        ],
         'N' => [
             0b10001, 0b11001, 0b11001, 0b10101, 0b10011, 0b10011, 0b10001,
         ],
         'O' => [
             0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
         ],
+        'P' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
         'R' => [
             0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+        ],
+        'S' => [
+            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
         ],
         'T' => [
             0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
@@ -964,6 +1117,15 @@ fn draw_quitting_screen(image: &mut GrayImage) {
         0,
         image.width(),
     );
+}
+
+fn draw_sleep_screen(image: &mut GrayImage) {
+    for pixel in image.pixels_mut() {
+        *pixel = Luma([255]);
+    }
+    let dot = (image.width() / 100).clamp(1, 8);
+    let top = image.height().saturating_sub(7 * dot) / 2;
+    draw_bitmap_text(image, "SLEEPING", dot, top, 0, image.width());
 }
 
 /// Production, single-window GPUI platform for Kobo e-readers.
@@ -1119,6 +1281,7 @@ impl KoboPlatform {
                 resource_monitor: KoboResourceMonitor::new(Instant::now()),
                 touch: TouchAccumulator::default(),
                 suppress_next_power_release: false,
+                wake_frame_pending: false,
             })),
             display_geometry_refresh_requested: Cell::new(false),
             queued_events: Cell::new(VecDeque::new()),
@@ -1177,6 +1340,9 @@ impl KoboPlatform {
     }
 
     fn present_pending_full_repaint(&self, state: &mut KoboRunState) -> Result<bool> {
+        if SLEEP_PENDING.with(|pending| pending.replace(false)) {
+            if let Err(error) = self.request_suspend(state) { eprintln!("Kobo sleep failed: {error}"); }
+        }
         if !self.full_repaint_requested.replace(false) {
             return Ok(false);
         }
@@ -1191,7 +1357,7 @@ impl KoboPlatform {
             println!("Kobo rendering mode changed: {render_mode:?}");
         }
         println!("GPUI full repaint request consumed at event-loop boundary");
-        let force = self.full_gc16_requested.replace(false);
+        let force = self.full_gc16_requested.get();
         self.request_and_present(state, false, force)?;
         Ok(true)
     }
@@ -1291,7 +1457,26 @@ impl KoboPlatform {
             .options
             .power_button_handler
             .ok_or_else(|| anyhow!("Kobo application did not install a power-button handler"))?;
+        let mut frame = self
+            .last_frame()
+            .ok_or_else(|| anyhow!("Kobo sleep requested before the first frame"))?;
+        draw_sleep_screen(&mut frame);
+        // Also restore the app if presenting or suspending fails. The sleep
+        // page must not replace the cached application frame.
+        self.full_repaint_requested.set(true);
+        self.full_gc16_requested.set(true);
+        if let Some(presenter) = state.presenter.as_mut() {
+            // Full refreshes wait for e-ink completion in the FBInk shim.
+            presenter.present_full_gc16(&frame)?;
+        }
+        println!("Kobo sleep screen presented; suspending");
+        let windows = self.with_windows(|windows| {
+            windows.iter().filter_map(Weak::upgrade).map(KoboWindow).collect::<Vec<_>>()
+        });
+        for window in &windows { window.set_active(false); }
         let suspend_result = handler();
+        for window in &windows { window.set_active(true); }
+        state.wake_frame_pending = true;
         if let Some(runtime) = state.runtime.as_mut() {
             let (touch_events, button_events) = runtime.discard_pending_input()?;
             println!(
@@ -1299,7 +1484,6 @@ impl KoboPlatform {
             );
         }
         state.suppress_next_power_release = false;
-        suspend_result.map_err(|error| anyhow!("Kobo application suspend failed: {error}"))?;
 
         let geometry = if let Some(presenter) = state.presenter.as_mut() {
             presenter.reinitialize()?;
@@ -1317,7 +1501,7 @@ impl KoboPlatform {
         }
         self.full_repaint_requested.set(true);
         self.full_gc16_requested.set(true);
-        Ok(())
+        suspend_result.map_err(|error| anyhow!("Kobo application suspend failed: {error}"))
     }
 
     fn apply_display_geometry(&self, state: &mut KoboRunState, geometry: &crate::ScreenGeometry) {
@@ -1355,6 +1539,14 @@ impl KoboPlatform {
         })
     }
 
+    fn notify_wake_ui_ready(&self, state: &mut KoboRunState) {
+        if std::mem::take(&mut state.wake_frame_pending) {
+            if let Some(handler) = self.options.wake_ui_ready_handler {
+                handler();
+            }
+        }
+    }
+
     fn request_and_present(
         &self,
         state: &mut KoboRunState,
@@ -1364,6 +1556,7 @@ impl KoboPlatform {
         let Some(window) = self.window() else {
             return Ok(());
         };
+        window.activate_callbacks();
         let pipeline_started = Instant::now();
         let render_started = Instant::now();
         window.request_frame(force);
@@ -1383,6 +1576,7 @@ impl KoboPlatform {
                 .map(|update| update.image.clone())
                 .or_else(|| window.last_frame().map(crate::GrayFrame::unpooled));
             let Some(image) = image else {
+                self.full_repaint_requested.set(true);
                 println!(
                     "GPUI timing: force=true scrolling={scrolling} render_ms={render_ms} frame=false total_ms={}",
                     pipeline_started.elapsed().as_millis()
@@ -1391,12 +1585,15 @@ impl KoboPlatform {
             };
             let present_started = Instant::now();
             if let Some(presenter) = state.presenter.as_mut() {
-                if self.full_gc16_requested.replace(false) {
+                if self.full_gc16_requested.get() {
                     presenter.present_full_gc16(&image)?;
                 } else {
                     presenter.present_full(&image)?;
                 }
             }
+            self.full_gc16_requested.set(false);
+            state.scheduler.record_full_presentation(&image);
+            self.notify_wake_ui_ready(state);
             println!(
                 "GPUI timing: force=true scrolling={scrolling} render_ms={render_ms} changed={} present_ms={} total_ms={}",
                 update.is_some(),
@@ -1485,6 +1682,7 @@ impl KoboPlatform {
                 present_started.elapsed().as_millis(),
                 pipeline_started.elapsed().as_millis(),
             );
+            state.scheduler.record_fast_presentation(&update, Instant::now());
             return Ok(());
         }
         let schedule_started = Instant::now();
@@ -1717,6 +1915,10 @@ impl KoboPlatform {
                 println!("ignored power-button release that completed Kobo wake");
                 return Ok(());
             }
+            if self.options.power_button_opens_menu {
+                POWER_MENU_PENDING.with(|pending| pending.set(true));
+                return Ok(());
+            }
             println!("hardware power button requested Kobo suspend");
             if let Err(error) = self.request_suspend(state) {
                 println!("hardware power suspend failed; staying in app: {error}");
@@ -1738,6 +1940,12 @@ impl KoboPlatform {
             }
             (HardwareButton::NextPage, PageButtonBehavior::ArrowKeys) => {
                 self.dispatch_page_key(state, "right")
+            }
+            (HardwareButton::PreviousPage, PageButtonBehavior::PageKeys) => {
+                self.dispatch_page_key(state, "pageup")
+            }
+            (HardwareButton::NextPage, PageButtonBehavior::PageKeys) => {
+                self.dispatch_page_key(state, "pagedown")
             }
             (HardwareButton::Home, _) => {
                 self.request_quit();
@@ -1771,6 +1979,12 @@ impl KoboPlatform {
         rotation: u8,
         from_gyro: bool,
     ) -> Result<()> {
+        // Manual rotation remains available while the lock is enabled, but
+        // gyro-driven geometry changes must be ignored when auto-rotation is
+        // disabled.
+        if from_gyro && !self.auto_rotate.get() {
+            return Ok(());
+        }
         let geometry = {
             let Some(presenter) = state.presenter.as_mut() else {
                 return Ok(());
@@ -1783,28 +1997,15 @@ impl KoboPlatform {
             };
             if presenter.geometry().current_rotation != next_rotation {
                 println!(
-                    "Kobo rotation change: {} -> {} (from_gyro={} touch_offset={})",
+                    "Kobo rotation change: {} -> {} (from_gyro={})",
                     native_rotation,
                     next_rotation,
                     from_gyro,
-                    if from_gyro {
-                        TOUCH_ROTATION_OFFSET_FROM_GYRO
-                    } else {
-                        0
-                    },
                 );
             }
-            presenter.set_current_rotation(next_rotation);
+            presenter.set_current_rotation(next_rotation)?;
             presenter.geometry().clone()
         };
-        let touch_rotation_offset = if from_gyro {
-            TOUCH_ROTATION_OFFSET_FROM_GYRO
-        } else {
-            0
-        };
-        if let Some(runtime) = state.runtime.as_mut() {
-            runtime.set_touch_rotation_offset(touch_rotation_offset);
-        }
         self.full_gc16_requested.set(false);
         self.apply_display_geometry(state, &geometry);
         Ok(())
@@ -1881,7 +2082,8 @@ impl KoboPlatform {
                     self.apply_display_geometry(state, &geometry);
                 }
             }
-            if !self.present_pending_full_repaint(state)? && ran_callbacks {
+            let frame_requested = self.window().is_some_and(|window| window.0.frame_requested.get() || window.0.activation_requested.get());
+            if !self.present_pending_full_repaint(state)? && (ran_callbacks || frame_requested) {
                 self.request_and_present(state, false, false)?;
             }
             if let Some(deadline) = deadline {
@@ -1913,6 +2115,10 @@ impl KoboPlatform {
 }
 
 impl Platform for KoboPlatform {
+    fn supports_animations(&self) -> bool {
+        false
+    }
+
     fn supports_touch_input(&self) -> bool {
         true
     }
@@ -2070,13 +2276,13 @@ impl Platform for KoboPlatform {
         self.write_to_clipboard(item);
     }
     fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {
-        Task::ready(Ok(()))
+        Task::ready(Err(anyhow!("credential storage is unsupported on Kobo")))
     }
     fn read_credentials(&self, _url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
-        Task::ready(Ok(None))
+        Task::ready(Err(anyhow!("credential storage is unsupported on Kobo")))
     }
     fn delete_credentials(&self, _url: &str) -> Task<Result<()>> {
-        Task::ready(Ok(()))
+        Task::ready(Err(anyhow!("credential storage is unsupported on Kobo")))
     }
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
         Box::new(KoboKeyboardLayout)
@@ -2085,4 +2291,190 @@ impl Platform for KoboPlatform {
         Rc::new(DummyKeyboardMapper)
     }
     fn on_keyboard_layout_change(&self, _callback: Box<dyn FnMut()>) {}
+}
+
+#[cfg(test)]
+mod sleep_tests {
+    use super::*;
+    thread_local! { static WAKE_NOTIFICATIONS: Cell<usize> = const { Cell::new(0) }; }
+    fn wake_ui_ready() {
+        WAKE_NOTIFICATIONS.with(|count| count.set(count.get() + 1));
+    }
+
+    #[test]
+    fn sleep_page_clears_previous_content_in_both_orientations() {
+        for (width, height) in [(600, 800), (800, 600)] {
+            let mut frame = GrayImage::from_pixel(width, height, Luma([42]));
+            draw_sleep_screen(&mut frame);
+            assert!(frame.pixels().all(|pixel| matches!(pixel.0[0], 0 | 255)));
+            let dark: Vec<_> = frame
+                .enumerate_pixels()
+                .filter(|(_, _, pixel)| pixel.0[0] == 0)
+                .map(|(x, y, _)| (x, y))
+                .collect();
+            assert!(!dark.is_empty());
+            let left = dark.iter().map(|&(x, _)| x).min().unwrap();
+            let right = dark.iter().map(|&(x, _)| x).max().unwrap();
+            let top = dark.iter().map(|&(_, y)| y).min().unwrap();
+            let bottom = dark.iter().map(|&(_, y)| y).max().unwrap();
+            assert_eq!(
+                left + right,
+                width - 1,
+                "label must be centered horizontally"
+            );
+            assert_eq!(
+                top + bottom,
+                height - 1,
+                "label must be centered vertically"
+            );
+        }
+    }
+
+    #[test]
+    fn suspend_restores_application_on_success_and_failure() {
+        for handler in [
+            (|| Ok(())) as fn() -> std::result::Result<(), String>,
+            || Err("suspend unavailable".to_owned()),
+        ] {
+            let platform = KoboPlatform::new(KoboPlatformOptions {
+                display: false,
+                interactive: false,
+                power_button_handler: Some(handler),
+                wake_ui_ready_handler: Some(wake_ui_ready),
+                ..Default::default()
+            })
+            .unwrap();
+            let frame = GrayImage::from_pixel(600, 800, Luma([42]));
+            platform.cached_frame.set(Some(frame.clone()));
+            let mut state = platform.run_state.take().unwrap();
+            WAKE_NOTIFICATIONS.with(|count| count.set(0));
+            let result = platform.request_suspend(&mut state);
+            assert!(state.wake_frame_pending);
+            WAKE_NOTIFICATIONS.with(|count| assert_eq!(count.get(), 0));
+            platform.notify_wake_ui_ready(&mut state);
+            platform.notify_wake_ui_ready(&mut state);
+            WAKE_NOTIFICATIONS.with(|count| assert_eq!(count.get(), 1));
+            assert_eq!(result.is_ok(), handler().is_ok());
+            assert!(platform.full_repaint_requested.get());
+            assert!(platform.full_gc16_requested.get());
+            assert_eq!(platform.last_frame().unwrap(), frame);
+            platform.run_state.set(Some(state));
+        }
+    }
+}
+
+#[cfg(test)]
+mod frame_scheduling_tests {
+    use super::*;
+    use gpui::{AppContext, Application, Context, IntoElement, Render, Window, WindowOptions, div};
+
+    struct TestView;
+    impl Render for TestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[test]
+    fn suspend_announces_inactive_then_active_even_on_failure() {
+        let platform = KoboPlatform::new(KoboPlatformOptions {
+            display: false,
+            interactive: false,
+            power_button_handler: Some(|| Err("test suspend failure".into())),
+            ..Default::default()
+        }).unwrap();
+        let launched = platform.clone();
+        Application::new_inaccessible(platform).run(move |cx| {
+            cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| TestView)).unwrap();
+            let window = launched.window().unwrap();
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let observed = events.clone();
+            window.on_active_status_change(Box::new(move |active| observed.borrow_mut().push(active)));
+            launched.cached_frame.set(Some(GrayImage::from_pixel(600, 800, Luma([42]))));
+            let mut state = launched.run_state.take().unwrap();
+            // Launch already holds the App borrow; this test observes platform
+            // activation directly rather than re-entering GPUI's wake callback.
+            let wake = launched.wake_callback.take();
+            assert!(launched.request_suspend(&mut state).is_err());
+            launched.wake_callback.set(wake);
+            assert_eq!(*events.borrow(), vec![false, true]);
+            assert!(window.is_active());
+            launched.run_state.set(Some(state));
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn kobo_cannot_reenable_animations() {
+        let platform = KoboPlatform::new(KoboPlatformOptions {
+            display: false,
+            interactive: false,
+            ..Default::default()
+        }).unwrap();
+        Application::new_inaccessible(platform).run(|cx| {
+            assert!(cx.reduce_motion());
+            cx.set_reduce_motion(false);
+            assert!(cx.reduce_motion());
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn frame_wakeup_is_deferred_and_demand_during_dispatch_survives() {
+        let platform = KoboPlatform::new(KoboPlatformOptions {
+            display: false,
+            interactive: false,
+            ..Default::default()
+        }).unwrap();
+        let platform_for_launch = platform.clone();
+        Application::new_inaccessible(platform.clone()).run(move |cx| {
+            cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| TestView)).unwrap();
+            let window = platform_for_launch.window().unwrap();
+            let original = window.0.request_frame.take();
+            let calls = Rc::new(Cell::new(0));
+            let callback_calls = calls.clone();
+            let demand = window.0.frame_requested.clone();
+            window.on_request_frame(Box::new(move |_| {
+                callback_calls.set(callback_calls.get() + 1);
+                demand.set(true);
+            }));
+            window.schedule_frame(); // Inherited no-op; must not re-enter GPUI.
+            let wake = window.frame_waker().unwrap();
+            wake();
+            wake();
+            assert_eq!(calls.get(), 0);
+            assert!(window.0.frame_requested.get());
+            window.request_frame(false);
+            assert_eq!(calls.get(), 1);
+            assert!(window.0.frame_requested.get(), "demand during a frame must survive");
+            let activations = Rc::new(Cell::new(0));
+            let activation_calls = activations.clone();
+            let original_active = window.0.active_changed.take();
+            let original_hover = window.0.hover_changed.take();
+            window.on_active_status_change(Box::new(move |_| activation_calls.set(activation_calls.get() + 1)));
+            window.activate();
+            window.activate();
+            assert_eq!(activations.get(), 0);
+            window.activate_callbacks();
+            window.activate_callbacks();
+            assert_eq!(activations.get(), 1);
+            window.0.active_changed.set(original_active);
+            window.0.hover_changed.set(original_hover);
+
+            let expected_gc16 = platform_for_launch.clone();
+            window.on_request_frame(Box::new(move |_| assert!(expected_gc16.full_gc16_requested.get())));
+            let mut state = platform_for_launch.run_state.take().unwrap();
+            platform_for_launch.full_repaint_requested.set(true);
+            platform_for_launch.full_gc16_requested.set(true);
+            platform_for_launch.present_pending_full_repaint(&mut state).unwrap();
+            assert!(platform_for_launch.full_gc16_requested.get(), "no image means GC16 remains pending");
+            window.0.render.borrow_mut().previous_frame = Some(crate::GrayFrame::unpooled(GrayImage::from_pixel(2, 2, Luma([255]))));
+            platform_for_launch.full_repaint_requested.set(true);
+            platform_for_launch.present_pending_full_repaint(&mut state).unwrap();
+            assert!(!platform_for_launch.full_gc16_requested.get(), "successful presentation consumes GC16");
+            platform_for_launch.run_state.set(Some(state));
+            window.0.request_frame.set(original);
+        });
+        assert!(platform.take_error().is_none());
+    }
 }

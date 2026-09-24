@@ -7,6 +7,7 @@
 mod platform;
 mod virtual_keyboard;
 pub use platform::{
+    take_power_menu_request, request_sleep,
     KoboExperienceMode, KoboPlatform, KoboPlatformOptions, KoboWindow, PageButtonBehavior,
     begin_application_startup_profile, begin_book_launch_profile, current_experience_mode,
     current_render_mode, request_auto_rotation, request_experience_mode, request_full_repaint,
@@ -1844,12 +1845,8 @@ fn draw_mask(
     _rgba_mask: bool,
     transformation: TransformationMatrix,
 ) -> Result<()> {
-    const GLYPH_COVERAGE_THRESHOLD: u8 = 96;
-
-    // GPUI may position glyph sprites on fractional scaled pixels. Fractional
-    // placement is useful with antialiasing, but produces unstable gray edges
-    // and wider damage on an e-ink display. Snap translation-only glyphs to
-    // the CPU framebuffer before sampling their atlas mask.
+    // Keep glyph masks aligned with the native framebuffer while preserving
+    // their original grayscale coverage for antialiased edges.
     let mut transformation = transformation;
     let translation_only = transformation.rotation_scale == [[1.0, 0.0], [0.0, 1.0]];
     if translation_only {
@@ -1895,11 +1892,6 @@ fn draw_mask(
             let source_row = &mask_pixels[source_start..source_start + width];
             let target_row = &mut target.as_mut()[target_start..target_start + width];
             for (pixel, &coverage) in target_row.iter_mut().zip(source_row) {
-                let coverage: u8 = if coverage >= GLYPH_COVERAGE_THRESHOLD {
-                    255
-                } else {
-                    0
-                };
                 let alpha = ((u16::from(coverage) * color_alpha + 127) / 255) as u8;
                 blend_gray_channel(pixel, gray, alpha);
             }
@@ -1929,11 +1921,7 @@ fn draw_mask(
                 .floor()
                 .clamp(0.0, (source_height - 1) as f32) as usize;
             let pixel_index = source_y * source_width + source_x;
-            let coverage = if mask_pixels[pixel_index] >= GLYPH_COVERAGE_THRESHOLD {
-                1.0
-            } else {
-                0.0
-            };
+            let coverage = f32::from(mask_pixels[pixel_index]) / 255.0;
             blend_gray(target.get_pixel_mut(x, y), gray, color_alpha * coverage);
         }
     }
@@ -2076,3 +2064,31 @@ pub use input::*;
 pub use presenter::*;
 pub use refresh::*;
 pub use runtime::*;
+
+#[cfg(test)]
+mod text_coverage_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_antialiasing_in_native_and_scaled_glyphs() {
+        let tile = CpuTile {
+            size: size(DevicePixels(5), DevicePixels(1)),
+            pixels: CpuTilePixels::Mask(vec![0, 64, 128, 192, 255]),
+            opaque: false,
+        };
+        for scale in [1, 2] {
+            let width = 5 * scale;
+            let mut image = GrayImage::from_pixel(width, 1, Luma([255]));
+            let bounds = Bounds {
+                origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                size: size(ScaledPixels(width as f32), ScaledPixels(1.0)),
+            };
+            draw_mask(&mut image, bounds, ContentMask { bounds }, rgb(0).into(), &tile, false, TransformationMatrix::default()).unwrap();
+            for (index, expected) in [255, 191, 127, 63, 0].into_iter().enumerate() {
+                for offset in 0..scale {
+                    assert_eq!(image.get_pixel(index as u32 * scale + offset, 0).0[0], expected);
+                }
+            }
+        }
+    }
+}

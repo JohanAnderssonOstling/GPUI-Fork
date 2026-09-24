@@ -100,29 +100,39 @@ impl FbInkPresenter {
         &self.geometry
     }
 
-    pub fn set_current_rotation(&mut self, current_rotation: u8) {
+    pub fn set_current_rotation(&mut self, current_rotation: u8) -> Result<()> {
         let current_rotation = current_rotation % 4;
         #[cfg(target_arch = "arm")]
         {
+            let previous_rotation = self.geometry.current_rotation;
             let result = unsafe { native::gpui_fbink_set_rotation(self.fd, current_rotation) };
             if result < 0 {
-                return;
+                bail!("fbink rotation change to {current_rotation} failed with {result}");
             }
 
             let mut state = native::State::default();
             let result = unsafe { native::gpui_fbink_reinit(self.fd, &mut state) };
             if result < 0 {
-                return;
+                let rollback =
+                    unsafe { native::gpui_fbink_set_rotation(self.fd, previous_rotation) };
+                if rollback >= 0 {
+                    let mut rollback_state = native::State::default();
+                    let _ = unsafe { native::gpui_fbink_reinit(self.fd, &mut rollback_state) };
+                }
+                bail!(
+                    "fbink reinitialization after rotation to {current_rotation} failed with {result}"
+                );
             }
 
             self.geometry = geometry_from_native(&state);
             self.geometry.current_rotation = current_rotation;
-            return;
+            return Ok(());
         }
 
         #[cfg(not(target_arch = "arm"))]
         {
             self.geometry.current_rotation = current_rotation;
+            Ok(())
         }
     }
 
@@ -208,7 +218,7 @@ impl FbInkPresenter {
                 previous,
                 &update.image,
                 damage,
-                (self.render_mode == KoboRenderMode::FastMonochrome)
+                matches!(mode, RefreshMode::FastMono | RefreshMode::TextMono | RefreshMode::FullMono)
                     .then_some(self.monochrome_threshold),
             )
         } else {
@@ -273,7 +283,7 @@ impl FbInkPresenter {
             self.scratch_pixels
                 .extend_from_slice(&image.as_raw()[row_start..row_end]);
         }
-        if self.render_mode == KoboRenderMode::FastMonochrome {
+        if matches!(mode, RefreshMode::FastMono | RefreshMode::TextMono | RefreshMode::FullMono) {
             for pixel in &mut self.scratch_pixels {
                 *pixel = monochrome_value(*pixel, self.monochrome_threshold);
             }

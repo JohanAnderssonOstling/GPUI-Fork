@@ -7,10 +7,10 @@ use anyhow::{Context as _, Result, bail, ensure};
 use gpui::Application;
 use gpui_kobo::{
     DeviceRefreshProfile, FrameUpdate, Gesture, GestureTracker, GrayFrame, HardwareButton,
-    MappedTouch, RepaintScheduler, RefreshMode, RefreshPolicy, RuntimeEvent, ScreenGeometry,
-    TouchCalibration, TouchPhase, TouchTransform, changed_pixel_bounds, extended_renderer_self_test,
-    hardware_button_from_code, presenter_self_test, rgba8_to_grayscale, write_pgm,
-    KoboAssets, KoboPlatform, KoboPlatformOptions, open_button_test_window,
+    KoboAssets, KoboPlatform, KoboPlatformOptions, MappedTouch, RefreshMode, RefreshPolicy,
+    RepaintScheduler, RuntimeEvent, ScreenGeometry, TouchCalibration, TouchPhase, TouchTransform,
+    changed_pixel_bounds, extended_renderer_self_test, hardware_button_from_code,
+    open_button_test_window, presenter_self_test, rgba8_to_grayscale, write_pgm,
 };
 use image::{GrayImage, Luma};
 
@@ -41,11 +41,20 @@ fn main() -> Result<()> {
     if !options.display {
         write_pgm(&image, &options.output)
             .with_context(|| format!("failed to write {}", options.output.display()))?;
-        println!("rendered {}x{} GPUI library to {}", image.width(), image.height(), options.output.display());
+        println!(
+            "rendered {}x{} GPUI library to {}",
+            image.width(),
+            image.height(),
+            options.output.display()
+        );
         return Ok(());
     }
 
-    println!("rendered {}x{} GPUI library through linked libfbink", image.width(), image.height());
+    println!(
+        "rendered {}x{} GPUI library through linked libfbink",
+        image.width(),
+        image.height()
+    );
     Ok(())
 }
 
@@ -71,7 +80,9 @@ fn run_platform_application(options: &Options, events: Vec<RuntimeEvent>) -> Res
     if let Some(error) = platform.take_error() {
         return Err(error).context("Kobo GPUI platform failed");
     }
-    let image = platform.last_frame().context("Kobo GPUI platform produced no frame")?;
+    let image = platform
+        .last_frame()
+        .context("Kobo GPUI platform produced no frame")?;
     Ok(PlatformRun {
         image,
         render_count: platform.render_count(),
@@ -96,7 +107,12 @@ fn run_self_test() -> Result<()> {
         "SELFTEST FAIL FBInk geometry values"
     );
     let scaled = geometry.scale_damage(
-        gpui_kobo::PixelRect { x: 10, y: 20, width: 101, height: 51 },
+        gpui_kobo::PixelRect {
+            x: 10,
+            y: 20,
+            width: 101,
+            height: 51,
+        },
         300,
         400,
     );
@@ -106,15 +122,23 @@ fn run_self_test() -> Result<()> {
     );
     println!("SELFTEST PASS display_geometry {}", geometry.description());
 
-    let transform = TouchTransform::parse("swap,invert-x")
-        .context("SELFTEST FAIL touch transform parser")?;
+    let transform =
+        TouchTransform::parse("swap,invert-x").context("SELFTEST FAIL touch transform parser")?;
     ensure!(
         transform.swap_axes && transform.invert_x && !transform.invert_y,
         "SELFTEST FAIL touch transform values"
     );
     let mut gestures = GestureTracker::default();
-    gestures.observe(MappedTouch { phase: TouchPhase::Down, x: 300.0, y: 500.0 });
-    gestures.observe(MappedTouch { phase: TouchPhase::Move, x: 300.0, y: 400.0 });
+    gestures.observe(MappedTouch {
+        phase: TouchPhase::Down,
+        x: 300.0,
+        y: 500.0,
+    });
+    gestures.observe(MappedTouch {
+        phase: TouchPhase::Move,
+        x: 300.0,
+        y: 400.0,
+    });
     let gesture = gestures.observe(MappedTouch {
         phase: TouchPhase::Up,
         x: 300.0,
@@ -129,31 +153,56 @@ fn run_self_test() -> Result<()> {
     let started_at = Instant::now();
     let mut long_press = GestureTracker::default();
     long_press.observe_at(
-        MappedTouch { phase: TouchPhase::Down, x: 10.0, y: 20.0 },
+        MappedTouch {
+            phase: TouchPhase::Down,
+            x: 10.0,
+            y: 20.0,
+        },
         started_at,
     );
     let long_press_gesture = long_press.observe_at(
-        MappedTouch { phase: TouchPhase::Up, x: 12.0, y: 21.0 },
+        MappedTouch {
+            phase: TouchPhase::Up,
+            x: 12.0,
+            y: 21.0,
+        },
         started_at + Duration::from_millis(700),
     );
     ensure!(
         matches!(long_press_gesture, Some(Gesture::LongPress { .. })),
         "SELFTEST FAIL long-press classification: {long_press_gesture:?}"
     );
-    let cancelled = long_press.observe(MappedTouch { phase: TouchPhase::Cancel, x: 0.0, y: 0.0 });
-    ensure!(cancelled == Some(Gesture::Cancelled), "SELFTEST FAIL touch cancellation");
+    let cancelled = long_press.observe(MappedTouch {
+        phase: TouchPhase::Cancel,
+        x: 0.0,
+        y: 0.0,
+    });
+    ensure!(
+        cancelled == Some(Gesture::Cancelled),
+        "SELFTEST FAIL touch cancellation"
+    );
     let calibration = TouchCalibration::parse("10,1010,20,2020")
         .context("SELFTEST FAIL touch calibration parser")?;
-    ensure!(calibration.x_minimum == 10 && calibration.y_maximum == 2020, "SELFTEST FAIL touch calibration values");
+    ensure!(
+        calibration.x_minimum == 10 && calibration.y_maximum == 2020,
+        "SELFTEST FAIL touch calibration values"
+    );
     ensure!(
         hardware_button_from_code(193) == HardwareButton::PreviousPage
             && hardware_button_from_code(194) == HardwareButton::NextPage
             && hardware_button_from_code(116) == HardwareButton::Power,
         "SELFTEST FAIL hardware button mapping"
     );
-    println!("SELFTEST PASS input_lifecycle long_press_ms=700 cancellation=true buttons=true calibration=true");
+    println!(
+        "SELFTEST PASS input_lifecycle long_press_ms=700 cancellation=true buttons=true calibration=true"
+    );
 
-    let policy_damage = gpui_kobo::PixelRect { x: 0, y: 100, width: 100, height: 100 };
+    let policy_damage = gpui_kobo::PixelRect {
+        x: 0,
+        y: 100,
+        width: 100,
+        height: 100,
+    };
     let mut policy = RefreshPolicy::default();
     ensure!(
         policy.decide(false, policy_damage, 480_000) == RefreshMode::PartialGray,
@@ -169,8 +218,16 @@ fn run_self_test() -> Result<()> {
         policy.decide(true, policy_damage, 480_000) == RefreshMode::FullGray,
         "SELFTEST FAIL ghosting cleanup refresh"
     );
-    ensure!(policy.fast_updates() == 0, "SELFTEST FAIL cleanup counter reset");
-    let area_damage = gpui_kobo::PixelRect { x: 0, y: 100, width: 600, height: 600 };
+    ensure!(
+        policy.fast_updates() == 0,
+        "SELFTEST FAIL cleanup counter reset"
+    );
+    let area_damage = gpui_kobo::PixelRect {
+        x: 0,
+        y: 100,
+        width: 600,
+        height: 600,
+    };
     let mut area_policy = RefreshPolicy::default();
     for update_number in 1..4 {
         ensure!(
@@ -190,7 +247,13 @@ fn run_self_test() -> Result<()> {
     let damage = changed_pixel_bounds(&before, &after)
         .context("SELFTEST FAIL raw grayscale damage was not detected")?;
     ensure!(
-        damage == gpui_kobo::PixelRect { x: 7, y: 9, width: 1, height: 1 },
+        damage
+            == gpui_kobo::PixelRect {
+                x: 7,
+                y: 9,
+                width: 1,
+                height: 1
+            },
         "SELFTEST FAIL raw grayscale damage bounds {damage:?}"
     );
     let frame = GrayFrame::unpooled(after);
@@ -212,7 +275,12 @@ fn run_self_test() -> Result<()> {
         FrameUpdate {
             image: GrayFrame::unpooled(GrayImage::from_pixel(20, 20, Luma([255]))),
             previous_image: None,
-            damage: gpui_kobo::PixelRect { x: 2, y: 3, width: 4, height: 5 },
+            damage: gpui_kobo::PixelRect {
+                x: 2,
+                y: 3,
+                width: 4,
+                height: 5,
+            },
         },
         true,
     );
@@ -220,11 +288,18 @@ fn run_self_test() -> Result<()> {
         FrameUpdate {
             image: GrayFrame::unpooled(GrayImage::from_pixel(20, 20, Luma([240]))),
             previous_image: None,
-            damage: gpui_kobo::PixelRect { x: 5, y: 6, width: 4, height: 5 },
+            damage: gpui_kobo::PixelRect {
+                x: 5,
+                y: 6,
+                width: 4,
+                height: 5,
+            },
         },
         true,
     );
-    let coalesced = scheduler.flush(scheduler_started).context("SELFTEST FAIL repaint flush")?;
+    let coalesced = scheduler
+        .flush(scheduler_started)
+        .context("SELFTEST FAIL repaint flush")?;
     ensure!(
         coalesced.mode == RefreshMode::FastMono
             && coalesced.update.damage.x == 2
@@ -236,9 +311,17 @@ fn run_self_test() -> Result<()> {
     let idle = scheduler
         .idle_cleanup(scheduler_started + Duration::from_millis(101))
         .context("SELFTEST FAIL idle cleanup was not scheduled")?;
-    ensure!(idle.mode == RefreshMode::FullGray, "SELFTEST FAIL idle cleanup waveform");
-    ensure!(presenter_self_test(&idle.update.image, idle.update.damage)? == 400, "SELFTEST FAIL native presenter buffer sizing");
-    println!("SELFTEST PASS repaint_scheduler coalesced=true idle_cleanup=true direct_buffer_pixels=400");
+    ensure!(
+        idle.mode == RefreshMode::PartialGray,
+        "SELFTEST FAIL idle cleanup waveform"
+    );
+    ensure!(
+        presenter_self_test(&idle.update.image, idle.update.damage)? == 56,
+        "SELFTEST FAIL native presenter buffer sizing"
+    );
+    println!(
+        "SELFTEST PASS repaint_scheduler coalesced=true idle_cleanup=true direct_buffer_pixels=56"
+    );
 
     let (red_gray, red_alpha) = rgba8_to_grayscale([255, 0, 0, 128], 0.5);
     let (white_gray, white_alpha) = rgba8_to_grayscale([255, 255, 255, 255], 1.0);
@@ -258,13 +341,17 @@ fn run_self_test() -> Result<()> {
     );
 
     let production_started = Instant::now();
-    let initial_run = run_platform_application(&Options {
-        output: PathBuf::from(DEFAULT_OUTPUT),
-        display: false,
-        interactive: false,
-        self_test: false,
-        timeout: Duration::from_secs(1),
-    }, Vec::new()).context("SELFTEST FAIL production Kobo platform")?;
+    let initial_run = run_platform_application(
+        &Options {
+            output: PathBuf::from(DEFAULT_OUTPUT),
+            display: false,
+            interactive: false,
+            self_test: false,
+            timeout: Duration::from_secs(1),
+        },
+        Vec::new(),
+    )
+    .context("SELFTEST FAIL production Kobo platform")?;
     let initial = initial_run.image;
     let initial_render_ms = production_started.elapsed().as_millis();
     let antialiased_pixels = initial
@@ -287,30 +374,110 @@ fn run_self_test() -> Result<()> {
         timeout: Duration::from_secs(1),
     };
     let swipe_started = Instant::now();
-    let swipe = run_platform_application(&scripted_options, vec![
-        RuntimeEvent::Touch { mapped: MappedTouch { phase: TouchPhase::Down, x: 300.0, y: 500.0 }, gesture: None },
-        RuntimeEvent::Touch { mapped: MappedTouch { phase: TouchPhase::Move, x: 300.0, y: 420.0 }, gesture: None },
-        RuntimeEvent::Touch { mapped: MappedTouch { phase: TouchPhase::Move, x: 300.0, y: 340.0 }, gesture: None },
-        RuntimeEvent::Touch { mapped: MappedTouch { phase: TouchPhase::Up, x: 300.0, y: 300.0 }, gesture: Some(Gesture::Swipe { dx: 0.0, dy: -200.0 }) },
-    ]).context("SELFTEST FAIL production swipe path")?;
-    ensure!(swipe.render_count == 2, "SELFTEST FAIL production swipe rendered {} frames instead of initial+release", swipe.render_count);
-    ensure!(changed_pixels(&initial, &swipe.image) > 100, "SELFTEST FAIL production swipe did not change the framebuffer");
-    println!("SELFTEST PASS repaint_guard renders_during_drag=0 release_renders=1 release_ms={}", swipe_started.elapsed().as_millis());
+    let swipe = run_platform_application(
+        &scripted_options,
+        vec![
+            RuntimeEvent::Touch {
+                mapped: MappedTouch {
+                    phase: TouchPhase::Down,
+                    x: 300.0,
+                    y: 500.0,
+                },
+                gesture: None,
+            },
+            RuntimeEvent::Touch {
+                mapped: MappedTouch {
+                    phase: TouchPhase::Move,
+                    x: 300.0,
+                    y: 420.0,
+                },
+                gesture: None,
+            },
+            RuntimeEvent::Touch {
+                mapped: MappedTouch {
+                    phase: TouchPhase::Move,
+                    x: 300.0,
+                    y: 340.0,
+                },
+                gesture: None,
+            },
+            RuntimeEvent::Touch {
+                mapped: MappedTouch {
+                    phase: TouchPhase::Up,
+                    x: 300.0,
+                    y: 300.0,
+                },
+                gesture: Some(Gesture::Swipe {
+                    dx: 0.0,
+                    dy: -200.0,
+                }),
+            },
+        ],
+    )
+    .context("SELFTEST FAIL production swipe path")?;
+    ensure!(
+        swipe.render_count == 2,
+        "SELFTEST FAIL production swipe rendered {} frames instead of initial+release",
+        swipe.render_count
+    );
+    ensure!(
+        changed_pixels(&initial, &swipe.image) > 100,
+        "SELFTEST FAIL production swipe did not change the framebuffer"
+    );
+    println!(
+        "SELFTEST PASS repaint_guard renders_during_drag=0 release_renders=1 release_ms={}",
+        swipe_started.elapsed().as_millis()
+    );
 
-    let page = run_platform_application(&scripted_options, vec![RuntimeEvent::Button(gpui_kobo::ButtonEvent {
-        button: HardwareButton::NextPage,
-        pressed: true,
-        repeated: false,
-    })]).context("SELFTEST FAIL production page-button path")?;
-    ensure!(page.render_count == 2, "SELFTEST FAIL page button render count {}", page.render_count);
-    ensure!(changed_pixels(&initial, &page.image) > 100, "SELFTEST FAIL page button did not change the framebuffer");
+    let page = run_platform_application(
+        &scripted_options,
+        vec![RuntimeEvent::Button(gpui_kobo::ButtonEvent {
+            button: HardwareButton::NextPage,
+            pressed: true,
+            repeated: false,
+        })],
+    )
+    .context("SELFTEST FAIL production page-button path")?;
+    ensure!(
+        page.render_count == 2,
+        "SELFTEST FAIL page button render count {}",
+        page.render_count
+    );
+    ensure!(
+        changed_pixels(&initial, &page.image) > 100,
+        "SELFTEST FAIL page button did not change the framebuffer"
+    );
 
-    let exit = run_platform_application(&scripted_options, vec![
-        RuntimeEvent::Touch { mapped: MappedTouch { phase: TouchPhase::Down, x: 510.0, y: 54.0 }, gesture: None },
-        RuntimeEvent::Touch { mapped: MappedTouch { phase: TouchPhase::Up, x: 510.0, y: 54.0 }, gesture: Some(Gesture::Tap { x: 510.0, y: 54.0 }) },
-    ]).context("SELFTEST FAIL production exit path")?;
-    ensure!(exit.quit_requested, "SELFTEST FAIL EXIT did not quit the production platform");
-    ensure!(exit.render_count == 1, "SELFTEST FAIL EXIT caused an unnecessary render");
+    let exit = run_platform_application(
+        &scripted_options,
+        vec![
+            RuntimeEvent::Touch {
+                mapped: MappedTouch {
+                    phase: TouchPhase::Down,
+                    x: 510.0,
+                    y: 54.0,
+                },
+                gesture: None,
+            },
+            RuntimeEvent::Touch {
+                mapped: MappedTouch {
+                    phase: TouchPhase::Up,
+                    x: 510.0,
+                    y: 54.0,
+                },
+                gesture: Some(Gesture::Tap { x: 510.0, y: 54.0 }),
+            },
+        ],
+    )
+    .context("SELFTEST FAIL production exit path")?;
+    ensure!(
+        exit.quit_requested,
+        "SELFTEST FAIL EXIT did not quit the production platform"
+    );
+    ensure!(
+        exit.render_count == 1,
+        "SELFTEST FAIL EXIT caused an unnecessary render"
+    );
     println!("SELFTEST PASS production_input page_button=true exit=true exit_repaints=0");
 
     ensure!(
@@ -323,12 +490,19 @@ fn run_self_test() -> Result<()> {
         initial.height(),
         initial_render_ms
     );
-    println!("SELFTEST PASS all total_ms={}", started.elapsed().as_millis());
+    println!(
+        "SELFTEST PASS all total_ms={}",
+        started.elapsed().as_millis()
+    );
     Ok(())
 }
 
 fn changed_pixels(before: &GrayImage, after: &GrayImage) -> usize {
-    before.pixels().zip(after.pixels()).filter(|(left, right)| left != right).count()
+    before
+        .pixels()
+        .zip(after.pixels())
+        .filter(|(left, right)| left != right)
+        .count()
 }
 
 fn parse_options() -> Result<Option<Options>> {
