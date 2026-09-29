@@ -151,6 +151,7 @@ struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
+    path_rasterization_direct: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
     underlines: wgpu::RenderPipeline,
     mono_sprites: wgpu::RenderPipeline,
@@ -1230,6 +1231,23 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        let path_rasterization_direct = create_pipeline(
+            "path_rasterization_direct",
+            "vs_path_rasterization",
+            "fs_path_rasterization",
+            &layouts.globals,
+            &layouts.instances,
+            None,
+            wgpu::PrimitiveTopology::TriangleList,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            1,
+            &shader_module,
+        );
+
         let paths_blend = wgpu::BlendState {
             color: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::One,
@@ -1350,6 +1368,7 @@ impl WgpuRenderer {
             quads,
             shadows,
             path_rasterization,
+            path_rasterization_direct,
             paths,
             underlines,
             mono_sprites,
@@ -1480,6 +1499,9 @@ impl WgpuRenderer {
     }
 
     fn ensure_intermediate_textures(&mut self) {
+        if cfg!(target_os = "android") {
+            return;
+        }
         if self.resources().path_intermediate_texture.is_some() {
             return;
         }
@@ -1961,6 +1983,11 @@ impl WgpuRenderer {
                             continue;
                         }
 
+                        if cfg!(target_os = "android") {
+                            self.draw_paths_direct(paths, &mut instance_offset, &mut pass)?;
+                            continue;
+                        }
+
                         drop(pass);
                         let rasterized = self.draw_paths_to_intermediate(
                             &mut encoder,
@@ -2208,6 +2235,44 @@ impl WgpuRenderer {
         pass.draw(
             0..4,
             instances.first_instance..instances.first_instance + sprites.len() as u32,
+        );
+        Ok(())
+    }
+
+    /// Draw path triangles in the existing surface pass on Android. The
+    /// separate intermediate render pass causes an Adreno Vulkan device loss
+    /// even when a frame contains only one simple path.
+    fn draw_paths_direct(
+        &mut self,
+        paths: &[Path<ScaledPixels>],
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> Result<()> {
+        let mut vertices = Vec::new();
+        for path in paths {
+            let bounds = path.clipped_bounds();
+            vertices.extend(path.vertices.iter().map(|vertex| PathRasterizationVertex {
+                xy_position: vertex.xy_position,
+                st_position: vertex.st_position,
+                color: path.color,
+                bounds,
+            }));
+        }
+        if vertices.is_empty() {
+            return Ok(());
+        }
+        let binding = self.write_instance_binding(
+            "path_rasterization_direct_bind_group",
+            instance_offset,
+            &vertices,
+        )?;
+        let resources = self.resources();
+        pass.set_pipeline(&resources.pipelines.path_rasterization_direct);
+        pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
+        pass.set_bind_group(1, &binding.bind_group, &[]);
+        pass.draw(
+            binding.first_instance..binding.first_instance + vertices.len() as u32,
+            0..1,
         );
         Ok(())
     }

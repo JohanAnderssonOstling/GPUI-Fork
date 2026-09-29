@@ -6,12 +6,12 @@ use android_activity::input::{
 use android_activity::{AndroidApp, InputStatus};
 use gpui::{
     KeyDownEvent, KeyLocation, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput, Point,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels, PlatformInput, Point,
     ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId, TouchPhase, point, px,
 };
 use std::collections::HashMap;
 use std::ops::Range;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Distance (logical px) a touch may travel before it stops being a tap and
 /// becomes a scroll.
@@ -270,9 +270,13 @@ pub(crate) enum TouchGesture {
     Pending {
         start: Point<Pixels>,
         last: Point<Pixels>,
+        started_at: Instant,
     },
     Scrolling {
         last: Point<Pixels>,
+    },
+    Pinching {
+        last_distance: f32,
     },
 }
 
@@ -310,6 +314,7 @@ pub(crate) fn handle_input_event(
                     *gesture = TouchGesture::Pending {
                         start: position,
                         last: position,
+                        started_at: Instant::now(),
                     };
                 }
                 MotionAction::Move => {
@@ -320,7 +325,7 @@ pub(crate) fn handle_input_event(
                         force: None,
                     }));
                     match gesture {
-                        TouchGesture::Pending { start, last } => {
+                        TouchGesture::Pending { start, last, .. } => {
                             let moved = ((f32::from(position.x) - f32::from(start.x)).powi(2)
                                 + (f32::from(position.y) - f32::from(start.y)).powi(2))
                             .sqrt();
@@ -350,13 +355,64 @@ pub(crate) fn handle_input_event(
                                 touch_phase: TouchPhase::Moved,
                             }));
                         }
+                        TouchGesture::Pinching { last_distance } => {
+                            if motion_event.pointer_count() >= 2 {
+                                let first = motion_event.pointer_at_index(0);
+                                let second = motion_event.pointer_at_index(1);
+                                let first = point(px(first.x() / scale), px(first.y() / scale));
+                                let second = point(px(second.x() / scale), px(second.y() / scale));
+                                let center = point((first.x + second.x) / 2.0, (first.y + second.y) / 2.0);
+                                let distance = f32::from(second.x - first.x).hypot(f32::from(second.y - first.y));
+                                if *last_distance > 0.0 && distance > 0.0 {
+                                    window.dispatch_input(PlatformInput::Pinch(PinchEvent {
+                                        position: center,
+                                        delta: distance / *last_distance - 1.0,
+                                        modifiers: Modifiers::default(),
+                                        phase: TouchPhase::Moved,
+                                    }));
+                                }
+                                *last_distance = distance;
+                            }
+                        }
                         TouchGesture::None => {}
+                    }
+                }
+                MotionAction::PointerDown => {
+                    if motion_event.pointer_count() >= 2 {
+                        if matches!(gesture, TouchGesture::Scrolling { .. }) {
+                            window.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                                position,
+                                delta: ScrollDelta::Pixels(Point::default()),
+                                modifiers: Modifiers::default(),
+                                touch_phase: TouchPhase::Ended,
+                            }));
+                        }
+                        let first = motion_event.pointer_at_index(0);
+                        let second = motion_event.pointer_at_index(1);
+                        let distance = ((second.x() - first.x()) / scale).hypot((second.y() - first.y()) / scale);
+                        *gesture = TouchGesture::Pinching { last_distance: distance };
+                    }
+                }
+                MotionAction::PointerUp => {
+                    if matches!(gesture, TouchGesture::Pinching { .. }) {
+                        window.dispatch_input(PlatformInput::Pinch(PinchEvent {
+                            position,
+                            delta: 0.0,
+                            modifiers: Modifiers::default(),
+                            phase: TouchPhase::Ended,
+                        }));
+                        *gesture = TouchGesture::None;
                     }
                 }
                 MotionAction::Up => {
                     match std::mem::take(gesture) {
-                        TouchGesture::Pending { start, .. } => {
-                            let click_count = window.click_state.borrow_mut().register_click(start);
+                        TouchGesture::Pending { start, started_at, .. } => {
+                            // Until GPUI's touch gesture arena dispatches long presses,
+                            // synthesize its secondary activation from a stationary hold.
+                            let release_distance = f32::from(position.x - start.x).hypot(f32::from(position.y - start.y));
+                            let long_press = started_at.elapsed() >= Duration::from_millis(500) && release_distance <= TOUCH_SLOP;
+                            let button = if long_press { MouseButton::Right } else { MouseButton::Left };
+                            let click_count = if long_press { 1 } else { window.click_state.borrow_mut().register_click(start) };
                             // Snapshot the handler before dispatching the click.
                             // MouseDown/MouseUp may synchronously move focus and
                             // replace it, so sampling afterward loses the field
@@ -380,14 +436,14 @@ pub(crate) fn handle_input_event(
                                 modifiers: Modifiers::default(),
                             }));
                             window.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
-                                button: MouseButton::Left,
+                                button,
                                 position: start,
                                 modifiers: Modifiers::default(),
                                 click_count,
                                 first_mouse: false,
                             }));
                             window.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
-                                button: MouseButton::Left,
+                                button,
                                 position: start,
                                 modifiers: Modifiers::default(),
                                 click_count,
@@ -409,6 +465,14 @@ pub(crate) fn handle_input_event(
                                 touch_phase: TouchPhase::Ended,
                             }));
                         }
+                        TouchGesture::Pinching { .. } => {
+                            window.dispatch_input(PlatformInput::Pinch(PinchEvent {
+                                position,
+                                delta: 0.0,
+                                modifiers: Modifiers::default(),
+                                phase: TouchPhase::Ended,
+                            }));
+                        }
                         TouchGesture::None => {}
                     }
                     window.dispatch_input(PlatformInput::Touch(TouchEvent {
@@ -425,6 +489,14 @@ pub(crate) fn handle_input_event(
                             delta: ScrollDelta::Pixels(Point::default()),
                             modifiers: Modifiers::default(),
                             touch_phase: TouchPhase::Ended,
+                        }));
+                    }
+                    if matches!(gesture, TouchGesture::Pinching { .. }) {
+                        window.dispatch_input(PlatformInput::Pinch(PinchEvent {
+                            position,
+                            delta: 0.0,
+                            modifiers: Modifiers::default(),
+                            phase: TouchPhase::Cancelled,
                         }));
                     }
                     *gesture = TouchGesture::None;
