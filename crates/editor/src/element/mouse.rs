@@ -507,7 +507,7 @@ impl EditorElement {
                     {
                         let delta_y = match event.delta {
                             ScrollDelta::Pixels(pixels) => pixels.y.into(),
-                            ScrollDelta::Lines(lines) => lines.y,
+                            ScrollDelta::Lines(lines) | ScrollDelta::Pages(lines) => lines.y,
                         };
 
                         if delta_y > 0.0 {
@@ -536,6 +536,10 @@ impl EditorElement {
                                         .scroll_manager
                                         .filter_scroll_delta(&mut pixels, event.touch_phase);
                                     pixels
+                                }
+
+                                gpui::ScrollDelta::Pages(pages) => {
+                                    point(hitbox.bounds.size.width * pages.x, hitbox.bounds.size.height * pages.y)
                                 }
 
                                 gpui::ScrollDelta::Lines(lines) => {

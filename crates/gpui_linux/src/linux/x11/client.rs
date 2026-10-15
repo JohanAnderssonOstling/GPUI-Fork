@@ -60,10 +60,10 @@ use crate::linux::{
 use crate::linux::{LinuxCommon, LinuxKeyboardLayout, X11Window, modifiers_from_xinput_info};
 
 use gpui::{
-    AnyWindowHandle, Bounds, ClipboardItem, CursorStyle, DisplayId, FileDropEvent, Keystroke,
-    Modifiers, ModifiersChangedEvent, MouseButton, Pixels, PlatformDisplay, PlatformInput,
-    PlatformKeyboardLayout, PlatformWindow, Point, RequestFrameOptions, ScrollDelta, Size,
-    TouchPhase, WindowButtonLayout, WindowParams, point, px,
+    AnyWindowHandle, ApplicationDrag, Bounds, ClipboardItem, CursorStyle, DisplayId, FileDropEvent,
+    Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, Pixels, PlatformDisplay,
+    PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point, RequestFrameOptions, ScrollDelta,
+    Size, TouchPhase, WindowButtonLayout, WindowParams, point, px,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 
@@ -148,6 +148,12 @@ pub struct Xdnd {
     position: Point<Pixels>,
 }
 
+struct ApplicationDragState {
+    drag: ApplicationDrag,
+    source: X11WindowStatePtr,
+    target: Option<X11WindowStatePtr>,
+}
+
 #[derive(Debug)]
 struct PointerDeviceState {
     horizontal: ScrollAxisState,
@@ -222,6 +228,7 @@ pub struct X11ClientState {
     pub(crate) clipboard: Clipboard,
     pub(crate) clipboard_item: Option<ClipboardItem>,
     pub(crate) xdnd_state: Xdnd,
+    application_drag: Option<ApplicationDragState>,
 }
 
 #[derive(Clone)]
@@ -237,6 +244,17 @@ impl X11ClientStatePtr {
             return;
         };
         let mut state = client.0.borrow_mut();
+        let cancelled_drag = if state.application_drag.as_ref().is_some_and(|drag| {
+            drag.source.x_window == x_window
+                || drag
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| target.x_window == x_window)
+        }) {
+            state.application_drag.take()
+        } else {
+            None
+        };
 
         if let Some(window_ref) = state.windows.remove(&x_window)
             && let Some(RefreshState::PeriodicRefresh {
@@ -255,6 +273,14 @@ impl X11ClientStatePtr {
             state.cursor_hidden_window = None;
         }
         state.cursor_styles.remove(&x_window);
+        drop(state);
+        if let Some(drag) = cancelled_drag {
+            if let Some(target) = drag.target {
+                target.handle_input(PlatformInput::FileDrop(FileDropEvent::Exited));
+            }
+            drag.source
+                .handle_input(PlatformInput::FileDrop(FileDropEvent::Ended));
+        }
     }
 
     pub fn update_ime_position(&self, bounds: Bounds<Pixels>) {
@@ -562,6 +588,7 @@ impl X11Client {
             clipboard,
             clipboard_item: None,
             xdnd_state: Xdnd::default(),
+            application_drag: None,
         }))))
     }
 
@@ -661,6 +688,9 @@ impl X11Client {
             }
 
             for event in events.into_iter() {
+                if self.handle_application_drag(&event) {
+                    continue;
+                }
                 let mut state = self.0.borrow_mut();
                 if !state.has_xim() {
                     drop(state);
@@ -794,7 +824,123 @@ impl X11Client {
             .map(|window_reference| window_reference.window.clone())
     }
 
+    pub(crate) fn start_application_drag(
+        &self,
+        source: X11WindowStatePtr,
+        drag: ApplicationDrag,
+    ) -> bool {
+        let mut state = self.0.borrow_mut();
+        if state.application_drag.is_some() {
+            return false;
+        }
+        state.application_drag = Some(ApplicationDragState {
+            drag,
+            source,
+            target: None,
+        });
+        true
+    }
+
+    fn handle_application_drag(&self, event: &Event) -> bool {
+        let mut state = self.0.borrow_mut();
+        if state.application_drag.is_none() {
+            return false;
+        }
+        let (submit, cancel) = match event {
+            Event::XinputMotion(_) => (false, false),
+            Event::XinputButtonRelease(event) if event.detail == 1 => (true, false),
+            Event::KeyPress(event)
+                if keystroke_from_xkb(&state.xkb, state.modifiers, event.detail.into()).key
+                    == "escape" =>
+            {
+                (false, true)
+            }
+            _ => return false,
+        };
+        let Some(mut application) = state.application_drag.take() else {
+            return false;
+        };
+        // X11 keeps delivering motion to the window holding the implicit button grab.
+        // Query the native window tree to find the unobscured application window instead.
+        let Some(root) = state.xcb_connection.setup().roots.get(state.x_root_index) else {
+            state.application_drag = Some(application);
+            return false;
+        };
+        let mut native_window = root.root;
+        let mut target = None;
+        if !cancel {
+            for _ in 0..32 {
+                let Some(pointer) = get_reply(
+                    || "Failed to locate drag destination",
+                    state.xcb_connection.query_pointer(native_window),
+                )
+                .log_err() else {
+                    break;
+                };
+                if let Some(window) = state.windows.get(&native_window)
+                    && window.is_mapped
+                    && !window.window.is_blocked()
+                {
+                    target = Some((
+                        window.window.clone(),
+                        point(
+                            px(pointer.win_x as f32 / state.scale_factor),
+                            px(pointer.win_y as f32 / state.scale_factor),
+                        ),
+                    ));
+                    break;
+                }
+                if pointer.child == 0 || pointer.child == native_window {
+                    break;
+                }
+                native_window = pointer.child;
+            }
+        }
+        let changed = application.target.as_ref().map(|window| window.x_window)
+            != target.as_ref().map(|(window, _)| window.x_window);
+        let previous = if changed {
+            application.target.take()
+        } else {
+            None
+        };
+        if let Some((window, _)) = &target {
+            application.target = Some(window.clone());
+        }
+        let source = application.source.clone();
+        let drag = application.drag;
+        if !submit && !cancel {
+            state.application_drag = Some(application);
+        }
+        drop(state);
+        if let Some(window) = previous {
+            window.handle_input(PlatformInput::FileDrop(FileDropEvent::Exited));
+        }
+        if let Some((window, position)) = target {
+            if changed {
+                window.handle_input(PlatformInput::FileDrop(FileDropEvent::ApplicationEntered {
+                    position,
+                    drag,
+                }));
+            }
+            window.handle_input(PlatformInput::FileDrop(if submit {
+                FileDropEvent::Submit { position }
+            } else {
+                FileDropEvent::Pending { position }
+            }));
+            if submit || cancel {
+                window.handle_input(PlatformInput::FileDrop(FileDropEvent::Exited));
+            }
+        }
+        if submit || cancel {
+            source.handle_input(PlatformInput::FileDrop(FileDropEvent::Ended));
+        }
+        true
+    }
+
     fn handle_event(&self, event: Event) -> Option<()> {
+        if self.handle_application_drag(&event) {
+            return Some(());
+        }
         match event {
             Event::UnmapNotify(event) => {
                 let mut state = self.0.borrow_mut();

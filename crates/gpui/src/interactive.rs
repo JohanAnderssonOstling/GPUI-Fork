@@ -1,5 +1,5 @@
 use crate::{
-    Bounds, Capslock, Context, Empty, IntoElement, Keystroke, Modifiers, Pixels, Point, Render,
+    Bounds, Capslock, Context, Empty, IntoElement, Keystroke, Modifiers, Pixels, Point, Render, Size,
     Window, point, seal::Sealed,
 };
 use smallvec::SmallVec;
@@ -150,6 +150,24 @@ impl InputEvent for TouchEvent {
     }
 }
 
+/// A stationary touch held past the platform's long-press threshold.
+/// Delivered while the contact is still down, independently of mouse clicks.
+#[derive(Clone, Debug, Default)]
+pub struct LongPressEvent {
+    /// The contact that triggered this hold.
+    pub id: TouchId,
+    /// The logical window position where the contact began.
+    pub position: Point<Pixels>,
+}
+
+impl Sealed for LongPressEvent {}
+impl InputEvent for LongPressEvent {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::LongPress(self)
+    }
+}
+impl GestureEvent for LongPressEvent {}
+
 /// A mouse down event from the platform
 #[derive(Clone, Debug, Default)]
 pub struct MouseDownEvent {
@@ -285,9 +303,8 @@ pub struct TouchClickEvent {
     /// The number of consecutive taps at this location (double tap = 2),
     /// analogous to the mouse `click_count`.
     pub tap_count: usize,
-    /// Whether this was a long press rather than a tap. Long presses are
-    /// touch's secondary activation: they are delivered to aux-click
-    /// listeners alongside right clicks, not to primary click listeners.
+    /// Legacy long-press click metadata. Platforms recognizing a hold while
+    /// the contact is down deliver [`LongPressEvent`] separately instead.
     pub long_press: bool,
 }
 
@@ -563,6 +580,8 @@ pub enum ScrollDelta {
     Pixels(Point<Pixels>),
     /// An inexact scroll delta in lines.
     Lines(Point<f32>),
+    /// A fraction of the receiving scroll surface's viewport, independent of display scale.
+    Pages(Point<f32>),
 }
 
 impl Default for ScrollDelta {
@@ -613,15 +632,24 @@ impl ScrollDelta {
     pub fn precise(&self) -> bool {
         match self {
             ScrollDelta::Pixels(_) => true,
-            ScrollDelta::Lines(_) => false,
+            ScrollDelta::Lines(_) | ScrollDelta::Pages(_) => false,
         }
     }
 
-    /// Converts this scroll event into exact pixels.
+    /// Converts pixel and line deltas into pixels. Page deltas use one line as
+    /// a fallback; scroll surfaces should use `pixel_delta_for_viewport`.
     pub fn pixel_delta(&self, line_height: Pixels) -> Point<Pixels> {
         match self {
             ScrollDelta::Pixels(delta) => *delta,
-            ScrollDelta::Lines(delta) => point(line_height * delta.x, line_height * delta.y),
+            ScrollDelta::Lines(delta) | ScrollDelta::Pages(delta) => point(line_height * delta.x, line_height * delta.y),
+        }
+    }
+
+    /// Resolves page deltas against the receiving surface's visible size.
+    pub fn pixel_delta_for_viewport(&self, line_height: Pixels, viewport: Size<Pixels>) -> Point<Pixels> {
+        match self {
+            Self::Pages(delta) => point(viewport.width * delta.x, viewport.height * delta.y),
+            _ => self.pixel_delta(line_height),
         }
     }
 
@@ -645,6 +673,12 @@ impl ScrollDelta {
                 };
 
                 ScrollDelta::Pixels(point(x, y))
+            }
+
+            (ScrollDelta::Pages(a), ScrollDelta::Pages(b)) => {
+                let x = if a.x.signum() == b.x.signum() { a.x + b.x } else { b.x };
+                let y = if a.y.signum() == b.y.signum() { a.y + b.y } else { b.y };
+                ScrollDelta::Pages(point(x, y))
             }
 
             (ScrollDelta::Lines(a), ScrollDelta::Lines(b)) => {
@@ -713,6 +747,38 @@ impl ExternalPaths {
 pub enum ExternalDragPayload {
     /// Real on-disk paths, handed to the platform as an outbound file drag.
     Files(FileDragPaths),
+    /// Carries a typed payload between windows in this application process.
+    Application(ApplicationDrag),
+}
+
+/// Identifies a drag whose typed value stays in the application process.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ApplicationDrag(u64);
+
+impl ApplicationDrag {
+    /// Allocates an identifier for one drag gesture.
+    pub fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_DRAG: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT_DRAG.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// A process-specific native data format, without exposing the typed value.
+    pub fn mime_type(self) -> String {
+        format!("application/x-gpui-drag-{}-{}", std::process::id(), self.0)
+    }
+
+    /// Recognizes a native drag offered by this process.
+    pub fn from_mime_type(mime_type: &str) -> Option<Self> {
+        let prefix = format!("application/x-gpui-drag-{}-", std::process::id());
+        Some(Self(mime_type.strip_prefix(&prefix)?.parse().ok()?))
+    }
+}
+
+impl Default for ApplicationDrag {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Paths handed to the platform for a native file drag. Directory metadata is
@@ -748,6 +814,13 @@ pub enum FileDropEvent {
         position: Point<Pixels>,
         /// The paths of the files that are being dragged.
         paths: ExternalPaths,
+    },
+    /// A typed drag from this process has entered another application window.
+    ApplicationEntered {
+        /// The pointer position in the receiving window.
+        position: Point<Pixels>,
+        /// The identifier offered by the source window.
+        drag: ApplicationDrag,
     },
     /// The files are being dragged over the window
     Pending {
@@ -800,6 +873,8 @@ pub enum PlatformInput {
     FileDrop(FileDropEvent),
     /// A raw touch event on a touch screen.
     Touch(TouchEvent),
+    /// A stationary touch was held long enough to activate a long press.
+    LongPress(LongPressEvent),
 }
 
 impl PlatformInput {
@@ -817,6 +892,7 @@ impl PlatformInput {
             PlatformInput::Pinch(event) => Some(event),
             PlatformInput::FileDrop(event) => Some(event),
             PlatformInput::Touch(_) => None,
+            PlatformInput::LongPress(_) => None,
         }
     }
 
@@ -834,6 +910,7 @@ impl PlatformInput {
             PlatformInput::Pinch(_) => None,
             PlatformInput::FileDrop(_) => None,
             PlatformInput::Touch(_) => None,
+            PlatformInput::LongPress(_) => None,
         }
     }
 
@@ -853,6 +930,7 @@ impl PlatformInput {
             PlatformInput::Pinch(_) => "pinch",
             PlatformInput::FileDrop(_) => "file_drop",
             PlatformInput::Touch(_) => "touch",
+            PlatformInput::LongPress(_) => "long_press",
         }
     }
 

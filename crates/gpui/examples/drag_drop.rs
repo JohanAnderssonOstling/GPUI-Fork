@@ -1,8 +1,8 @@
 #![cfg_attr(target_family = "wasm", no_main)]
 
 use gpui::{
-    App, Bounds, Context, Half, Hsla, Pixels, Point, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, rgb, size,
+    App, ApplicationDrag, Bounds, Context, ExternalDragPayload, Half, Hsla, Pixels, Point, Window,
+    WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
 
@@ -74,7 +74,12 @@ impl Render for DragDrop {
             .justify_center()
             .items_center()
             .text_color(rgb(0x333333))
-            .child(div().text_xl().text_center().child("Drop & Drop"))
+            .child(
+                div()
+                    .text_xl()
+                    .text_center()
+                    .child("Drag between these windows"),
+            )
             .child(
                 div()
                     .w_full()
@@ -102,6 +107,9 @@ impl Render for DragDrop {
                             .on_drag(drag_info, |info: &DragInfo, position, _, cx| {
                                 cx.new(|_| info.position(position))
                             })
+                            .external_drag_payload(|_: &DragInfo, _, _| {
+                                Some(ExternalDragPayload::Application(ApplicationDrag::new()))
+                            })
                     })),
             )
             .child(
@@ -115,8 +123,14 @@ impl Render for DragDrop {
                     .border_3()
                     .border_color(self.drop_on.map(|info| info.color).unwrap_or(gpui::black()))
                     .when_some(self.drop_on, |this, info| this.bg(info.color.opacity(0.5)))
-                    .on_drop(cx.listener(|this, info: &DragInfo, _, _| {
+                    .on_drop(cx.listener(|this, info: &DragInfo, window, cx| {
+                        println!(
+                            "Dropped item {} in {:?}",
+                            info.ix,
+                            window.window_handle().window_id()
+                        );
                         this.drop_on = Some(*info);
+                        cx.notify();
                     }))
                     .child("Drop items here"),
             )
@@ -124,16 +138,28 @@ impl Render for DragDrop {
 }
 
 fn run_example() {
+    #[cfg(not(target_family = "wasm"))]
+    env_logger::init();
     application().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(800.), px(600.0)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            |_, cx| cx.new(|_| DragDrop::new()),
-        )
-        .unwrap();
+        let count = if cfg!(target_family = "wasm") { 1 } else { 2 };
+        for index in 0..count {
+            let mut bounds = Bounds::centered(None, size(px(620.), px(540.)), cx);
+            if count == 2 {
+                bounds.origin.x += px(if index == 0 { -320. } else { 320. });
+            }
+            if let Err(error) = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    window.set_window_title(&format!("GPUI drag window {}", index + 1));
+                    cx.new(|_| DragDrop::new())
+                },
+            ) {
+                eprintln!("Could not open drag example window: {error}");
+            }
+        }
 
         cx.activate(true);
     });

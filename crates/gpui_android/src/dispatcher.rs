@@ -14,7 +14,7 @@ const MIN_BACKGROUND_THREADS: usize = 2;
 pub(crate) struct AndroidDispatcher {
     main_sender: PriorityQueueSender<RunnableVariant>,
     waker: AndroidAppWaker,
-    background_sender: PriorityQueueSender<RunnableVariant>,
+    background_sender: parking_lot::Mutex<Option<PriorityQueueSender<RunnableVariant>>>,
     timers: Arc<TimerQueue>,
     main_thread_id: thread::ThreadId,
     _background_threads: Vec<thread::JoinHandle<()>>,
@@ -59,11 +59,23 @@ impl AndroidDispatcher {
         Self {
             main_sender,
             waker,
-            background_sender,
+            background_sender: parking_lot::Mutex::new(Some(background_sender)),
             timers,
             main_thread_id: thread::current().id(),
             _background_threads: background_threads,
         }
+    }
+
+    pub(crate) fn shutdown(&self) {
+        self.timers.shutdown();
+        let sender = self.background_sender.lock().take();
+        drop(sender);
+    }
+}
+
+impl Drop for AndroidDispatcher {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -73,9 +85,20 @@ impl PlatformDispatcher for AndroidDispatcher {
     }
 
     fn dispatch(&self, runnable: RunnableVariant, priority: Priority) {
-        self.background_sender
-            .send(priority, runnable)
-            .unwrap_or_else(|_| panic!("blocking sender returned without value"));
+        let rejected = {
+            let sender = self.background_sender.lock();
+            match sender.as_ref() {
+                Some(sender) => match sender.send(priority, runnable) {
+                    Ok(()) => None,
+                    Err(error) => {
+                        log::error!("Android background queue disconnected; cancelling task");
+                        Some(error.0)
+                    }
+                },
+                None => Some(runnable),
+            }
+        };
+        drop(rejected);
     }
 
     fn dispatch_on_main_thread(&self, runnable: RunnableVariant, priority: Priority) {
@@ -124,9 +147,15 @@ impl PlatformDispatcher for AndroidDispatcher {
 
 #[derive(Default)]
 struct TimerQueue {
-    heap: parking_lot::Mutex<BinaryHeap<TimerEntry>>,
+    state: parking_lot::Mutex<TimerQueueState>,
     condvar: parking_lot::Condvar,
     next_sequence: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Default)]
+struct TimerQueueState {
+    heap: BinaryHeap<TimerEntry>,
+    stopped: bool,
 }
 
 impl TimerQueue {
@@ -134,7 +163,12 @@ impl TimerQueue {
         let sequence = self
             .next_sequence
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.heap.lock().push(TimerEntry {
+        let mut state = self.state.lock();
+        if state.stopped {
+            drop(state);
+            return;
+        }
+        state.heap.push(TimerEntry {
             deadline,
             sequence,
             runnable,
@@ -142,27 +176,43 @@ impl TimerQueue {
         self.condvar.notify_one();
     }
 
+    fn shutdown(&self) {
+        let pending = {
+            let mut state = self.state.lock();
+            state.stopped = true;
+            std::mem::take(&mut state.heap)
+        };
+        self.condvar.notify_all();
+        // Dropping tasks can dispatch more work, so do it outside the lock.
+        drop(pending);
+    }
+
     fn run(&self) {
-        let mut heap = self.heap.lock();
+        let mut state = self.state.lock();
         loop {
+            if state.stopped {
+                return;
+            }
             let now = Instant::now();
             let mut due = Vec::new();
-            while heap.peek().is_some_and(|entry| entry.deadline <= now) {
-                due.push(heap.pop().unwrap());
+            while state.heap.peek().is_some_and(|entry| entry.deadline <= now) {
+                if let Some(entry) = state.heap.pop() {
+                    due.push(entry);
+                }
             }
             if !due.is_empty() {
-                drop(heap);
+                drop(state);
                 for entry in due {
                     entry.runnable.run();
                 }
-                heap = self.heap.lock();
+                state = self.state.lock();
                 continue;
             }
-            match heap.peek().map(|entry| entry.deadline) {
+            match state.heap.peek().map(|entry| entry.deadline) {
                 Some(deadline) => {
-                    self.condvar.wait_until(&mut heap, deadline);
+                    self.condvar.wait_until(&mut state, deadline);
                 }
-                None => self.condvar.wait(&mut heap),
+                None => self.condvar.wait(&mut state),
             }
         }
     }
@@ -195,5 +245,28 @@ impl Ord for TimerEntry {
             .deadline
             .cmp(&self.deadline)
             .then(other.sequence.cmp(&self.sequence))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_stops_an_idle_timer_thread() {
+        let timers = Arc::new(TimerQueue::default());
+        let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
+        let thread = {
+            let timers = timers.clone();
+            thread::spawn(move || {
+                timers.run();
+                finished_sender.send(()).expect("test receiver is alive");
+            })
+        };
+        timers.shutdown();
+        finished_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("timer thread should exit during shutdown");
+        thread.join().expect("timer thread should not panic");
     }
 }

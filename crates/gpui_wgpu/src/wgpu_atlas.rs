@@ -74,12 +74,12 @@ impl WgpuAtlas {
         lock.flush_uploads();
     }
 
-    pub fn get_texture_info(&self, id: AtlasTextureId) -> WgpuTextureInfo {
+    pub fn get_texture_info(&self, id: AtlasTextureId) -> Option<WgpuTextureInfo> {
         let lock = self.0.lock();
-        let texture = &lock.storage[id];
-        WgpuTextureInfo {
+        let texture = lock.storage.get(id)?;
+        Some(WgpuTextureInfo {
             view: texture.view.clone(),
-        }
+        })
     }
 
     /// Clears all cached textures and tiles, forcing them to be recreated.
@@ -437,6 +437,34 @@ mod tests {
                 .map_err(|error| anyhow::anyhow!("failed to request device: {error}"))?;
             Ok((Arc::new(device), Arc::new(queue)))
         })
+    }
+
+    #[test]
+    fn texture_lookup_survives_removal_and_atlas_reset() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let key = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(1),
+            frame_index: 0,
+        });
+        let size = Size {
+            width: DevicePixels(1),
+            height: DevicePixels(1),
+        };
+        let mut build = || Ok(Some((size, Cow::Owned(vec![0, 0, 0, 255]))));
+        let tile = atlas
+            .get_or_insert_with(&key, &mut build)?
+            .expect("tile is created");
+        assert!(atlas.get_texture_info(tile.texture_id).is_some());
+        atlas.remove(&key);
+        assert!(atlas.get_texture_info(tile.texture_id).is_none());
+
+        let tile = atlas
+            .get_or_insert_with(&key, &mut build)?
+            .expect("tile is recreated");
+        atlas.clear();
+        assert!(atlas.get_texture_info(tile.texture_id).is_none());
+        Ok(())
     }
 
     #[test]

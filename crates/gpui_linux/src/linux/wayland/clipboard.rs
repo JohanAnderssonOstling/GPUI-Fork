@@ -75,6 +75,12 @@ impl<T: ReceiveData> DataOffer<T> {
         self.mime_types.push(mime_type)
     }
 
+    pub(crate) fn application_drag(&self) -> Option<(String, gpui::ApplicationDrag)> {
+        self.mime_types.iter().find_map(|mime_type| {
+            gpui::ApplicationDrag::from_mime_type(mime_type).map(|drag| (mime_type.clone(), drag))
+        })
+    }
+
     fn has_mime_type(&self, mime_type: &str) -> bool {
         self.mime_types.iter().any(|t| t == mime_type)
     }

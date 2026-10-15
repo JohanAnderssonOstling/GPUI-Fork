@@ -534,7 +534,7 @@ fn mermaid_display_size(base_size: Size<Pixels>, display_scale: f32) -> Size<Pix
 /// fractional tick, so a gesture zooms smoothly at the same overall rate.
 fn mermaid_zoom_ticks(delta: ScrollDelta) -> f32 {
     match delta {
-        ScrollDelta::Lines(lines) => lines.y,
+        ScrollDelta::Lines(lines) | ScrollDelta::Pages(lines) => lines.y,
         ScrollDelta::Pixels(pixels) => f32::from(pixels.y) / PIXELS_PER_ZOOM_TICK,
     }
     .clamp(-1.0, 1.0)

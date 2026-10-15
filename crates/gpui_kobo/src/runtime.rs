@@ -145,6 +145,16 @@ impl KoboRuntime {
         self.gestures = GestureTracker::default();
         Ok((touch_events, button_events))
     }
+
+    /// Keep power-button releases queued so the wake guard can consume them.
+    pub fn discard_pending_touch(&mut self) -> Result<usize> {
+        self.gestures = GestureTracker::default();
+        self.touch.discard_pending_events()
+    }
+
+    pub fn next_sleep_button(&mut self, timeout: Duration) -> Result<Option<ButtonEvent>> {
+        self.buttons.next_event(timeout)
+    }
 }
 
 #[cfg(test)]

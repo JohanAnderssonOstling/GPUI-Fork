@@ -1704,11 +1704,11 @@ impl PlatformInputHandler {
     }
 
     /// See [`InputHandler::set_selected_text_range`].
-    pub fn set_selected_text_range(&mut self, range_utf16: Range<usize>) {
+    pub fn set_selected_text_range(&mut self, selection_utf16: UTF16Selection) {
         self.cx
             .update(|window, cx| {
                 self.handler
-                    .set_selected_text_range(range_utf16, window, cx)
+                    .set_selected_text_range(selection_utf16, window, cx)
             })
             .ok();
     }
@@ -1875,10 +1875,11 @@ pub trait InputHandler: 'static {
     /// invokes Select All from system UI (iOS `UITextInput setSelectedTextRange:`,
     /// Android `InputConnection.setSelection`).
     ///
-    /// range_utf16 is in terms of UTF-16 characters, from 0 to the length of the document
+    /// The selection uses UTF-16 offsets. Preserve `reversed` so the active end
+    /// remains correct when the user extends or shrinks a backwards selection.
     fn set_selected_text_range(
         &mut self,
-        _range_utf16: Range<usize>,
+        _selection_utf16: UTF16Selection,
         _window: &mut Window,
         _cx: &mut App,
     ) {

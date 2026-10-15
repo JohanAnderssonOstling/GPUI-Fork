@@ -80,12 +80,10 @@ impl<T> PriorityQueueState<T> {
     fn recv<'a>(&'a self) -> Result<parking_lot::MutexGuard<'a, PriorityQueues<T>>, RecvError> {
         let mut queues = self.queues.lock();
 
-        let sender_count = self.sender_count.load(std::sync::atomic::Ordering::Relaxed);
-        if queues.is_empty() && sender_count == 0 {
-            return Err(crate::queue::RecvError);
-        }
-
         while queues.is_empty() {
+            if self.sender_count.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                return Err(RecvError);
+            }
             self.condvar.wait(&mut queues);
         }
 
@@ -155,9 +153,16 @@ impl<T> PriorityQueueSender<T> {
 
 impl<T> Drop for PriorityQueueSender<T> {
     fn drop(&mut self) {
-        self.state
+        // Coordinate with recv's empty check to avoid losing the shutdown wakeup.
+        let _queues = self.state.queues.lock();
+        if self
+            .state
             .sender_count
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.state.condvar.notify_all();
+        }
     }
 }
 
@@ -402,6 +407,40 @@ mod tests {
     use collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn dropping_sender_wakes_all_idle_receivers() {
+        let (sender, receiver) = PriorityQueueReceiver::<usize>::new();
+        let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
+        let threads = (0..4)
+            .map(|_| {
+                let mut receiver = receiver.clone();
+                let finished_sender = finished_sender.clone();
+                std::thread::spawn(move || {
+                    assert!(receiver.pop().is_err());
+                    finished_sender.send(()).expect("test receiver is alive");
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while receiver.state.condvar.notify_all() != threads.len() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "receivers should park"
+            );
+            std::thread::yield_now();
+        }
+        drop(sender);
+        for _ in &threads {
+            finished_receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("idle receiver should stop after disconnection");
+        }
+        for thread in threads {
+            thread.join().expect("receiver thread should not panic");
+        }
+    }
 
     #[test]
     fn all_tasks_get_yielded() {

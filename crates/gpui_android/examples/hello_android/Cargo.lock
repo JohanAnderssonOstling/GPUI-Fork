@@ -168,6 +168,7 @@ dependencies = [
  "ndk-context",
  "ndk-sys",
  "num_enum",
+ "simd_cesu8",
  "thiserror 2.0.18",
 ]
 
@@ -2040,6 +2041,7 @@ dependencies = [
  "util_macros",
  "uuid",
  "waker-fn",
+ "wasm-bindgen",
  "web-time",
  "windows 0.61.3",
  "zed-font-kit",
@@ -2057,6 +2059,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui_wgpu",
+ "jni",
  "libc",
  "log",
  "parking_lot",

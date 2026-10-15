@@ -289,13 +289,13 @@ impl ImageView {
     fn handle_scroll_wheel(
         &mut self,
         event: &ScrollWheelEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if event.modifiers.control || event.modifiers.platform {
             let delta: f32 = match event.delta {
                 ScrollDelta::Pixels(pixels) => pixels.y.into(),
-                ScrollDelta::Lines(lines) => lines.y * SCROLL_LINE_MULTIPLIER,
+                ScrollDelta::Lines(lines) | ScrollDelta::Pages(lines) => lines.y * SCROLL_LINE_MULTIPLIER,
             };
             let zoom_factor = if delta > 0.0 {
                 1.0 + delta.abs() * 0.01
@@ -307,6 +307,7 @@ impl ImageView {
             let delta = match event.delta {
                 ScrollDelta::Pixels(pixels) => pixels,
                 ScrollDelta::Lines(lines) => lines.map(|d| px(d * SCROLL_LINE_MULTIPLIER)),
+                ScrollDelta::Pages(_) => event.delta.pixel_delta_for_viewport(px(SCROLL_LINE_MULTIPLIER), window.viewport_size()),
             };
             self.pan_offset += delta;
             cx.notify();

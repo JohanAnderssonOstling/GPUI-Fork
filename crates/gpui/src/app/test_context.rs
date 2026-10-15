@@ -936,6 +936,14 @@ impl VisualTestContext {
         self.background_executor.run_until_parked();
     }
 
+    /// Drives a requested compositor frame, including callbacks queued by
+    /// `Window::on_next_frame`, then drains the resulting application work.
+    pub fn simulate_scheduled_frame(&mut self) -> bool {
+        let requested = self.cx.test_window(self.window).simulate_scheduled_frame();
+        self.cx.background_executor.run_until_parked();
+        requested
+    }
+
     /// Simulates the user closing the window.
     /// Returns true if the window was closed.
     pub fn simulate_close(&mut self) -> bool {

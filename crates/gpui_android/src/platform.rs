@@ -1,13 +1,14 @@
 use crate::dispatcher::AndroidDispatcher;
 use crate::display::AndroidDisplay;
-use crate::events::{self, TouchGesture};
+use crate::events::{self, TouchState};
+use crate::frame::poll_timeout;
 use crate::keyboard::AndroidKeyboardLayout;
 use crate::window::{
     AndroidPhysicalEdges, AndroidPhysicalInsets, AndroidWindow, AndroidWindowInner,
 };
 use android_activity::input::KeyCharacterMap;
 use android_activity::{AndroidApp, MainEvent, PollEvent};
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use futures::channel::oneshot;
 use gpui::{
     Action, AnyWindowHandle, AppLifecyclePhase, BackgroundExecutor, ClipboardItem, CursorStyle,
@@ -17,7 +18,8 @@ use gpui::{
     SelectedDirectoryFile, SelectedDirectoryReader, SelectedFile, Task, ThermalState,
     WindowAppearance, WindowParams,
 };
-use gpui_wgpu::GpuContext;
+use gpui_wgpu::{GpuContext, WgpuRendererOptions};
+use gpui::profiler::startup::StartupProfile;
 use jni::objects::{JObject, JString};
 use jni::refs::Global;
 use jni::strings::JNIString;
@@ -32,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 static ANDROID_APP: OnceLock<Mutex<AndroidApp>> = OnceLock::new();
 static NEXT_PATH_PROMPT_ID: AtomicU64 = AtomicU64::new(1);
@@ -83,7 +85,6 @@ fn pending_reader_chrome_reveals() -> &'static Mutex<u32> {
     PENDING_READER_CHROME_REVEALS.get_or_init(|| Mutex::new(0))
 }
 
-
 fn pending_window_insets() -> &'static Mutex<Option<AndroidPhysicalInsets>> {
     PENDING_WINDOW_INSETS.get_or_init(|| Mutex::new(None))
 }
@@ -117,12 +118,16 @@ pub fn complete_file_prompt(request_id: u64, error: Option<anyhow::Error>, cance
         return;
     }
 
-    let files = prompt.files.into_iter().map(|selected| SelectedFile {
-        name: selected.name,
-        source: SelectedDirectoryFile::new(Vec::new(), move || Box::pin(async move {
-            Ok(Box::new(selected.file) as SelectedDirectoryReader)
-        })),
-    }).collect();
+    let files = prompt
+        .files
+        .into_iter()
+        .map(|selected| SelectedFile {
+            name: selected.name,
+            source: SelectedDirectoryFile::new(Vec::new(), move || {
+                Box::pin(async move { Ok(Box::new(selected.file) as SelectedDirectoryReader) })
+            }),
+        })
+        .collect();
     prompt.sender.send(Ok(Some(files))).ok();
 }
 
@@ -136,7 +141,11 @@ pub fn selected_directory_root(request_id: u64, name: String) {
 }
 
 pub fn selected_directory_local_root(request_id: u64, path: PathBuf) {
-    if let Some(prompt) = pending_directory_prompts().lock().unwrap().get_mut(&request_id) {
+    if let Some(prompt) = pending_directory_prompts()
+        .lock()
+        .unwrap()
+        .get_mut(&request_id)
+    {
         prompt.local_path = Some(path);
     }
 }
@@ -150,10 +159,19 @@ pub fn selected_directory_path(request_id: u64, path: Vec<String>) {
     }
 }
 
-pub fn selected_directory_file(request_id: u64, path: Vec<String>, uri: String, size_bytes: Option<u64>) {
+pub fn selected_directory_file(
+    request_id: u64,
+    path: Vec<String>,
+    uri: String,
+    size_bytes: Option<u64>,
+) {
     let mut prompts = pending_directory_prompts().lock().unwrap();
     if let Some(prompt) = prompts.get_mut(&request_id) {
-        prompt.files.push(PendingDirectoryFile { path, uri, size_bytes });
+        prompt.files.push(PendingDirectoryFile {
+            path,
+            uri,
+            size_bytes,
+        });
     } else {
         log::warn!("received a file for unknown Android directory prompt {request_id}");
     }
@@ -192,7 +210,8 @@ pub fn complete_directory_prompt(request_id: u64, error: Option<anyhow::Error>, 
             let uri = file.uri;
             SelectedDirectoryFile::new(file.path, move || {
                 Box::pin(async move { open_android_document(&uri) })
-            }).with_size_bytes(file.size_bytes)
+            })
+            .with_size_bytes(file.size_bytes)
         })
         .collect();
     prompt
@@ -244,7 +263,12 @@ pub fn request_all_files_access() {
         let result = vm.attach_current_thread(|env| {
             let raw = activity_app.activity_as_ptr() as jni::sys::jobject;
             let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw)? };
-            env.call_method(activity.as_ref(), jni_str!("requestAllFilesAccess"), jni_sig!("()V"), &[])?;
+            env.call_method(
+                activity.as_ref(),
+                jni_str!("requestAllFilesAccess"),
+                jni_sig!("()V"),
+                &[],
+            )?;
             Ok::<_, jni::errors::Error>(())
         });
         if let Err(error) = result {
@@ -268,7 +292,6 @@ pub fn reader_chrome_revealed() {
         app.lock().unwrap().create_waker().wake();
     }
 }
-
 
 /// Publishes physical Android system/cutout and IME insets. The latest value
 /// is consumed on GPUI's Android event-loop thread.
@@ -326,24 +349,22 @@ fn call_activity_boolean_method(app: AndroidApp, method: &'static str, value: bo
     }));
 }
 
-const POLL_TIMEOUT: Duration = Duration::from_millis(8);
-const FRAME_INTERVAL: Duration = Duration::from_millis(16);
-
 pub struct AndroidPlatform {
     app: AndroidApp,
+    dispatcher: Arc<AndroidDispatcher>,
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     main_receiver: PriorityQueueReceiver<RunnableVariant>,
     text_system: Arc<dyn PlatformTextSystem>,
     gpu_context: GpuContext,
+    renderer_options: WgpuRendererOptions,
     display: Rc<AndroidDisplay>,
     active_window: RefCell<Option<(AnyWindowHandle, Rc<AndroidWindowInner>)>>,
     callbacks: RefCell<AndroidPlatformCallbacks>,
     pending_launch: RefCell<Option<Box<dyn 'static + FnOnce()>>>,
     quit_requested: Cell<bool>,
     key_maps: RefCell<HashMap<i32, KeyCharacterMap>>,
-    touch_gesture: RefCell<TouchGesture>,
-    last_frame: Cell<Instant>,
+    touch_state: RefCell<TouchState>,
     backgrounded: Cell<bool>,
 }
 
@@ -361,8 +382,39 @@ struct AndroidPlatformCallbacks {
     memory_warning: Option<Box<dyn FnMut()>>,
 }
 
+/// Initialization policy for an Android platform instance.
+#[derive(Clone, Debug)]
+pub struct AndroidPlatformOptions {
+    /// Loads Android's UI, emoji and symbol fonts. Enabled by default.
+    pub load_system_fonts: bool,
+    /// Family used for system-font aliases. When system fonts are disabled,
+    /// the application must register this family before opening a window.
+    pub system_font_fallback: String,
+    /// Persists GPU pipelines in private app storage. Enabled by default.
+    pub cache_gpu_pipelines: bool,
+    /// Restricts GPU backends; by default Vulkan is tried before GL.
+    pub graphics_backends: Option<wgpu::Backends>,
+}
+
+impl Default for AndroidPlatformOptions {
+    fn default() -> Self {
+        Self {
+            load_system_fonts: true,
+            system_font_fallback: "Roboto".into(),
+            cache_gpu_pipelines: true,
+            graphics_backends: None,
+        }
+    }
+}
+
 impl AndroidPlatform {
-    pub fn new(_headless: bool) -> Self {
+    pub fn new(headless: bool) -> Self {
+        Self::new_with_options(headless, AndroidPlatformOptions::default())
+    }
+
+    /// Creates a platform with optional Android font loading.
+    pub fn new_with_options(_headless: bool, options: AndroidPlatformOptions) -> Self {
+        let mut startup = StartupProfile::new("gpui_android_platform");
         let app = ANDROID_APP
             .get()
             .expect("gpui_android::init(app) must be called from android_main before building the platform")
@@ -373,30 +425,49 @@ impl AndroidPlatform {
         let (main_sender, main_receiver) = PriorityQueueReceiver::new();
         let dispatcher = Arc::new(AndroidDispatcher::new(main_sender, app.create_waker()));
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
-        let foreground_executor = ForegroundExecutor::new(dispatcher);
+        let foreground_executor = ForegroundExecutor::new(dispatcher.clone());
+        startup.mark("dispatcher");
 
         let text_system = Arc::new(gpui_wgpu::CosmicTextSystem::new_without_system_fonts(
-            "Roboto",
+            &options.system_font_fallback,
         ));
-        if let Err(error) = text_system.add_fonts(system_fonts()) {
-            log::error!("failed to load Android system fonts: {error:#}");
+        startup.mark("text_system");
+        if options.load_system_fonts {
+            let fonts = system_fonts();
+            startup.mark("system_fonts_read");
+            if let Err(error) = text_system.add_fonts(fonts) {
+                log::error!("failed to load Android system fonts: {error:#}");
+            }
+            startup.mark("system_fonts_add");
+        } else {
+            startup.mark("system_fonts_skipped");
         }
+
+        let renderer_options = WgpuRendererOptions {
+            pipeline_cache_directory: if options.cache_gpu_pipelines {
+                app.internal_data_path().map(|directory| directory.join("gpui-pipeline-cache"))
+            } else {
+                None
+            },
+            backends: options.graphics_backends,
+        };
 
         Self {
             app,
+            dispatcher,
             background_executor,
             foreground_executor,
             main_receiver,
             text_system,
             gpu_context: GpuContext::default(),
+            renderer_options,
             display: Rc::new(AndroidDisplay::new()),
             active_window: RefCell::new(None),
             callbacks: RefCell::new(AndroidPlatformCallbacks::default()),
             pending_launch: RefCell::new(None),
             quit_requested: Cell::new(false),
             key_maps: RefCell::new(HashMap::new()),
-            touch_gesture: RefCell::new(TouchGesture::default()),
-            last_frame: Cell::new(Instant::now()),
+            touch_state: RefCell::new(TouchState::default()),
             backgrounded: Cell::new(false),
         }
     }
@@ -420,6 +491,7 @@ impl AndroidPlatform {
                 }
             }
             MainEvent::TerminateWindow { .. } => {
+                self.cancel_input();
                 if let Some(window) = self.window() {
                     window.handle_surface_destroyed();
                 }
@@ -438,8 +510,7 @@ impl AndroidPlatform {
             }
             MainEvent::RedrawNeeded { .. } => {
                 if let Some(window) = self.window() {
-                    window.request_frame(true);
-                    self.last_frame.set(Instant::now());
+                    window.schedule_frame(true);
                 }
             }
             MainEvent::InputAvailable => self.process_input(),
@@ -449,6 +520,7 @@ impl AndroidPlatform {
                 }
             }
             MainEvent::LostFocus => {
+                self.cancel_input();
                 if let Some(window) = self.window() {
                     window.set_active(false);
                 }
@@ -461,16 +533,21 @@ impl AndroidPlatform {
             }
             MainEvent::Resume { .. } => {
                 self.backgrounded.set(false);
+                if let Some(window) = self.window() {
+                    window.schedule_frame(true);
+                }
                 if let Some(callback) = self.callbacks.borrow_mut().app_lifecycle.as_mut() {
                     callback(AppLifecyclePhase::Active);
                 }
             }
             MainEvent::Pause => {
+                self.cancel_input();
                 if let Some(callback) = self.callbacks.borrow_mut().app_lifecycle.as_mut() {
                     callback(AppLifecyclePhase::Inactive);
                 }
             }
             MainEvent::Stop => {
+                self.cancel_input();
                 self.backgrounded.set(true);
                 if let Some(callback) = self.callbacks.borrow_mut().app_lifecycle.as_mut() {
                     callback(AppLifecyclePhase::Background);
@@ -481,8 +558,21 @@ impl AndroidPlatform {
                     callback();
                 }
             }
-            MainEvent::Destroy => self.quit_requested.set(true),
+            MainEvent::Destroy => {
+                self.cancel_input();
+                self.quit_requested.set(true);
+            }
             _ => {}
+        }
+    }
+
+    fn cancel_input(&self) {
+        let events = self.touch_state.borrow_mut().cancel();
+        if let Some(window) = self.window() {
+            window.cancel_pending_input();
+            for event in events {
+                window.dispatch_input(event);
+            }
         }
     }
 
@@ -498,27 +588,48 @@ impl AndroidPlatform {
             }
         };
         let mut key_maps = self.key_maps.borrow_mut();
-        let mut gesture = self.touch_gesture.borrow_mut();
+        let mut touches = self.touch_state.borrow_mut();
         loop {
             let mut finish_activity = false;
             let more = iter.next(|event| {
                 events::handle_input_event(
                     event,
                     &window,
-                    &mut gesture,
+                    &mut touches,
                     &mut key_maps,
                     &self.app,
                     &mut finish_activity,
                 )
             });
             if finish_activity {
-                self.quit_requested.set(true);
+                // Keep polling until Android destroys the Activity. Stopping
+                // the renderer here leaves its Java window visible but inert.
+                self.finish_activity();
                 return;
             }
             if !more {
                 break;
             }
         }
+    }
+
+    fn finish_activity(&self) {
+        let app = self.app.clone();
+        let activity_app = app.clone();
+        app.run_on_java_main_thread(Box::new(move || {
+            let result = (|| -> jni::errors::Result<()> {
+                let vm = unsafe { JavaVM::from_raw(activity_app.vm_as_ptr().cast()) };
+                vm.attach_current_thread(|env| {
+                    let raw = activity_app.activity_as_ptr() as jni::sys::jobject;
+                    let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw)? };
+                    env.call_method(activity.as_ref(), jni_str!("finish"), jni_sig!("()V"), &[])?;
+                    Ok(())
+                })
+            })();
+            if let Err(error) = result {
+                log::error!("Could not finish Android activity: {error}");
+            }
+        }));
     }
 
     fn drain_main_runnables(&self) {
@@ -568,15 +679,11 @@ impl AndroidPlatform {
             window.update_physical_insets(insets);
         }
     }
+}
 
-    fn maybe_request_frame(&self) {
-        if self.backgrounded.get() || self.last_frame.get().elapsed() < FRAME_INTERVAL {
-            return;
-        }
-        if let Some(window) = self.window() {
-            self.last_frame.set(Instant::now());
-            window.request_frame(false);
-        }
+impl Drop for AndroidPlatform {
+    fn drop(&mut self) {
+        self.dispatcher.shutdown();
     }
 }
 
@@ -631,7 +738,12 @@ impl Platform for AndroidPlatform {
             let timeout = if self.backgrounded.get() {
                 None
             } else {
-                Some(POLL_TIMEOUT)
+                let now = Instant::now();
+                poll_timeout(
+                    now,
+                    self.window().and_then(|window| window.frame_deadline(now)),
+                    self.touch_state.borrow().long_press_deadline(),
+                )
             };
             app.poll_events(timeout, |event| {
                 match event {
@@ -643,13 +755,30 @@ impl Platform for AndroidPlatform {
                 self.drain_volume_buttons();
                 self.drain_reader_chrome_reveals();
                 self.drain_window_insets();
-                self.maybe_request_frame();
+                // A pending stationary hold supplies its own one-shot deadline.
+                let press = self
+                    .touch_state
+                    .borrow_mut()
+                    .take_long_press(Instant::now());
+                if let Some(press) = press {
+                    if let Some(window) = self.window() {
+                        window.dispatch_input(press);
+                    }
+                }
+                if let Some(window) = self.window() {
+                    if !self.backgrounded.get() {
+                        window.request_pending_frame(Instant::now());
+                    }
+                    window.sync_text_input_state();
+                }
             });
         }
         let mut callbacks = self.callbacks.borrow_mut();
         if let Some(ref mut quit) = callbacks.quit {
             quit();
         }
+        drop(callbacks);
+        self.dispatcher.shutdown();
     }
 
     fn quit(&self) {
@@ -693,9 +822,8 @@ impl Platform for AndroidPlatform {
             self.gpu_context.clone(),
             self.display.clone(),
             self.window_appearance(),
+            self.renderer_options.clone(),
         )?;
-        self.display
-            .set_size(window.inner.state.borrow().bounds.size);
         *self.active_window.borrow_mut() = Some((handle, Rc::clone(&window.inner)));
         Ok(Box::new(window))
     }
@@ -971,10 +1099,98 @@ impl Platform for AndroidPlatform {
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        None
+        let vm = unsafe { JavaVM::from_raw(self.app.vm_as_ptr().cast()) };
+        let result = vm.attach_current_thread(|env| -> jni::errors::Result<Option<String>> {
+            let raw = self.app.activity_as_ptr() as jni::sys::jobject;
+            let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw)? };
+            let service = JString::from_str(env, "clipboard")?;
+            let manager = env
+                .call_method(
+                    activity.as_ref(),
+                    jni_str!("getSystemService"),
+                    jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
+                    &[JValue::Object(service.as_ref())],
+                )?
+                .l()?;
+            if manager.is_null() {
+                return Ok(None);
+            }
+            let clip = env
+                .call_method(
+                    &manager,
+                    jni_str!("getPrimaryClip"),
+                    jni_sig!("()Landroid/content/ClipData;"),
+                    &[],
+                )?
+                .l()?;
+            if clip.is_null()
+                || env
+                    .call_method(&clip, jni_str!("getItemCount"), jni_sig!("()I"), &[])?
+                    .i()?
+                    == 0
+            {
+                return Ok(None);
+            }
+            let item = env
+                .call_method(
+                    &clip,
+                    jni_str!("getItemAt"),
+                    jni_sig!("(I)Landroid/content/ClipData$Item;"),
+                    &[JValue::Int(0)],
+                )?
+                .l()?;
+            let text = env
+                .call_method(
+                    &item,
+                    jni_str!("coerceToText"),
+                    jni_sig!("(Landroid/content/Context;)Ljava/lang/CharSequence;"),
+                    &[JValue::Object(activity.as_ref())],
+                )?
+                .l()?;
+            if text.is_null() {
+                return Ok(None);
+            }
+            let text = env
+                .call_method(
+                    &text,
+                    jni_str!("toString"),
+                    jni_sig!("()Ljava/lang/String;"),
+                    &[],
+                )?
+                .l()?;
+            Ok(Some(env.cast_local::<JString>(text)?.try_to_string(env)?))
+        });
+        match result {
+            Ok(Some(text)) => Some(ClipboardItem::new_string(text)),
+            Ok(None) => None,
+            Err(error) => {
+                log::warn!("Could not read Android clipboard: {error}");
+                None
+            }
+        }
     }
 
-    fn write_to_clipboard(&self, _item: ClipboardItem) {}
+    fn write_to_clipboard(&self, item: ClipboardItem) {
+        let Some(text) = item.text() else { return };
+        let app = self.app.clone();
+        let app_for_call = app.clone();
+        app.run_on_java_main_thread(Box::new(move || {
+            let vm = unsafe { JavaVM::from_raw(app_for_call.vm_as_ptr().cast()) };
+            let result = vm.attach_current_thread(|env| -> jni::errors::Result<()> {
+                let raw = app_for_call.activity_as_ptr() as jni::sys::jobject;
+                let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw)? };
+                let service = JString::from_str(env, "clipboard")?;
+                let manager = env.call_method(activity.as_ref(), jni_str!("getSystemService"), jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"), &[JValue::Object(service.as_ref())])?.l()?;
+                if manager.is_null() { return Ok(()); }
+                let label = JString::from_str(env, "Selected text")?;
+                let text = JString::from_str(env, &text)?;
+                let clip = env.call_static_method(jni_str!("android/content/ClipData"), jni_str!("newPlainText"), jni_sig!("(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Landroid/content/ClipData;"), &[JValue::Object(label.as_ref()), JValue::Object(text.as_ref())])?.l()?;
+                env.call_method(&manager, jni_str!("setPrimaryClip"), jni_sig!("(Landroid/content/ClipData;)V"), &[JValue::Object(&clip)])?;
+                Ok(())
+            });
+            if let Err(error) = result { log::warn!("Could not write Android clipboard: {error}"); }
+        }));
+    }
 
     fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {
         Task::ready(Err(anyhow::anyhow!(

@@ -1,21 +1,30 @@
+#[cfg(target_os = "android")]
 use crate::window::AndroidWindowInner;
+#[cfg(target_os = "android")]
 use android_activity::input::{
     InputEvent, KeyAction, KeyCharacterMap, KeyMapChar, Keycode, MetaState, MotionAction,
     TextInputAction, TextInputState, TextSpan,
 };
+#[cfg(target_os = "android")]
 use android_activity::{AndroidApp, InputStatus};
 use gpui::{
-    KeyDownEvent, KeyLocation, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels, PlatformInput, Point,
-    ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId, TouchPhase, point, px,
+    KeyDownEvent, KeyLocation, Keystroke, LongPressEvent, Modifiers, PinchEvent, Pixels,
+    PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId, TouchPhase,
+    UTF16Selection, point, px,
+};
+#[cfg(target_os = "android")]
+use gpui::{
+    KeyUpEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
 };
 use std::collections::HashMap;
 use std::ops::Range;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 /// Distance (logical px) a touch may travel before it stops being a tap and
 /// becomes a scroll.
 const TOUCH_SLOP: f32 = 8.0;
+const LONG_PRESS_DELAY: Duration = Duration::from_millis(500);
 const DOUBLE_TAP_MILLIS: u128 = 400;
 const DOUBLE_TAP_DISTANCE: f32 = 16.0;
 
@@ -90,6 +99,7 @@ fn replace_utf16(text: &str, range: Range<usize>, replacement: &str) -> String {
     format!("{}{}{}", &text[..start], replacement, &text[end..])
 }
 
+#[cfg(target_os = "android")]
 fn span_range(span: TextSpan, text_length: usize) -> Range<usize> {
     let start = span.start.min(text_length);
     let end = span.end.min(text_length);
@@ -101,6 +111,29 @@ fn selection_within(selection: &Range<usize>, outer: &Range<usize>) -> Option<Ra
         .then(|| selection.start - outer.start..selection.end - outer.start)
 }
 
+fn selection_from_endpoints(start: usize, end: usize, text_length: usize) -> UTF16Selection {
+    let start = start.min(text_length);
+    let end = end.min(text_length);
+    UTF16Selection {
+        range: start.min(end)..start.max(end),
+        reversed: start > end,
+    }
+}
+
+fn hardware_key_down(
+    keystroke: Keystroke,
+    key_location: KeyLocation,
+    repeat_count: i32,
+) -> KeyDownEvent {
+    KeyDownEvent {
+        keystroke,
+        key_location,
+        is_held: repeat_count > 0,
+        prefer_character_input: false,
+    }
+}
+
+#[cfg(target_os = "android")]
 fn apply_text_input_state(window: &AndroidWindowInner, text_input_state: &TextInputState) -> bool {
     let handled = window.with_input_handler(|input_handler| {
         let Some(old_text) = AndroidWindowInner::input_handler_text(input_handler) else {
@@ -108,7 +141,11 @@ fn apply_text_input_state(window: &AndroidWindowInner, text_input_state: &TextIn
         };
 
         let new_text_length = text_input_state.text.encode_utf16().count();
-        let selection = span_range(text_input_state.selection, new_text_length);
+        let selection = selection_from_endpoints(
+            text_input_state.selection.start,
+            text_input_state.selection.end,
+            new_text_length,
+        );
         let compose_region = text_input_state
             .compose_region
             .map(|span| span_range(span, new_text_length))
@@ -116,7 +153,7 @@ fn apply_text_input_state(window: &AndroidWindowInner, text_input_state: &TextIn
 
         if let Some(compose_region) = compose_region {
             let compose_text = utf16_slice(&text_input_state.text, compose_region.clone());
-            let selected_range = selection_within(&selection, &compose_region);
+            let selected_range = selection_within(&selection.range, &compose_region);
             let marked_range = input_handler.marked_text_range();
             let replaced_existing_composition = marked_range.as_ref().is_some_and(|marked_range| {
                 replace_utf16(&old_text, marked_range.clone(), &compose_text)
@@ -132,7 +169,7 @@ fn apply_text_input_state(window: &AndroidWindowInner, text_input_state: &TextIn
             } else {
                 let replacement = text_replacement(&old_text, &text_input_state.text);
                 let replacement_selection = (replacement.new_range == compose_region)
-                    .then(|| selection_within(&selection, &replacement.new_range))
+                    .then(|| selection_within(&selection.range, &replacement.new_range))
                     .flatten();
                 input_handler.replace_and_mark_text_in_range(
                     Some(replacement.old_range),
@@ -162,6 +199,7 @@ fn apply_text_input_state(window: &AndroidWindowInner, text_input_state: &TextIn
     handled == Some(true)
 }
 
+#[cfg(target_os = "android")]
 fn dispatch_ime_key(window: &AndroidWindowInner, key: &str, modifiers: Modifiers) {
     let keystroke = Keystroke {
         modifiers,
@@ -180,6 +218,7 @@ fn dispatch_ime_key(window: &AndroidWindowInner, key: &str, modifiers: Modifiers
     }));
 }
 
+#[cfg(target_os = "android")]
 fn handle_text_action(window: &AndroidWindowInner, action: TextInputAction) -> InputStatus {
     match action {
         TextInputAction::Next => dispatch_ime_key(window, "tab", Modifiers::default()),
@@ -197,6 +236,7 @@ fn handle_text_action(window: &AndroidWindowInner, action: TextInputAction) -> I
     InputStatus::Handled
 }
 
+#[cfg(target_os = "android")]
 pub(crate) fn dispatch_reader_page_key(window: &AndroidWindowInner, next: bool) {
     let keystroke = Keystroke {
         modifiers: Modifiers::default(),
@@ -215,10 +255,23 @@ pub(crate) fn dispatch_reader_page_key(window: &AndroidWindowInner, next: bool) 
     }));
 }
 
+#[cfg(target_os = "android")]
 pub(crate) fn dispatch_reader_chrome_reveal(window: &AndroidWindowInner) {
-    let keystroke = Keystroke { modifiers: Modifiers::default(), key: "f24".to_owned(), key_char: None };
-    window.dispatch_input(PlatformInput::KeyDown(KeyDownEvent { keystroke: keystroke.clone(), key_location: KeyLocation::Standard, is_held: false, prefer_character_input: false }));
-    window.dispatch_input(PlatformInput::KeyUp(KeyUpEvent { keystroke, key_location: KeyLocation::Standard }));
+    let keystroke = Keystroke {
+        modifiers: Modifiers::default(),
+        key: "f24".to_owned(),
+        key_char: None,
+    };
+    window.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
+        keystroke: keystroke.clone(),
+        key_location: KeyLocation::Standard,
+        is_held: false,
+        prefer_character_input: false,
+    }));
+    window.dispatch_input(PlatformInput::KeyUp(KeyUpEvent {
+        keystroke,
+        key_location: KeyLocation::Standard,
+    }));
 }
 
 pub(crate) struct ClickState {
@@ -275,27 +328,241 @@ pub(crate) enum TouchGesture {
     Scrolling {
         last: Point<Pixels>,
     },
+    LongPressed,
+    Captured,
     Pinching {
+        pointer_ids: [i32; 2],
         last_distance: f32,
     },
 }
 
+#[derive(Default)]
+pub(crate) struct TouchState {
+    pub(crate) gesture: TouchGesture,
+    contacts: HashMap<TouchId, TouchEvent>,
+}
+
+impl TouchState {
+    /// Consume the remaining contact after a hold so it cannot become a click
+    /// or a scroll. Keep ownership until all fingers are lifted or cancelled.
+    fn consume_owned_gesture(&mut self, phase: TouchPhase) -> bool {
+        if !matches!(
+            self.gesture,
+            TouchGesture::LongPressed | TouchGesture::Captured
+        ) {
+            return false;
+        }
+        if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) && self.contacts.is_empty() {
+            self.gesture = TouchGesture::None;
+        }
+        true
+    }
+
+    pub(crate) fn long_press_deadline(&self) -> Option<Instant> {
+        let TouchGesture::Pending {
+            start, started_at, ..
+        } = &self.gesture
+        else {
+            return None;
+        };
+        if self.contacts.len() != 1 {
+            return None;
+        }
+        let contact = self.contacts.values().next()?;
+        if f32::from(contact.position.x - start.x).hypot(f32::from(contact.position.y - start.y))
+            > TOUCH_SLOP
+        {
+            return None;
+        }
+        Some(*started_at + LONG_PRESS_DELAY)
+    }
+
+    pub(crate) fn take_long_press(&mut self, now: Instant) -> Option<PlatformInput> {
+        if now < self.long_press_deadline()? {
+            return None;
+        }
+        let TouchGesture::Pending { start, .. } = &self.gesture else {
+            return None;
+        };
+        let contact = self.contacts.values().next()?;
+        let press = LongPressEvent {
+            id: contact.id,
+            position: *start,
+        };
+        self.gesture = TouchGesture::LongPressed;
+        Some(PlatformInput::LongPress(press))
+    }
+
+    fn track(&mut self, event: &TouchEvent) -> bool {
+        match event.phase {
+            TouchPhase::Started => {
+                self.contacts.insert(event.id, event.clone());
+                true
+            }
+            TouchPhase::Moved => {
+                if let Some(contact) = self.contacts.get_mut(&event.id) {
+                    *contact = event.clone();
+                    true
+                } else {
+                    false
+                }
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => self.contacts.remove(&event.id).is_some(),
+        }
+    }
+
+    pub(crate) fn cancel(&mut self) -> Vec<PlatformInput> {
+        let mut events = Vec::new();
+        match std::mem::take(&mut self.gesture) {
+            TouchGesture::Scrolling { last } => {
+                events.push(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                    position: last,
+                    delta: ScrollDelta::Pixels(Point::default()),
+                    modifiers: Modifiers::default(),
+                    touch_phase: TouchPhase::Cancelled,
+                }))
+            }
+            TouchGesture::Pinching { pointer_ids, .. } => {
+                let positions = pointer_ids
+                    .iter()
+                    .filter_map(|pointer_id| {
+                        self.contacts
+                            .get(&TouchId((*pointer_id).max(0) as u64))
+                            .map(|contact| contact.position)
+                    })
+                    .collect::<Vec<_>>();
+                let position = match positions.as_slice() {
+                    [first, second] => {
+                        point((first.x + second.x) / 2.0, (first.y + second.y) / 2.0)
+                    }
+                    [position] => *position,
+                    _ => Point::default(),
+                };
+                events.push(PlatformInput::Pinch(PinchEvent {
+                    position,
+                    delta: 0.0,
+                    modifiers: Modifiers::default(),
+                    phase: TouchPhase::Cancelled,
+                }));
+            }
+            TouchGesture::Pending { .. }
+            | TouchGesture::LongPressed
+            | TouchGesture::Captured
+            | TouchGesture::None => {}
+        }
+        let mut contacts = self
+            .contacts
+            .drain()
+            .map(|(_, contact)| contact)
+            .collect::<Vec<_>>();
+        contacts.sort_by_key(|contact| contact.id);
+        for mut contact in contacts {
+            contact.phase = TouchPhase::Cancelled;
+            events.push(PlatformInput::Touch(contact));
+        }
+        events
+    }
+}
+
+#[cfg(target_os = "android")]
+fn touch_pointer_indices(
+    action: MotionAction,
+    pointer_index: usize,
+    pointer_count: usize,
+) -> Range<usize> {
+    match action {
+        MotionAction::Down
+        | MotionAction::PointerDown
+        | MotionAction::Up
+        | MotionAction::PointerUp
+            if pointer_index < pointer_count =>
+        {
+            pointer_index..pointer_index + 1
+        }
+        MotionAction::Move | MotionAction::Cancel => 0..pointer_count,
+        _ => 0..0,
+    }
+}
+
+#[cfg(target_os = "android")]
 pub(crate) fn handle_input_event(
     event: &InputEvent<'_>,
     window: &AndroidWindowInner,
-    gesture: &mut TouchGesture,
+    touches: &mut TouchState,
     key_maps: &mut HashMap<i32, KeyCharacterMap>,
     app: &AndroidApp,
     finish_activity: &mut bool,
 ) -> InputStatus {
     match event {
         InputEvent::MotionEvent(motion_event) => {
+            if gpui::profiler::input_frame::enabled() {
+                let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                // MotionEvent uses System.nanoTime's monotonic time base.
+                if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } == 0 {
+                    let now_ns = (now.tv_sec as i64).saturating_mul(1_000_000_000).saturating_add(now.tv_nsec as i64);
+                    let age_ns = now_ns.saturating_sub(motion_event.event_time()).max(0) as u64;
+                    gpui::profiler::input_frame::platform_event_age(Duration::from_nanos(age_ns));
+                }
+            }
             let scale = window.state.borrow().scale_factor;
-            let pointer_index = motion_event.pointer_index();
+            let action = motion_event.action();
+            let pointer_count = motion_event.pointer_count();
+            let pointer_index = if matches!(action, MotionAction::Move | MotionAction::Cancel) {
+                0
+            } else {
+                motion_event.pointer_index()
+            };
+            if pointer_index >= pointer_count {
+                return InputStatus::Unhandled;
+            }
             let pointer = motion_event.pointer_at_index(pointer_index);
             let position = point(px(pointer.x() / scale), px(pointer.y() / scale));
-            let touch_id = TouchId(pointer.pointer_id().max(0) as u64);
             window.state.borrow_mut().mouse_position = position;
+
+            let phase = match action {
+                MotionAction::Down | MotionAction::PointerDown => TouchPhase::Started,
+                MotionAction::Move => TouchPhase::Moved,
+                MotionAction::Up | MotionAction::PointerUp => TouchPhase::Ended,
+                MotionAction::Cancel => TouchPhase::Cancelled,
+                _ => return InputStatus::Unhandled,
+            };
+            let raw_touches = touch_pointer_indices(action, pointer_index, pointer_count)
+                .map(|pointer_index| {
+                    let pointer = motion_event.pointer_at_index(pointer_index);
+                    TouchEvent {
+                        id: TouchId(pointer.pointer_id().max(0) as u64),
+                        phase,
+                        position: point(px(pointer.x() / scale), px(pointer.y() / scale)),
+                        force: None,
+                    }
+                })
+                .filter(|event| touches.track(event))
+                .collect::<Vec<_>>();
+            let dispatch_touches = || {
+                let mut claimed = false;
+                for event in &raw_touches {
+                    claimed |= window
+                        .dispatch_input(PlatformInput::Touch(event.clone()))
+                        .is_some_and(|result| result.default_prevented);
+                }
+                claimed
+            };
+            if raw_touches.is_empty() {
+                return InputStatus::Handled;
+            }
+            // A recognized hold owns the rest of this contact. Releasing it
+            // must not also click, and moving it must not turn into a swipe.
+            if touches.consume_owned_gesture(phase) {
+                dispatch_touches();
+                return InputStatus::Handled;
+            }
+            let gesture = &mut touches.gesture;
+            if !matches!(action, MotionAction::Up | MotionAction::Cancel) && dispatch_touches() {
+                // A view (for example a selection handle) owns this contact.
+                // Do not synthesize a tap, scroll, or another long press.
+                *gesture = TouchGesture::Captured;
+                return InputStatus::Handled;
+            }
 
             match motion_event.action() {
                 MotionAction::Down => {
@@ -305,114 +572,164 @@ pub(crate) fn handle_input_event(
                     window.pending_ime_tap_had_handler.set(false);
                     window.pending_ime_previous_bounds.set(None);
                     window.pending_ime_registrations.set(0);
-                    window.dispatch_input(PlatformInput::Touch(TouchEvent {
-                        id: touch_id,
-                        phase: TouchPhase::Started,
-                        position,
-                        force: None,
-                    }));
                     *gesture = TouchGesture::Pending {
                         start: position,
                         last: position,
                         started_at: Instant::now(),
                     };
                 }
-                MotionAction::Move => {
-                    window.dispatch_input(PlatformInput::Touch(TouchEvent {
-                        id: touch_id,
-                        phase: TouchPhase::Moved,
-                        position,
-                        force: None,
-                    }));
-                    match gesture {
-                        TouchGesture::Pending { start, last, .. } => {
-                            let moved = ((f32::from(position.x) - f32::from(start.x)).powi(2)
-                                + (f32::from(position.y) - f32::from(start.y)).powi(2))
-                            .sqrt();
-                            if moved > TOUCH_SLOP {
-                                let delta = point(position.x - last.x, position.y - last.y);
-                                let anchor = *start;
-                                *gesture = TouchGesture::Scrolling { last: position };
-                                window.dispatch_input(PlatformInput::ScrollWheel(
-                                    ScrollWheelEvent {
-                                        position: anchor,
-                                        delta: ScrollDelta::Pixels(delta),
-                                        modifiers: Modifiers::default(),
-                                        touch_phase: TouchPhase::Started,
-                                    },
-                                ));
-                            } else {
-                                *last = position;
-                            }
-                        }
-                        TouchGesture::Scrolling { last } => {
-                            let delta = point(position.x - last.x, position.y - last.y);
-                            *last = position;
+                MotionAction::Move => match gesture {
+                    TouchGesture::Pending { start, last, .. } => {
+                        let moved = ((f32::from(position.x) - f32::from(start.x)).powi(2)
+                            + (f32::from(position.y) - f32::from(start.y)).powi(2))
+                        .sqrt();
+                        if moved > TOUCH_SLOP {
+                            let delta = point(position.x - start.x, position.y - start.y);
+                            let anchor = *start;
+                            *gesture = TouchGesture::Scrolling { last: position };
                             window.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
-                                position,
+                                position: anchor,
                                 delta: ScrollDelta::Pixels(delta),
                                 modifiers: Modifiers::default(),
-                                touch_phase: TouchPhase::Moved,
+                                touch_phase: TouchPhase::Started,
                             }));
+                        } else {
+                            *last = position;
                         }
-                        TouchGesture::Pinching { last_distance } => {
-                            if motion_event.pointer_count() >= 2 {
-                                let first = motion_event.pointer_at_index(0);
-                                let second = motion_event.pointer_at_index(1);
-                                let first = point(px(first.x() / scale), px(first.y() / scale));
-                                let second = point(px(second.x() / scale), px(second.y() / scale));
-                                let center = point((first.x + second.x) / 2.0, (first.y + second.y) / 2.0);
-                                let distance = f32::from(second.x - first.x).hypot(f32::from(second.y - first.y));
-                                if *last_distance > 0.0 && distance > 0.0 {
-                                    window.dispatch_input(PlatformInput::Pinch(PinchEvent {
-                                        position: center,
-                                        delta: distance / *last_distance - 1.0,
-                                        modifiers: Modifiers::default(),
-                                        phase: TouchPhase::Moved,
-                                    }));
-                                }
-                                *last_distance = distance;
-                            }
-                        }
-                        TouchGesture::None => {}
                     }
-                }
+                    TouchGesture::Scrolling { last } => {
+                        let delta = point(position.x - last.x, position.y - last.y);
+                        *last = position;
+                        window.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                            position,
+                            delta: ScrollDelta::Pixels(delta),
+                            modifiers: Modifiers::default(),
+                            touch_phase: TouchPhase::Moved,
+                        }));
+                    }
+                    TouchGesture::Pinching {
+                        pointer_ids,
+                        last_distance,
+                    } => {
+                        let mut pointers = pointer_ids.iter().filter_map(|pointer_id| {
+                            (0..pointer_count)
+                                .map(|index| motion_event.pointer_at_index(index))
+                                .find(|pointer| pointer.pointer_id() == *pointer_id)
+                        });
+                        if let (Some(first), Some(second)) = (pointers.next(), pointers.next()) {
+                            let first = point(px(first.x() / scale), px(first.y() / scale));
+                            let second = point(px(second.x() / scale), px(second.y() / scale));
+                            let center =
+                                point((first.x + second.x) / 2.0, (first.y + second.y) / 2.0);
+                            let distance =
+                                f32::from(second.x - first.x).hypot(f32::from(second.y - first.y));
+                            if *last_distance > 0.0 && distance > 0.0 {
+                                window.dispatch_input(PlatformInput::Pinch(PinchEvent {
+                                    position: center,
+                                    delta: distance / *last_distance - 1.0,
+                                    modifiers: Modifiers::default(),
+                                    phase: TouchPhase::Moved,
+                                }));
+                            }
+                            *last_distance = distance;
+                        }
+                    }
+                    TouchGesture::LongPressed | TouchGesture::Captured | TouchGesture::None => {}
+                },
                 MotionAction::PointerDown => {
-                    if motion_event.pointer_count() >= 2 {
+                    if motion_event.pointer_count() >= 2
+                        && !matches!(gesture, TouchGesture::Pinching { .. })
+                    {
                         if matches!(gesture, TouchGesture::Scrolling { .. }) {
                             window.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
                                 position,
                                 delta: ScrollDelta::Pixels(Point::default()),
                                 modifiers: Modifiers::default(),
-                                touch_phase: TouchPhase::Ended,
+                                touch_phase: TouchPhase::Cancelled,
                             }));
                         }
                         let first = motion_event.pointer_at_index(0);
                         let second = motion_event.pointer_at_index(1);
-                        let distance = ((second.x() - first.x()) / scale).hypot((second.y() - first.y()) / scale);
-                        *gesture = TouchGesture::Pinching { last_distance: distance };
+                        let distance = ((second.x() - first.x()) / scale)
+                            .hypot((second.y() - first.y()) / scale);
+                        let center = point(
+                            px((first.x() + second.x()) / (2.0 * scale)),
+                            px((first.y() + second.y()) / (2.0 * scale)),
+                        );
+                        *gesture = TouchGesture::Pinching {
+                            pointer_ids: [first.pointer_id(), second.pointer_id()],
+                            last_distance: distance,
+                        };
+                        window.dispatch_input(PlatformInput::Pinch(PinchEvent {
+                            position: center,
+                            delta: 0.0,
+                            modifiers: Modifiers::default(),
+                            phase: TouchPhase::Started,
+                        }));
                     }
                 }
                 MotionAction::PointerUp => {
-                    if matches!(gesture, TouchGesture::Pinching { .. }) {
+                    if let TouchGesture::Pinching { pointer_ids, .. } = gesture
+                        && pointer_ids.contains(&pointer.pointer_id())
+                    {
                         window.dispatch_input(PlatformInput::Pinch(PinchEvent {
                             position,
                             delta: 0.0,
                             modifiers: Modifiers::default(),
                             phase: TouchPhase::Ended,
                         }));
-                        *gesture = TouchGesture::None;
+                        let mut remaining = (0..pointer_count)
+                            .filter(|index| *index != pointer_index)
+                            .map(|index| motion_event.pointer_at_index(index));
+                        match (remaining.next(), remaining.next()) {
+                            (Some(first), Some(second)) => {
+                                let distance = ((second.x() - first.x()) / scale)
+                                    .hypot((second.y() - first.y()) / scale);
+                                let center = point(
+                                    px((first.x() + second.x()) / (2.0 * scale)),
+                                    px((first.y() + second.y()) / (2.0 * scale)),
+                                );
+                                *gesture = TouchGesture::Pinching {
+                                    pointer_ids: [first.pointer_id(), second.pointer_id()],
+                                    last_distance: distance,
+                                };
+                                window.dispatch_input(PlatformInput::Pinch(PinchEvent {
+                                    position: center,
+                                    delta: 0.0,
+                                    modifiers: Modifiers::default(),
+                                    phase: TouchPhase::Started,
+                                }));
+                            }
+                            (Some(remaining), None) => {
+                                let position =
+                                    point(px(remaining.x() / scale), px(remaining.y() / scale));
+                                *gesture = TouchGesture::Scrolling { last: position };
+                                window.dispatch_input(PlatformInput::ScrollWheel(
+                                    ScrollWheelEvent {
+                                        position,
+                                        delta: ScrollDelta::Pixels(Point::default()),
+                                        modifiers: Modifiers::default(),
+                                        touch_phase: TouchPhase::Started,
+                                    },
+                                ));
+                            }
+                            _ => *gesture = TouchGesture::None,
+                        }
                     }
                 }
                 MotionAction::Up => {
                     match std::mem::take(gesture) {
-                        TouchGesture::Pending { start, started_at, .. } => {
-                            // Until GPUI's touch gesture arena dispatches long presses,
-                            // synthesize its secondary activation from a stationary hold.
-                            let release_distance = f32::from(position.x - start.x).hypot(f32::from(position.y - start.y));
-                            let long_press = started_at.elapsed() >= Duration::from_millis(500) && release_distance <= TOUCH_SLOP;
-                            let button = if long_press { MouseButton::Right } else { MouseButton::Left };
-                            let click_count = if long_press { 1 } else { window.click_state.borrow_mut().register_click(start) };
+                        TouchGesture::Pending {
+                            start, started_at, ..
+                        } => {
+                            // Long presses are emitted by the polling timer,
+                            // not synthesized as a mouse click on release.
+                            if started_at.elapsed() >= LONG_PRESS_DELAY {
+                                dispatch_touches();
+                                return InputStatus::Handled;
+                            }
+                            let button = MouseButton::Left;
+                            let click_count = window.click_state.borrow_mut().register_click(start);
                             // Snapshot the handler before dispatching the click.
                             // MouseDown/MouseUp may synchronously move focus and
                             // replace it, so sampling afterward loses the field
@@ -457,10 +774,10 @@ pub(crate) fn handle_input_event(
                                 app.show_soft_input(false);
                             }
                         }
-                        TouchGesture::Scrolling { .. } => {
+                        TouchGesture::Scrolling { last } => {
                             window.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
                                 position,
-                                delta: ScrollDelta::Pixels(Point::default()),
+                                delta: ScrollDelta::Pixels(position - last),
                                 modifiers: Modifiers::default(),
                                 touch_phase: TouchPhase::Ended,
                             }));
@@ -473,14 +790,9 @@ pub(crate) fn handle_input_event(
                                 phase: TouchPhase::Ended,
                             }));
                         }
-                        TouchGesture::None => {}
+                        TouchGesture::LongPressed | TouchGesture::Captured | TouchGesture::None => {
+                        }
                     }
-                    window.dispatch_input(PlatformInput::Touch(TouchEvent {
-                        id: touch_id,
-                        phase: TouchPhase::Ended,
-                        position,
-                        force: None,
-                    }));
                 }
                 MotionAction::Cancel => {
                     if matches!(gesture, TouchGesture::Scrolling { .. }) {
@@ -488,7 +800,7 @@ pub(crate) fn handle_input_event(
                             position,
                             delta: ScrollDelta::Pixels(Point::default()),
                             modifiers: Modifiers::default(),
-                            touch_phase: TouchPhase::Ended,
+                            touch_phase: TouchPhase::Cancelled,
                         }));
                     }
                     if matches!(gesture, TouchGesture::Pinching { .. }) {
@@ -500,14 +812,11 @@ pub(crate) fn handle_input_event(
                         }));
                     }
                     *gesture = TouchGesture::None;
-                    window.dispatch_input(PlatformInput::Touch(TouchEvent {
-                        id: touch_id,
-                        phase: TouchPhase::Cancelled,
-                        position,
-                        force: None,
-                    }));
                 }
                 _ => return InputStatus::Unhandled,
+            }
+            if matches!(action, MotionAction::Up | MotionAction::Cancel) {
+                dispatch_touches();
             }
             InputStatus::Handled
         }
@@ -547,12 +856,11 @@ pub(crate) fn handle_input_event(
 
             match key_event.action() {
                 KeyAction::Down => {
-                    let result = window.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
+                    let result = window.dispatch_input(PlatformInput::KeyDown(hardware_key_down(
                         keystroke,
                         key_location,
-                        is_held: false,
-                        prefer_character_input: false,
-                    }));
+                        key_event.repeat_count(),
+                    )));
 
                     let propagate = result.as_ref().is_none_or(|result| result.propagate);
                     if keycode == Keycode::Back && propagate {
@@ -581,6 +889,7 @@ pub(crate) fn handle_input_event(
         }
         InputEvent::TextEvent(text_input_state) => {
             if apply_text_input_state(window, text_input_state) {
+                window.accept_text_input_state(text_input_state);
                 InputStatus::Handled
             } else {
                 InputStatus::Unhandled
@@ -594,6 +903,359 @@ pub(crate) fn handle_input_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{
+        Bounds, Context, ElementInputHandler, EntityInputHandler, IntoElement,
+        PlatformInputHandler, Render, TestAppContext, Window, div,
+    };
+
+    fn contact(id: u64, phase: TouchPhase, position: Point<Pixels>) -> TouchEvent {
+        TouchEvent {
+            id: TouchId(id),
+            phase,
+            position,
+            force: None,
+        }
+    }
+
+    #[test]
+    fn stationary_hold_emits_one_explicit_long_press_before_release() {
+        let now = Instant::now();
+        let position = point(px(30.0), px(40.0));
+        let mut touches = TouchState::default();
+        touches.track(&contact(7, TouchPhase::Started, position));
+        touches.gesture = TouchGesture::Pending {
+            start: position,
+            last: position,
+            started_at: now,
+        };
+        assert_eq!(touches.long_press_deadline(), Some(now + LONG_PRESS_DELAY));
+        assert!(
+            touches
+                .take_long_press(now + LONG_PRESS_DELAY - Duration::from_millis(1))
+                .is_none()
+        );
+        assert!(
+            matches!(touches.take_long_press(now + LONG_PRESS_DELAY), Some(PlatformInput::LongPress(LongPressEvent { id: TouchId(7), position: held })) if held == position)
+        );
+        assert!(matches!(touches.gesture, TouchGesture::LongPressed));
+        assert_eq!(touches.long_press_deadline(), None);
+        assert!(
+            touches
+                .take_long_press(now + LONG_PRESS_DELAY * 2)
+                .is_none()
+        );
+        let cancelled = touches.cancel();
+        assert!(
+            matches!(cancelled.as_slice(), [PlatformInput::Touch(event)] if event.phase == TouchPhase::Cancelled)
+        );
+        assert!(
+            touches
+                .take_long_press(now + LONG_PRESS_DELAY * 3)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn long_press_is_cancelled_by_movement_multiple_contacts_and_release() {
+        let now = Instant::now();
+        let position = point(px(30.0), px(40.0));
+        let mut touches = TouchState::default();
+        touches.track(&contact(7, TouchPhase::Started, position));
+        touches.gesture = TouchGesture::Pending {
+            start: position,
+            last: position,
+            started_at: now,
+        };
+        touches.track(&contact(7, TouchPhase::Moved, point(px(50.0), px(40.0))));
+        assert_eq!(touches.long_press_deadline(), None);
+        assert!(touches.take_long_press(now + LONG_PRESS_DELAY).is_none());
+        touches.track(&contact(7, TouchPhase::Moved, position));
+        touches.track(&contact(8, TouchPhase::Started, position));
+        assert_eq!(touches.long_press_deadline(), None);
+        assert!(touches.take_long_press(now + LONG_PRESS_DELAY).is_none());
+        touches.track(&contact(8, TouchPhase::Ended, position));
+        touches.track(&contact(7, TouchPhase::Ended, position));
+        assert!(touches.take_long_press(now + LONG_PRESS_DELAY).is_none());
+    }
+
+    #[test]
+    fn long_press_consumes_movement_and_release_until_all_contacts_end() {
+        let position = point(px(30.0), px(40.0));
+        let mut touches = TouchState::default();
+        touches.track(&contact(7, TouchPhase::Started, position));
+        touches.gesture = TouchGesture::LongPressed;
+        touches.track(&contact(7, TouchPhase::Moved, point(px(90.0), px(40.0))));
+        assert!(touches.consume_owned_gesture(TouchPhase::Moved));
+        assert!(matches!(touches.gesture, TouchGesture::LongPressed));
+        touches.track(&contact(8, TouchPhase::Started, position));
+        assert!(touches.consume_owned_gesture(TouchPhase::Started));
+        touches.track(&contact(7, TouchPhase::Ended, position));
+        assert!(touches.consume_owned_gesture(TouchPhase::Ended));
+        assert!(matches!(touches.gesture, TouchGesture::LongPressed));
+        touches.track(&contact(8, TouchPhase::Ended, position));
+        assert!(touches.consume_owned_gesture(TouchPhase::Ended));
+        assert!(matches!(touches.gesture, TouchGesture::None));
+        assert!(!touches.consume_owned_gesture(TouchPhase::Ended));
+    }
+
+    #[test]
+    fn captured_handle_drag_suppresses_platform_gestures_and_finishes_on_release() {
+        let now = Instant::now();
+        let position = point(px(30.0), px(40.0));
+        let mut touches = TouchState::default();
+        touches.track(&contact(7, TouchPhase::Started, position));
+        touches.gesture = TouchGesture::Captured;
+        assert!(
+            touches
+                .take_long_press(now + LONG_PRESS_DELAY * 2)
+                .is_none()
+        );
+        touches.track(&contact(7, TouchPhase::Moved, point(px(300.0), px(400.0))));
+        assert!(touches.consume_owned_gesture(TouchPhase::Moved));
+        touches.track(&contact(7, TouchPhase::Ended, position));
+        assert!(touches.consume_owned_gesture(TouchPhase::Ended));
+        assert!(matches!(touches.gesture, TouchGesture::None));
+        assert!(touches.cancel().is_empty());
+    }
+
+    #[test]
+    fn interrupted_tap_cancels_contacts_without_clicking_and_ignores_late_release() {
+        let mut touches = TouchState::default();
+        let position = point(px(10.0), px(20.0));
+        assert!(touches.track(&contact(7, TouchPhase::Started, position)));
+        touches.gesture = TouchGesture::Pending {
+            start: position,
+            last: position,
+            started_at: Instant::now(),
+        };
+        let events = touches.cancel();
+        assert!(matches!(touches.gesture, TouchGesture::None));
+        assert!(matches!(events.as_slice(), [PlatformInput::Touch(event)]
+            if event.id == TouchId(7)
+                && event.phase == TouchPhase::Cancelled
+                && event.position == position));
+        assert!(touches.cancel().is_empty());
+        assert!(!touches.track(&contact(7, TouchPhase::Ended, position)));
+        assert!(!touches.track(&contact(7, TouchPhase::Moved, position)));
+        assert!(touches.track(&contact(7, TouchPhase::Started, position)));
+        assert!(touches.track(&contact(7, TouchPhase::Ended, position)));
+        assert!(touches.cancel().is_empty());
+    }
+
+    #[test]
+    fn interrupted_scroll_sends_a_terminal_scroll_and_touch_at_the_last_position() {
+        let mut touches = TouchState::default();
+        let start = point(px(10.0), px(20.0));
+        let last = point(px(10.0), px(80.0));
+        assert!(touches.track(&contact(1, TouchPhase::Started, start)));
+        assert!(touches.track(&contact(1, TouchPhase::Moved, last)));
+        touches.gesture = TouchGesture::Scrolling { last };
+        let events = touches.cancel();
+        assert!(
+            matches!(events.as_slice(), [PlatformInput::ScrollWheel(scroll), PlatformInput::Touch(touch)]
+            if scroll.touch_phase == TouchPhase::Cancelled
+                && scroll.position == last
+                && touch.phase == TouchPhase::Cancelled
+                && touch.position == last)
+        );
+        assert!(touches.cancel().is_empty());
+    }
+
+    #[test]
+    fn interrupted_pinch_cancels_all_contacts_including_an_extra_finger() {
+        let mut touches = TouchState::default();
+        for (id, horizontal) in [(3, 30.0), (2, 20.0), (1, 10.0)] {
+            assert!(touches.track(&contact(
+                id,
+                TouchPhase::Started,
+                point(px(horizontal), px(40.0)),
+            )));
+        }
+        touches.gesture = TouchGesture::Pinching {
+            pointer_ids: [1, 3],
+            last_distance: 20.0,
+        };
+        let events = touches.cancel();
+        assert!(matches!(events.first(), Some(PlatformInput::Pinch(event))
+            if event.phase == TouchPhase::Cancelled
+                && event.delta == 0.0
+                && event.position == point(px(20.0), px(40.0))));
+        let cancelled = events
+            .iter()
+            .skip(1)
+            .map(|event| {
+                let PlatformInput::Touch(touch) = event else {
+                    panic!("each contact must receive a terminal touch event");
+                };
+                assert_eq!(touch.phase, TouchPhase::Cancelled);
+                touch.id
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cancelled, vec![TouchId(1), TouchId(2), TouchId(3)]);
+        assert!(touches.cancel().is_empty());
+    }
+
+    #[test]
+    fn hardware_key_repeats_are_held_without_changing_the_keystroke() {
+        for repeat_count in [0, 1, 20] {
+            let keystroke = Keystroke {
+                modifiers: Modifiers::shift(),
+                key: "left".to_owned(),
+                key_char: None,
+            };
+            let event = hardware_key_down(keystroke.clone(), KeyLocation::Standard, repeat_count);
+            assert_eq!(event.keystroke, keystroke);
+            assert_eq!(event.is_held, repeat_count > 0);
+        }
+    }
+
+    struct SelectionField {
+        selection: UTF16Selection,
+    }
+
+    impl Render for SelectionField {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    impl EntityInputHandler for SelectionField {
+        fn text_for_range(
+            &mut self,
+            range: Range<usize>,
+            adjusted_range: &mut Option<Range<usize>>,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> Option<String> {
+            *adjusted_range = Some(range.clone());
+            Some(utf16_slice("a😀ö", range))
+        }
+
+        fn selected_text_range(
+            &mut self,
+            _ignore_disabled_input: bool,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> Option<UTF16Selection> {
+            Some(UTF16Selection {
+                range: self.selection.range.clone(),
+                reversed: self.selection.reversed,
+            })
+        }
+
+        fn marked_text_range(
+            &self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> Option<Range<usize>> {
+            None
+        }
+
+        fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+        fn replace_text_in_range(
+            &mut self,
+            _range: Option<Range<usize>>,
+            _text: &str,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) {
+        }
+
+        fn replace_and_mark_text_in_range(
+            &mut self,
+            _range: Option<Range<usize>>,
+            _new_text: &str,
+            _new_selected_range: Option<Range<usize>>,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) {
+        }
+
+        fn bounds_for_range(
+            &mut self,
+            _range_utf16: Range<usize>,
+            _element_bounds: Bounds<Pixels>,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> Option<Bounds<Pixels>> {
+            None
+        }
+
+        fn character_index_for_point(
+            &mut self,
+            _point: Point<Pixels>,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> Option<usize> {
+            None
+        }
+
+        fn set_selected_text_range(
+            &mut self,
+            selection_utf16: UTF16Selection,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) {
+            self.selection = selection_utf16;
+        }
+    }
+
+    #[gpui::test]
+    fn selection_direction_round_trips_through_platform_and_entity_handlers(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.add_window(|_, _| SelectionField {
+            selection: selection_from_endpoints(0, 0, 4),
+        });
+        let mut handler = cx.update(|cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    PlatformInputHandler::new(
+                        window.to_async(cx),
+                        Box::new(ElementInputHandler::new(Bounds::default(), cx.entity())),
+                    )
+                })
+                .expect("test window exists")
+        });
+        for (start, end, expected_range, reversed) in [
+            (4, 1, 1..4, true),
+            (1, 3, 1..3, false),
+            (3, 3, 3..3, false),
+            (100, 1, 1..4, true),
+            (100, 200, 4..4, false),
+        ] {
+            handler.set_selected_text_range(selection_from_endpoints(start, end, 4));
+            let selection = handler
+                .selected_text_range(true)
+                .expect("selection was stored by the entity");
+            assert_eq!(selection.range, expected_range);
+            assert_eq!(selection.reversed, reversed);
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    #[test]
+    fn raw_touch_events_cover_each_pointer_lifecycle() {
+        for action in [
+            MotionAction::Down,
+            MotionAction::PointerDown,
+            MotionAction::Up,
+            MotionAction::PointerUp,
+        ] {
+            assert_eq!(
+                touch_pointer_indices(action, 1, 3).collect::<Vec<_>>(),
+                vec![1]
+            );
+        }
+        for action in [MotionAction::Move, MotionAction::Cancel] {
+            assert_eq!(
+                touch_pointer_indices(action, 0, 3).collect::<Vec<_>>(),
+                vec![0, 1, 2]
+            );
+        }
+        assert!(touch_pointer_indices(MotionAction::PointerDown, 3, 3).is_empty());
+    }
 
     #[test]
     fn text_replacement_appends_ascii_text() {
@@ -612,8 +1274,8 @@ mod tests {
         assert_eq!(
             text_replacement("one two three", "one three"),
             TextReplacement {
-                old_range: 4..8,
-                new_range: 4..4,
+                old_range: 5..9,
+                new_range: 5..5,
                 replacement: String::new(),
             }
         );
@@ -638,6 +1300,7 @@ mod tests {
     }
 }
 
+#[cfg(target_os = "android")]
 fn key_location(keycode: Keycode) -> KeyLocation {
     match keycode {
         Keycode::Numpad0
@@ -664,6 +1327,7 @@ fn key_location(keycode: Keycode) -> KeyLocation {
     }
 }
 
+#[cfg(target_os = "android")]
 fn key_char_for(
     device_id: i32,
     keycode: Keycode,
@@ -705,6 +1369,7 @@ fn key_char_for(
     }
 }
 
+#[cfg(target_os = "android")]
 fn modifiers_from_meta_state(meta_state: MetaState) -> Modifiers {
     Modifiers {
         control: meta_state.ctrl_on(),
@@ -719,6 +1384,7 @@ fn modifiers_from_meta_state(meta_state: MetaState) -> Modifiers {
 /// Returns `Some("")` for modifier keys (handled via ModifiersChanged) and
 /// `None` for keys we don't handle so the OS can apply default behavior
 /// (volume, media controls, etc.).
+#[cfg(target_os = "android")]
 fn keycode_to_key(keycode: Keycode) -> Option<&'static str> {
     use Keycode::*;
     Some(match keycode {

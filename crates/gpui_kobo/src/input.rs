@@ -301,6 +301,7 @@ pub enum HardwareButton {
     Home,
     Power,
     Sleep,
+    SleepCover,
     Unknown(u16),
 }
 
@@ -744,6 +745,7 @@ pub fn hardware_button_from_code(code: u16) -> HardwareButton {
         102 => HardwareButton::Home,
         116 => HardwareButton::Power,
         142 => HardwareButton::Sleep,
+        59 | 35 => HardwareButton::SleepCover,
         other => HardwareButton::Unknown(other),
     }
 }

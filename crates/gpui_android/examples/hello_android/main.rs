@@ -1,14 +1,16 @@
 #![cfg(target_os = "android")]
 
 //! Minimal GPUI app exercising the Android backend: rendering, tap (counter
-//! button), scrolling (message list), and the soft keyboard fallback path.
+//! button), scrolling (message list), and GameActivity packaging.
 //!
-//! Build and package (from the repo root):
+//! Build and package (requires cargo-ndk, Android SDK/NDK, JDK 17 or 21,
+//! and Gradle 8.13 or newer; run from the repo root):
 //! ```sh
-//! cargo ndk -t arm64-v8a build -p hello_android --manifest-path crates/gpui_android/examples/hello_android/Cargo.toml
+//! cd crates/gpui_android/examples/hello_android
+//! cargo ndk -t arm64-v8a -o jniLibs build --release
+//! gradle assembleDebug
+//! adb install -r build/outputs/apk/debug/hello_android-debug.apk
 //! ```
-//! Then package the resulting `libhello_android.so` in a NativeActivity APK
-//! with the Android build tools and install it with `adb install`.
 
 use android_activity::AndroidApp;
 use gpui::{

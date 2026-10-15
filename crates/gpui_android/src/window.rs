@@ -1,4 +1,7 @@
+use crate::display::AndroidDisplay;
 use crate::events::ClickState;
+use crate::frame::{FRAME_INTERVAL, FrameScheduler};
+use crate::lifecycle::SurfaceLifecycle;
 use android_activity::AndroidApp;
 use android_activity::input::{TextInputState, TextSpan};
 use anyhow::Context as _;
@@ -9,10 +12,11 @@ use gpui::{
     ResizeEdge, Scene, Size, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
     WindowControlArea, WindowControls, WindowDecorations, WindowInsets, WindowParams, px,
 };
-use gpui_wgpu::{GpuContext, SurfaceSizePolicy, WgpuRenderer, WgpuSurfaceConfig};
+use gpui_wgpu::{GpuContext, SurfaceSizePolicy, WgpuRenderer, WgpuRendererOptions, WgpuSurfaceConfig};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Wraps the current `ANativeWindow` so `WgpuRenderer` can create a surface
 /// from it via raw-window-handle.
@@ -67,7 +71,6 @@ pub(crate) struct AndroidWindowCallbacks {
 
 pub(crate) struct AndroidWindowState {
     pub(crate) renderer: WgpuRenderer,
-    pub(crate) raw_window: RawWindow,
     pub(crate) bounds: Bounds<Pixels>,
     pub(crate) scale_factor: f32,
     pub(crate) title: String,
@@ -111,13 +114,17 @@ pub(crate) struct AndroidWindowInner {
     pub(crate) state: RefCell<AndroidWindowState>,
     pub(crate) callbacks: RefCell<AndroidWindowCallbacks>,
     pub(crate) click_state: RefCell<ClickState>,
-    pub(crate) surface_configured: Cell<bool>,
+    surface: RefCell<SurfaceLifecycle<RawWindow>>,
+    display: Rc<AndroidDisplay>,
     pub(crate) appearance: Cell<WindowAppearance>,
     pub(crate) pending_ime_tap: Cell<Option<Point<Pixels>>>,
     pub(crate) pending_ime_tap_had_handler: Cell<bool>,
     pub(crate) pending_ime_previous_bounds: Cell<Option<Bounds<Pixels>>>,
     pub(crate) pending_ime_registrations: Cell<u8>,
     pending_physical_size: Cell<Option<Size<DevicePixels>>>,
+    input_handler_registered: Cell<bool>,
+    last_text_input_state: RefCell<Option<TextInputState>>,
+    frames: Rc<RefCell<FrameScheduler>>,
 }
 
 pub struct AndroidWindow {
@@ -148,8 +155,9 @@ impl AndroidWindow {
         _params: WindowParams,
         app: AndroidApp,
         gpu_context: GpuContext,
-        display: Rc<dyn PlatformDisplay>,
+        display: Rc<AndroidDisplay>,
         appearance: WindowAppearance,
+        renderer_options: WgpuRendererOptions,
     ) -> anyhow::Result<Self> {
         let native_window = app
             .native_window()
@@ -158,21 +166,22 @@ impl AndroidWindow {
         let physical_size = raw_window.physical_size();
         let scale = scale_factor(&app);
 
-        let renderer = WgpuRenderer::new(
+        let renderer = WgpuRenderer::new_with_options(
             gpu_context.clone(),
             &raw_window,
             surface_config(physical_size),
             None,
+            renderer_options,
         )?;
 
-        let bounds = Bounds {
+        let mut bounds = Bounds {
             origin: Point::default(),
             size: logical_size(physical_size, scale),
         };
 
+        display.update_window_bounds(physical_size, scale, &mut bounds);
         let state = AndroidWindowState {
             renderer,
-            raw_window,
             bounds,
             scale_factor: scale,
             title: String::new(),
@@ -191,13 +200,17 @@ impl AndroidWindow {
             state: RefCell::new(state),
             callbacks: RefCell::new(AndroidWindowCallbacks::default()),
             click_state: RefCell::new(ClickState::default()),
-            surface_configured: Cell::new(true),
+            surface: RefCell::new(SurfaceLifecycle::new(raw_window)),
+            display: display.clone(),
             appearance: Cell::new(appearance),
             pending_ime_tap: Cell::new(None),
             pending_ime_tap_had_handler: Cell::new(false),
             pending_ime_previous_bounds: Cell::new(None),
             pending_ime_registrations: Cell::new(0),
             pending_physical_size: Cell::new(None),
+            input_handler_registered: Cell::new(false),
+            last_text_input_state: RefCell::new(None),
+            frames: Rc::new(RefCell::new(FrameScheduler::default())),
         });
 
         Ok(Self {
@@ -234,6 +247,13 @@ fn logical_insets(insets: AndroidPhysicalInsets, scale: f32) -> WindowInsets {
     }
 }
 
+fn text_input_states_equal(first: &TextInputState, second: &TextInputState) -> bool {
+    let span = |span: TextSpan| (span.start, span.end);
+    first.text == second.text
+        && span(first.selection) == span(second.selection)
+        && first.compose_region.map(span) == second.compose_region.map(span)
+}
+
 impl AndroidWindowInner {
     pub(crate) fn input_handler_text(input_handler: &mut PlatformInputHandler) -> Option<String> {
         let text_length = input_handler.text_length_utf16().unwrap_or(65_536);
@@ -267,15 +287,62 @@ impl AndroidWindowInner {
     }
 
     pub(crate) fn sync_text_input_state(&self) {
-        let text_input_state = self
-            .state
-            .borrow_mut()
-            .input_handler
-            .as_mut()
-            .and_then(Self::text_input_state);
+        // Handler queries re-enter GPUI, so this must run after draw/input callbacks.
+        let registered = self.input_handler_registered.replace(false);
+        let text_input_state = self.with_input_handler(Self::text_input_state).flatten();
         if let Some(text_input_state) = text_input_state {
-            self.app.set_text_input_state(text_input_state);
+            let changed = self
+                .last_text_input_state
+                .borrow()
+                .as_ref()
+                .is_none_or(|previous| !text_input_states_equal(previous, &text_input_state));
+            if changed {
+                self.app.set_text_input_state(text_input_state.clone());
+                self.last_text_input_state.replace(Some(text_input_state));
+            }
+        } else if self.state.borrow().input_handler.is_none()
+            && self.last_text_input_state.borrow_mut().take().is_some()
+        {
+            self.app.hide_soft_input(false);
         }
+
+        if registered && let Some(tap_position) = self.pending_ime_tap.get() {
+            let input_bounds = self
+                .with_input_handler(|handler| handler.element_bounds())
+                .flatten();
+            let previous_bounds = self.pending_ime_previous_bounds.get();
+            let changed_handler = self.pending_ime_tap_had_handler.get()
+                && previous_bounds.is_some()
+                && input_bounds.is_some()
+                && previous_bounds != input_bounds;
+            let tapped_input = self.state.borrow().input_handler.is_some()
+                && (!self.pending_ime_tap_had_handler.get()
+                    || changed_handler
+                    || input_bounds.is_some_and(|bounds| bounds.contains(&tap_position)));
+            let registrations = self.pending_ime_registrations.get().saturating_sub(1);
+            self.pending_ime_registrations.set(registrations);
+            if tapped_input || registrations == 0 {
+                self.pending_ime_tap.set(None);
+                self.pending_ime_tap_had_handler.set(false);
+                self.pending_ime_previous_bounds.set(None);
+                self.pending_ime_registrations.set(0);
+            }
+            if tapped_input {
+                self.app.show_soft_input(false);
+            }
+        }
+    }
+
+    pub(crate) fn cancel_pending_input(&self) {
+        self.pending_ime_tap.set(None);
+        self.pending_ime_tap_had_handler.set(false);
+        self.pending_ime_previous_bounds.set(None);
+        self.pending_ime_registrations.set(0);
+        *self.click_state.borrow_mut() = ClickState::default();
+    }
+
+    pub(crate) fn accept_text_input_state(&self, state: &TextInputState) {
+        self.last_text_input_state.replace(Some(state.clone()));
     }
 
     fn insets(&self) -> WindowInsets {
@@ -310,49 +377,35 @@ impl AndroidWindowInner {
             log::error!("InitWindow received but native_window() returned None");
             return;
         };
-        let raw_window = RawWindow { native_window };
-        let physical_size = raw_window.physical_size();
-        let Some(instance) = self
-            .gpu_context
-            .borrow()
-            .as_ref()
-            .map(|context| context.instance.clone())
-        else {
-            log::error!("surface recreation requested before the GPU context exists");
-            return;
-        };
-
-        {
-            let mut state = self.state.borrow_mut();
-            if let Err(error) = state.renderer.replace_surface(
-                &raw_window,
-                surface_config(physical_size),
-                &instance,
-            ) {
-                log::error!("failed to replace wgpu surface: {error:#}");
-                return;
-            }
-            state.raw_window = raw_window;
-        }
-        self.surface_configured.set(true);
+        self.state.borrow_mut().renderer.unconfigure_surface();
+        self.surface
+            .borrow_mut()
+            .replace_window(RawWindow { native_window });
         self.update_size();
+        self.schedule_frame(true);
     }
 
     /// Called on `MainEvent::TerminateWindow`: the `ANativeWindow` is about to
     /// be destroyed, so rendering must stop until a new surface arrives.
     pub(crate) fn handle_surface_destroyed(&self) {
-        self.surface_configured.set(false);
         self.state.borrow_mut().renderer.unconfigure_surface();
+        self.surface.borrow_mut().clear();
+        self.pending_physical_size.set(None);
     }
 
     pub(crate) fn update_size(&self) {
         let scale = scale_factor(&self.app);
         let (physical_size, changed, changed_insets) = {
             let mut state = self.state.borrow_mut();
-            let physical_size = state.raw_window.physical_size();
-            let logical = logical_size(physical_size, scale);
-            let changed = state.bounds.size != logical || state.scale_factor != scale;
-            state.bounds.size = logical;
+            let surface = self.surface.borrow();
+            let Some(raw_window) = surface.window() else {
+                return;
+            };
+            let physical_size = raw_window.physical_size();
+            let changed =
+                self.display
+                    .update_window_bounds(physical_size, scale, &mut state.bounds)
+                    || state.scale_factor != scale;
             state.scale_factor = scale;
             let insets = logical_insets(state.physical_insets, scale);
             let changed_insets = (state.insets != insets).then_some(insets.clone());
@@ -374,16 +427,97 @@ impl AndroidWindowInner {
         }
     }
 
-    pub(crate) fn request_frame(&self, force_render: bool) {
-        if !self.surface_configured.get() {
+    pub(crate) fn schedule_frame(&self, force_render: bool) {
+        self.frames.borrow_mut().request(force_render);
+        self.app.create_waker().wake();
+    }
+
+    pub(crate) fn frame_deadline(&self, now: Instant) -> Option<Instant> {
+        // A missing native surface is restored by an Android lifecycle event.
+        self.surface.borrow().window()?;
+        self.frames.borrow().deadline(now)
+    }
+
+    pub(crate) fn request_pending_frame(&self, now: Instant) {
+        if self.surface.borrow().window().is_none() {
             return;
         }
+        let force_render = self.frames.borrow_mut().take_due(now);
+        if let Some(force_render) = force_render {
+            self.request_frame(force_render);
+        }
+    }
+
+    fn request_frame(&self, force_render: bool) {
+        let force_render = {
+            let mut state = self.state.borrow_mut();
+            let mut surface = self.surface.borrow_mut();
+            let recovering = state.renderer.device_lost();
+            if recovering {
+                if surface.is_ready() {
+                    surface.invalidate();
+                }
+                if state.renderer.recovery_pending() {
+                    self.frames
+                        .borrow_mut()
+                        .defer_until(Instant::now() + FRAME_INTERVAL);
+                    return;
+                }
+            }
+            let configured = surface.try_configure(Instant::now(), |raw_window| {
+                if recovering {
+                    state.renderer.recover(raw_window)
+                } else {
+                    let instance = self
+                        .gpu_context
+                        .borrow()
+                        .as_ref()
+                        .context("surface recreation requested before the GPU context exists")?
+                        .instance
+                        .clone();
+                    state.renderer.replace_surface(
+                        raw_window,
+                        surface_config(raw_window.physical_size()),
+                        &instance,
+                    )
+                }
+            });
+            let configured = match configured {
+                Ok(configured) => configured,
+                Err(error) => {
+                    if !recovering || !state.renderer.recovery_pending() {
+                        log::error!("failed to restore Android surface; will retry: {error:#}");
+                    }
+                    let retry = surface
+                        .retry_deadline()
+                        .unwrap_or_else(|| Instant::now() + FRAME_INTERVAL);
+                    self.frames.borrow_mut().defer_until(retry);
+                    return;
+                }
+            };
+            if !surface.is_ready() {
+                let retry = surface
+                    .retry_deadline()
+                    .unwrap_or_else(|| Instant::now() + FRAME_INTERVAL);
+                self.frames.borrow_mut().defer_until(retry);
+                return;
+            }
+            state.renderer.needs_redraw() || configured || force_render
+        };
         let mut callbacks = self.callbacks.borrow_mut();
         if let Some(ref mut callback) = callbacks.request_frame {
             callback(RequestFrameOptions {
-                require_presentation: true,
+                require_presentation: force_render,
                 force_render,
             });
+        }
+        drop(callbacks);
+        // A failed GPU submission may need another frame even if GPUI is clean.
+        let mut state = self.state.borrow_mut();
+        if state.renderer.needs_redraw() || state.renderer.device_lost() {
+            self.frames
+                .borrow_mut()
+                .defer_until(Instant::now() + FRAME_INTERVAL);
         }
     }
 
@@ -426,7 +560,10 @@ impl raw_window_handle::HasWindowHandle for AndroidWindow {
     fn window_handle(
         &self,
     ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
-        let raw_window = self.inner.state.borrow().raw_window.clone();
+        let surface = self.inner.surface.borrow();
+        let raw_window = surface
+            .window()
+            .ok_or(raw_window_handle::HandleError::Unavailable)?;
         let handle = raw_window.window_handle()?.as_raw();
         Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(handle) })
     }
@@ -483,50 +620,9 @@ impl PlatformWindow for AndroidWindow {
         self.inner.state.borrow().capslock
     }
 
-    fn set_input_handler(&mut self, mut input_handler: PlatformInputHandler) {
-        // Focus changes can briefly re-register the old handler before the new
-        // one. Keep the tap alive for those immediate registrations instead of
-        // letting the old handler consume the request.
-        if let Some(tap_position) = self.inner.pending_ime_tap.get() {
-            let had_handler = self.inner.pending_ime_tap_had_handler.get();
-            let previous_bounds = self.inner.pending_ime_previous_bounds.get();
-            let input_bounds = input_handler.element_bounds();
-            // A handler created by this tap is itself proof that the tap hit an
-            // editable. Its bounds can lag by one paint on Android, which used
-            // to discard the first tap and require a second one. A changed bound
-            // means the tap moved focus to another editable, so that transition
-            // is also an explicit keyboard request. Otherwise keep the bounds
-            // check so taps elsewhere do not re-open the keyboard merely because
-            // the cursor is still visible.
-            let changed_handler = had_handler
-                && previous_bounds.is_some()
-                && input_bounds.is_some()
-                && previous_bounds != input_bounds;
-            let tapped_input = !had_handler
-                || changed_handler
-                || input_bounds.is_some_and(|bounds| bounds.contains(&tap_position));
-            if tapped_input {
-                self.inner.pending_ime_tap.set(None);
-                self.inner.pending_ime_tap_had_handler.set(false);
-                self.inner.pending_ime_previous_bounds.set(None);
-                self.inner.pending_ime_registrations.set(0);
-                if let Some(text_input_state) =
-                    AndroidWindowInner::text_input_state(&mut input_handler)
-                {
-                    self.inner.app.set_text_input_state(text_input_state);
-                }
-                self.inner.app.show_soft_input(false);
-            } else {
-                let registrations = self.inner.pending_ime_registrations.get().saturating_sub(1);
-                self.inner.pending_ime_registrations.set(registrations);
-                if registrations == 0 {
-                    self.inner.pending_ime_tap.set(None);
-                    self.inner.pending_ime_tap_had_handler.set(false);
-                    self.inner.pending_ime_previous_bounds.set(None);
-                }
-            }
-        }
+    fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
         self.inner.state.borrow_mut().input_handler = Some(input_handler);
+        self.inner.input_handler_registered.set(true);
     }
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
@@ -575,6 +671,21 @@ impl PlatformWindow for AndroidWindow {
         true
     }
 
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        // GPUI may call this while the window state/callbacks are borrowed.
+        // Only record demand here; the event loop delivers it after unwinding.
+        let frames = self.inner.frames.clone();
+        let waker = self.inner.app.create_waker();
+        Some(Rc::new(move || {
+            frames.borrow_mut().request(false);
+            waker.wake();
+        }))
+    }
+
+    fn schedule_frame(&self) {
+        self.inner.schedule_frame(false);
+    }
+
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.inner.callbacks.borrow_mut().request_frame = Some(callback);
     }
@@ -616,14 +727,16 @@ impl PlatformWindow for AndroidWindow {
     }
 
     fn draw(&self, scene: &Scene) {
-        if !self.inner.surface_configured.get() {
+        if !self.inner.surface.borrow().is_ready() {
             return;
         }
         let mut state = self.inner.state.borrow_mut();
-        if let Some(physical_size) = self.inner.pending_physical_size.take() {
-            state.renderer.update_drawable_size(physical_size);
+        if !state.renderer.device_lost() {
+            if let Some(physical_size) = self.inner.pending_physical_size.take() {
+                state.renderer.update_drawable_size(physical_size);
+            }
+            state.renderer.draw(scene);
         }
-        state.renderer.draw(scene);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

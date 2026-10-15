@@ -141,6 +141,7 @@ pub use http_client;
 pub use input::*;
 pub use inspector::*;
 pub use interactive::*;
+pub use interactive::LongPressEvent;
 use key_dispatch::*;
 pub use keymap::*;
 pub use path_builder::*;

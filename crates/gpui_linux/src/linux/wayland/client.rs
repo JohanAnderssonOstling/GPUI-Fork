@@ -507,22 +507,27 @@ impl WaylandClientStatePtr {
             return false;
         };
 
-        let ExternalDragPayload::Files(paths) = payload;
-        let uri_list = file_uri_list(paths);
-        if uri_list.is_empty() {
-            return false;
-        }
+        let (mime_type, bytes) = match payload {
+            ExternalDragPayload::Files(paths) => {
+                let uri_list = file_uri_list(paths);
+                if uri_list.is_empty() {
+                    return false;
+                }
+                (FILE_LIST_MIME_TYPE.to_string(), uri_list.into_bytes())
+            }
+            ExternalDragPayload::Application(drag) => (drag.mime_type(), Vec::new()),
+        };
 
         let serial = state.serial_tracker.get(SerialKind::MousePress);
         let source =
             data_device_manager.create_data_source(&state.globals.qh, DataSourceKind::Drag);
-        source.offer(FILE_LIST_MIME_TYPE.to_string());
+        source.offer(mime_type);
         source.set_actions(DndAction::Copy | DndAction::Move);
         data_device.start_drag(Some(&source), surface, None, serial.as_raw());
 
         state.external_drag = Some(ExternalDrag {
             source,
-            bytes: uri_list.into_bytes(),
+            bytes,
             window,
         });
         true
@@ -2601,6 +2606,25 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                         return;
                     };
 
+                    let application = state
+                        .data_offers
+                        .iter()
+                        .find(|offer| offer.inner.id() == data_offer.id())
+                        .and_then(|offer| offer.application_drag());
+                    if let Some((mime_type, drag)) = application {
+                        data_offer.accept(serial, Some(mime_type));
+                        data_offer.set_actions(DndAction::Copy, DndAction::Copy);
+                        let position = Point::new(x.into(), y.into());
+                        state.drag.data_offer = Some(data_offer);
+                        state.drag.window = Some(drag_window.clone());
+                        state.drag.position = position;
+                        drop(state);
+                        drag_window.handle_input(PlatformInput::FileDrop(
+                            FileDropEvent::ApplicationEntered { position, drag },
+                        ));
+                        return;
+                    }
+                    data_offer.accept(serial, Some(FILE_LIST_MIME_TYPE.to_string()));
                     const ACTIONS: DndAction = DndAction::Copy;
                     data_offer.set_actions(ACTIONS, ACTIONS);
 

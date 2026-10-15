@@ -10,8 +10,8 @@
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style, StyleRefinement, Styled,
-    Window, point, px, size,
+    Overflow, PageScrollAnimation, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style,
+    StyleRefinement, Styled, Window, point, px, size,
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
@@ -64,6 +64,7 @@ struct StateInner {
     last_padding: Option<Edges<Pixels>>,
     items: SumTree<ListItem>,
     logical_scroll_top: Option<ListOffset>,
+    page_scroll_animation: Option<PageScrollAnimation>,
     alignment: ListAlignment,
     overdraw: Pixels,
     reset: bool,
@@ -317,6 +318,7 @@ impl ListState {
             last_padding: None,
             items: SumTree::default(),
             logical_scroll_top: None,
+            page_scroll_animation: None,
             alignment,
             overdraw,
             scroll_handler: None,
@@ -356,6 +358,7 @@ impl ListState {
         let old_count = {
             let state = &mut *self.0.borrow_mut();
             state.reset = true;
+            state.page_scroll_animation = None;
             state.measuring_behavior.reset();
             state.logical_scroll_top = None;
             state.pending_scroll = None;
@@ -659,6 +662,7 @@ impl ListState {
     /// Scroll the list to the given offset
     pub fn scroll_to(&self, mut scroll_top: ListOffset) {
         let state = &mut *self.0.borrow_mut();
+        state.page_scroll_animation = None;
         let item_count = state.items.summary().count;
         if scroll_top.item_ix >= item_count {
             scroll_top.item_ix = item_count;
@@ -895,27 +899,23 @@ impl StateInner {
         scroll_top.item_ix..cursor.start().count + 1
     }
 
-    fn scroll(
+    fn scroll_position(
         &mut self,
         scroll_top: &ListOffset,
         height: Pixels,
         delta: Point<Pixels>,
-        current_view: EntityId,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
+    ) -> bool {
         // Drop scroll events after a reset, since we can't calculate
         // the new logical scroll top without the item heights
         if self.reset {
-            return;
+            return false;
         }
 
         let padding = self.last_padding.unwrap_or_default();
         let scroll_max =
             (self.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
-        let new_scroll_top = (self.scroll_top(scroll_top) - delta.y)
-            .max(px(0.))
-            .min(scroll_max);
+        let old_scroll_top = self.scroll_top(scroll_top);
+        let new_scroll_top = (old_scroll_top - delta.y).max(px(0.)).min(scroll_max);
 
         if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
             self.pending_scroll = None;
@@ -939,24 +939,40 @@ impl StateInner {
             self.follow_state.stop_following();
         }
 
-        if let Some(handler) = self.scroll_handler.as_mut() {
-            let visible_range = Self::visible_range(&self.items, height, scroll_top);
-            handler(
-                &ListScrollEvent {
-                    visible_range,
-                    count: self.items.summary().count,
-                    is_scrolled: self.logical_scroll_top.is_some(),
-                    is_following_tail: matches!(
-                        self.follow_state,
-                        FollowState::Tail { is_following: true }
-                    ),
-                },
-                window,
-                cx,
-            );
-        }
+        new_scroll_top != old_scroll_top
+    }
 
+    fn scroll_event(&self, scroll_top: &ListOffset, height: Pixels) -> ListScrollEvent {
+        ListScrollEvent {
+            visible_range: Self::visible_range(&self.items, height, scroll_top),
+            count: self.items.summary().count,
+            is_scrolled: self.logical_scroll_top.is_some(),
+            is_following_tail: matches!(
+                self.follow_state,
+                FollowState::Tail { is_following: true }
+            ),
+        }
+    }
+
+    fn scroll(
+        &mut self,
+        scroll_top: &ListOffset,
+        height: Pixels,
+        delta: Point<Pixels>,
+        current_view: EntityId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        if self.reset {
+            return false;
+        }
+        let moved = self.scroll_position(scroll_top, height, delta);
+        let event = self.scroll_event(scroll_top, height);
+        if let Some(handler) = self.scroll_handler.as_mut() {
+            handler(&event, window, cx);
+        }
         cx.notify(current_view);
+        moved
     }
 
     fn logical_scroll_top(&self) -> ListOffset {
@@ -1369,6 +1385,7 @@ impl StateInner {
     // Scrollbar support
 
     fn set_offset_from_scrollbar(&mut self, point: Point<Pixels>) {
+        self.page_scroll_animation = None;
         let Some(bounds) = self.last_layout_bounds else {
             return;
         };
@@ -1560,6 +1577,44 @@ impl Element for List {
         let padding = style
             .padding
             .to_pixels(bounds.size.into(), window.rem_size());
+        if let Some(mut animation) = state.page_scroll_animation.take() {
+            let scroll_top = state.logical_scroll_top();
+            let current = state.scroll_top(&scroll_top);
+            if animation.last_offset.y == current {
+                let (offset, finished) = animation.advance(cx.reduce_motion());
+                let moved = state.scroll_position(
+                    &scroll_top,
+                    bounds.size.height,
+                    point(Pixels::ZERO, current - offset.y),
+                );
+                if moved {
+                    cx.notify(window.current_view());
+                    if state.scroll_handler.is_some() {
+                        let event = state.scroll_event(&scroll_top, bounds.size.height);
+                        let list_state = Rc::downgrade(&self.state.0);
+                        // A scroll handler may update views or dispatch input. Run it
+                        // after drawing, with the list state released as well.
+                        window.defer(cx, move |window, cx| {
+                            let Some(list_state) = list_state.upgrade() else {
+                                return;
+                            };
+                            let handler = list_state.borrow_mut().scroll_handler.take();
+                            if let Some(mut handler) = handler {
+                                handler(&event, window, cx);
+                                let mut state = list_state.borrow_mut();
+                                if state.scroll_handler.is_none() {
+                                    state.scroll_handler = Some(handler);
+                                }
+                            }
+                        });
+                    }
+                }
+                if !finished {
+                    state.page_scroll_animation = Some(animation);
+                    window.request_animation_frame();
+                }
+            }
+        }
         let layout =
             match state.prepaint_items(bounds, padding, true, &mut self.render_item, window, cx) {
                 Ok(layout) => layout,
@@ -1601,15 +1656,53 @@ impl Element for List {
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
                 accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
-                let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
-                list_state.0.borrow_mut().scroll(
-                    &scroll_top,
-                    height,
-                    pixel_delta,
-                    current_view,
-                    window,
-                    cx,
-                )
+                let pixel_delta = match accumulated_scroll_delta {
+                    ScrollDelta::Pages(pages) if pages.y == 0.0 => {
+                        point(Pixels::ZERO, height * pages.x)
+                    }
+                    _ => accumulated_scroll_delta.pixel_delta_for_viewport(px(20.), bounds.size),
+                };
+                let mut state = list_state.0.borrow_mut();
+                if matches!(event.delta, ScrollDelta::Pages(_))
+                    && !cx.reduce_motion()
+                    && !state.reset
+                {
+                    let logical_top = state.logical_scroll_top();
+                    let current = state.scroll_top(&logical_top);
+                    let base = state
+                        .page_scroll_animation
+                        .as_ref()
+                        .filter(|active| active.last_offset.y == current)
+                        .map_or(current, |active| active.target.y);
+                    let padding = state.last_padding.unwrap_or_default();
+                    let maximum = (state.items.summary().height + padding.top + padding.bottom
+                        - height)
+                        .max(Pixels::ZERO);
+                    let page_delta = match event.delta {
+                        ScrollDelta::Pages(pages) if pages.y == 0.0 => height * pages.x,
+                        _ => event.delta.pixel_delta_for_viewport(px(20.), bounds.size).y,
+                    };
+                    let target = (base - page_delta).clamp(Pixels::ZERO, maximum);
+                    if target != base || target != current {
+                        if target != base {
+                            state.page_scroll_animation = (target != current).then(|| {
+                                PageScrollAnimation::new(
+                                    point(Pixels::ZERO, current),
+                                    point(Pixels::ZERO, target),
+                                )
+                            });
+                        }
+                        cx.notify(current_view);
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
+                state.page_scroll_animation = None;
+                let moved =
+                    state.scroll(&scroll_top, height, pixel_delta, current_view, window, cx);
+                if moved && matches!(event.delta, ScrollDelta::Pages(_)) {
+                    cx.stop_propagation();
+                }
             }
         });
 

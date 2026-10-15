@@ -8,7 +8,9 @@ use anyhow::{Context as _, bail};
 use derive_more::{Deref, DerefMut};
 use futures::channel::oneshot;
 use futures::future::FutureExt;
-use std::{future::Future, rc::Weak, time::Duration};
+#[cfg(target_arch = "wasm32")]
+use std::time::Duration;
+use std::{future::Future, rc::Weak};
 
 use super::{Context, WeakEntity};
 

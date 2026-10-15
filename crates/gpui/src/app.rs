@@ -1,4 +1,5 @@
 use scheduler::Instant;
+use crate::profiler::startup::StartupProfile;
 use std::{
     any::{TypeId, type_name},
     cell::{BorrowMutError, Cell, Ref, RefCell, RefMut},
@@ -45,8 +46,8 @@ pub use visual_test_context::*;
 use crate::InspectorElementRegistry;
 use crate::{
     Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext,
-    AppLifecyclePhase, Arena, ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds,
-    ClipboardItem, ClipboardReadError, CursorStyle, DispatchPhase, DisplayId, EventEmitter,
+    AppLifecyclePhase, ApplicationDrag, Arena, ArenaBox, Asset, AssetSource, BackgroundExecutor,
+    Bounds, ClipboardItem, ClipboardReadError, CursorStyle, DispatchPhase, DisplayId, EventEmitter,
     ExternalDragPayload, FileDialogFilter, FocusHandle, FocusMap, ForegroundExecutor, Global,
     KeyBinding, KeyContext, Keymap, Keystroke, LayoutId, Menu, MenuItem, OwnedMenu,
     PathPromptOptions, Pixels, Platform, PlatformDisplay, PlatformKeyboardLayout,
@@ -674,13 +675,15 @@ impl GpuiMode {
 struct PlatformOwnedDrag {
     source_window: WindowId,
     state: PlatformOwnedDragState,
+    application: Option<ApplicationDrag>,
 }
 
 enum PlatformOwnedDragState {
     Suspended(AnyDrag),
-    // A source-window drop consumes `active_drag` before AppKit ends the dragging session, so this
+    // A drop consumes `active_drag` before the platform ends the dragging session, so this
     // marker can outlive the active drag and is cleaned up by `FileDropEvent::Ended`.
-    RestoredInSourceWindow,
+    Restored(WindowId),
+    Completed,
 }
 
 /// Contains the state of the full application, and passed as a reference to a variety of callbacks.
@@ -1297,10 +1300,13 @@ impl App {
         self.update(|cx| {
             let id = cx.windows.insert(None);
             let handle = WindowHandle::new(id);
+            let mut startup = StartupProfile::new("gpui_window_open");
             match Window::new(handle.into(), options, cx) {
                 Ok(mut window) => {
+                    startup.mark("window_new");
                     cx.window_update_stack.push(id);
                     let root_view = build_root_view(&mut window, cx);
+                    startup.mark("root_view");
                     cx.window_update_stack.pop();
                     window.root.replace(root_view.into());
                     window.defer(cx, |window: &mut Window, cx| window.appearance_changed(cx));
@@ -1311,6 +1317,7 @@ impl App {
                     // where DispatchTree::root_node_id asserts on empty nodes
                     let clear = window.draw(cx);
                     clear.clear(cx);
+                    startup.mark("first_draw");
 
                     cx.window_handles.insert(id, window.handle);
                     cx.windows.get_mut(id).unwrap().replace(Box::new(window));
@@ -2036,6 +2043,14 @@ impl App {
 
                 if window.removed {
                     cx.end_platform_drag(id);
+                    if cx
+                        .active_drag
+                        .as_ref()
+                        .is_some_and(|drag| drag.window == id)
+                    {
+                        cx.active_drag = None;
+                        cx.refresh_windows();
+                    }
                     cx.window_handles.remove(&id);
                     cx.windows.remove(id);
                     if let Some(tracked) = cx.tracked_entities.remove(&id) {
@@ -2685,10 +2700,15 @@ impl App {
         if self.active_drag.is_some() {
             self.active_drag = None;
             if self.platform_owned_drag.as_ref().is_some_and(|drag| {
-                drag.source_window == window.window_handle().window_id()
-                    && matches!(&drag.state, PlatformOwnedDragState::RestoredInSourceWindow)
+                matches!(&drag.state, PlatformOwnedDragState::Restored(host) if *host == window.window_handle().window_id())
             }) {
-                self.platform_owned_drag = None;
+                if let Some(drag) = self.platform_owned_drag.as_mut() {
+                    if drag.application.is_some() {
+                        drag.state = PlatformOwnedDragState::Completed;
+                    } else {
+                        self.platform_owned_drag = None;
+                    }
+                }
             }
             window.refresh();
             true
@@ -2697,60 +2717,86 @@ impl App {
         }
     }
 
-    pub(crate) fn hand_active_drag_to_platform(&mut self, source_window: WindowId) -> bool {
+    pub(crate) fn hand_active_drag_to_platform(
+        &mut self,
+        source_window: WindowId,
+        application: Option<ApplicationDrag>,
+    ) -> bool {
         let Some(drag) = self.active_drag.take() else {
             return false;
         };
         self.platform_owned_drag = Some(PlatformOwnedDrag {
             source_window,
             state: PlatformOwnedDragState::Suspended(drag),
+            application,
         });
         true
     }
 
-    pub(crate) fn restore_platform_drag(&mut self, source_window: WindowId) -> bool {
-        let Some(platform_drag) = self
-            .platform_owned_drag
-            .as_mut()
-            .filter(|drag| drag.source_window == source_window)
+    pub(crate) fn restore_platform_drag(
+        &mut self,
+        host: WindowId,
+        application: Option<ApplicationDrag>,
+    ) -> bool {
+        let Some(platform_drag) =
+            self.platform_owned_drag
+                .as_mut()
+                .filter(|drag| match application {
+                    Some(application) => drag.application == Some(application),
+                    None => drag.source_window == host && drag.application.is_none(),
+                })
         else {
             return false;
         };
-        let state = std::mem::replace(
+        if !matches!(&platform_drag.state, PlatformOwnedDragState::Suspended(_)) {
+            return false;
+        }
+        let PlatformOwnedDragState::Suspended(mut drag) = std::mem::replace(
             &mut platform_drag.state,
-            PlatformOwnedDragState::RestoredInSourceWindow,
-        );
-        let PlatformOwnedDragState::Suspended(drag) = state else {
+            PlatformOwnedDragState::Restored(host),
+        ) else {
             return false;
         };
+        drag.window = host;
         self.active_drag = Some(drag);
         true
     }
 
-    pub(crate) fn hand_restored_drag_to_platform(&mut self, source_window: WindowId) -> bool {
+    pub(crate) fn hand_restored_drag_to_platform(&mut self, host: WindowId) -> bool {
         let Some(platform_drag) = self.platform_owned_drag.as_mut().filter(|drag| {
-            drag.source_window == source_window
-                && matches!(&drag.state, PlatformOwnedDragState::RestoredInSourceWindow)
+            matches!(&drag.state, PlatformOwnedDragState::Restored(window) if *window == host)
         }) else {
             return false;
         };
-        let Some(drag) = self.active_drag.take() else {
-            return false;
+        platform_drag.state = match self.active_drag.take() {
+            Some(drag) => PlatformOwnedDragState::Suspended(drag),
+            None => PlatformOwnedDragState::Completed,
         };
-        platform_drag.state = PlatformOwnedDragState::Suspended(drag);
         true
+    }
+
+    pub(crate) fn rollback_platform_drag(&mut self, source: WindowId) {
+        if self
+            .platform_owned_drag
+            .as_ref()
+            .is_some_and(|drag| drag.source_window == source)
+        {
+            self.platform_owned_drag = None;
+        }
     }
 
     pub(crate) fn end_platform_drag(&mut self, source_window: WindowId) -> bool {
         if !self
             .platform_owned_drag
             .as_ref()
-            .is_some_and(|drag| drag.source_window == source_window)
+            .is_some_and(|drag| drag.source_window == source_window
+                || matches!(drag.state, PlatformOwnedDragState::Restored(host) if host == source_window))
         {
             return false;
         }
         self.platform_owned_drag = None;
         self.active_drag = None;
+        self.refresh_windows();
         true
     }
 
@@ -3118,6 +3164,8 @@ impl<G: Global> DerefMut for GlobalLease<G> {
 /// Contains state associated with an active drag operation, started by dragging an element
 /// within the window or by dragging into the app from the underlying platform.
 pub struct AnyDrag {
+    /// The window currently hosting the drag preview and drop targets.
+    pub window: WindowId,
     /// The view used to render this drag
     pub view: AnyView,
 

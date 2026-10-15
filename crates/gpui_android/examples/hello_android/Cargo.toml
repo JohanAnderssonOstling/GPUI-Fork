@@ -12,7 +12,7 @@ crate-type = ["cdylib"]
 path = "main.rs"
 
 [dependencies]
-android-activity = { version = "0.6", features = ["native-activity"] }
+android-activity = { version = "0.6", features = ["game-activity"] }
 gpui = { path = "../../../gpui" }
 gpui_platform = { path = "../../../gpui_platform" }
 log = "0.4"

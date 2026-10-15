@@ -61,6 +61,36 @@ struct KoboRunState {
     touch: TouchAccumulator,
     suppress_next_power_release: bool,
     wake_frame_pending: bool,
+    startup_frame_pending: bool,
+    last_user_activity: Instant,
+    next_power_check: Instant,
+    cover_closed: bool,
+}
+
+fn is_sleep_wake(event: ButtonEvent, cover_closed: &mut bool, suppress_release: &mut bool, sleep_cover: bool) -> bool {
+    if sleep_cover && event.button == HardwareButton::SleepCover {
+        let was_closed = *cover_closed;
+        *cover_closed = event.pressed;
+        return was_closed && !event.pressed;
+    }
+    if event.repeated { return false; }
+    if *cover_closed { return false; }
+    match event.button {
+        HardwareButton::Power | HardwareButton::Sleep => {
+            *suppress_release = event.pressed;
+            true
+        }
+        HardwareButton::PreviousPage | HardwareButton::NextPage | HardwareButton::Home => event.pressed,
+        _ => false,
+    }
+}
+
+fn suspend_until_confirmed(mut suspend: impl FnMut() -> std::result::Result<(), String>, mut confirm: impl FnMut() -> Result<bool>) -> Result<()> {
+    loop {
+        suspend().map_err(|error| anyhow!("Kobo application suspend failed: {error}"))?;
+        if confirm()? { return Ok(()); }
+        println!("Unconfirmed Kobo wake; suspending again with peripherals off");
+    }
 }
 
 impl KoboResourceMonitor {
@@ -174,10 +204,17 @@ pub fn request_full_repaint() -> Result<()> {
 thread_local! {
     static POWER_MENU_PENDING: Cell<bool> = const { Cell::new(false) };
     static SLEEP_PENDING: Cell<bool> = const { Cell::new(false) };
+    static POWER_MESSAGE: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 pub fn take_power_menu_request() -> bool { POWER_MENU_PENDING.with(|pending| pending.replace(false)) }
 pub fn request_sleep() { SLEEP_PENDING.with(|pending| pending.set(true)); }
+pub fn take_power_message() -> Option<String> { POWER_MESSAGE.with(|message| message.borrow_mut().take()) }
+
+fn report_power_message(message: String) {
+    eprintln!("Kobo power: {message}");
+    POWER_MESSAGE.with(|pending| *pending.borrow_mut() = Some(message));
+}
 
 pub fn current_render_mode() -> Result<KoboRenderMode> {
     let platform = active_kobo_platform()?;
@@ -306,9 +343,13 @@ pub struct KoboPlatformOptions {
     /// Application-owned Kobo suspend operation invoked on power-button release.
     pub power_button_handler: Option<fn() -> std::result::Result<(), String>>,
     pub power_button_opens_menu: bool,
+    pub power: KoboPowerOptions,
     /// Called after the restored application frame is presented following suspend.
     /// Must only enqueue background work, without blocking the event loop.
     pub wake_ui_ready_handler: Option<fn()>,
+    /// Called once after the first application frame finishes presenting.
+    /// Must only enqueue background work, without blocking or updating GPUI.
+    pub startup_frame_ready_handler: Option<fn()>,
     /// Draw and handle a persistent control that exits to the Kobo shell.
     pub show_exit_button: bool,
     pub experience_mode: KoboExperienceMode,
@@ -316,10 +357,29 @@ pub struct KoboPlatformOptions {
     pub monochrome_threshold: u8,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KoboPowerOptions {
+    pub prepare_sleep: Option<fn() -> std::result::Result<(), String>>,
+    pub finish_sleep: Option<fn() -> std::result::Result<(), String>>,
+    pub poll: Option<fn() -> KoboPowerEvent>,
+    pub power_off: Option<fn() -> std::result::Result<(), String>>,
+    pub prepare_delay: Duration,
+    pub settle_delay: Duration,
+    pub wake_confirmation_timeout: Duration,
+    pub idle_timeout: Option<Duration>,
+    pub sleep_cover: bool,
+}
+
+pub enum KoboPowerEvent {
+    None,
+    Warning(String),
+    PowerOff,
+}
+
 /// Input behavior for Kobo's physical page-turn buttons.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PageButtonBehavior {
-    /// Emit a scroll gesture, useful for generic scrolling views and the smoke test.
+    /// Scroll by one receiving viewport, independently of keyboard focus.
     Scroll,
     /// Emit left/right keystrokes, reusing the desktop reader's existing key bindings.
     ///
@@ -347,7 +407,9 @@ impl Default for KoboPlatformOptions {
             page_buttons: PageButtonBehavior::Scroll,
             power_button_handler: None,
             power_button_opens_menu: false,
+            power: KoboPowerOptions::default(),
             wake_ui_ready_handler: None,
+            startup_frame_ready_handler: None,
             show_exit_button: false,
             experience_mode: KoboExperienceMode::ReaderQuality,
             render_mode: KoboRenderMode::QualityGrayscale,
@@ -977,6 +1039,7 @@ impl PlatformWindow for KoboWindow {
 
 #[derive(Clone, Copy, Default)]
 struct TouchAccumulator {
+    origin: Point<Pixels>,
     last_y: Option<f32>,
     scroll_y: f32,
     exit_candidate: bool,
@@ -1282,6 +1345,10 @@ impl KoboPlatform {
                 touch: TouchAccumulator::default(),
                 suppress_next_power_release: false,
                 wake_frame_pending: false,
+                startup_frame_pending: true,
+                last_user_activity: Instant::now(),
+                next_power_check: Instant::now(),
+                cover_closed: false,
             })),
             display_geometry_refresh_requested: Cell::new(false),
             queued_events: Cell::new(VecDeque::new()),
@@ -1341,8 +1408,9 @@ impl KoboPlatform {
 
     fn present_pending_full_repaint(&self, state: &mut KoboRunState) -> Result<bool> {
         if SLEEP_PENDING.with(|pending| pending.replace(false)) {
-            if let Err(error) = self.request_suspend(state) { eprintln!("Kobo sleep failed: {error}"); }
+            if let Err(error) = self.request_suspend(state) { report_power_message(format!("Sleep failed: {error}")); }
         }
+        if self.quit.get() { return Ok(false); }
         if !self.full_repaint_requested.replace(false) {
             return Ok(false);
         }
@@ -1474,16 +1542,36 @@ impl KoboPlatform {
             windows.iter().filter_map(Weak::upgrade).map(KoboWindow).collect::<Vec<_>>()
         });
         for window in &windows { window.set_active(false); }
-        let suspend_result = handler();
+        let mut prepared = false;
+        // One logical sleep session can include several kernel returns. Keep
+        // the frontlight and radio asleep until a physical wake is confirmed.
+        let suspend_result = (|| -> Result<()> {
+            if self.wait_for_sleep_input(state, self.options.power.prepare_delay)? { return Ok(()); }
+            if let Some(prepare) = self.options.power.prepare_sleep {
+                prepare().map_err(|error| anyhow!("sleep preparation failed: {error}"))?;
+                prepared = true;
+            }
+            if self.wait_for_sleep_input(state, self.options.power.settle_delay)? { return Ok(()); }
+            if self.quit.get() { return Ok(()); }
+            suspend_until_confirmed(handler, || {
+                state.next_power_check = Instant::now();
+                let confirmation = self.options.power.wake_confirmation_timeout;
+                Ok(confirmation.is_zero() || state.runtime.is_none() || self.wait_for_sleep_input(state, confirmation)?)
+            })
+        })();
+        if self.quit.get() { return suspend_result; }
+        let finish_result = if prepared {
+            self.options.power.finish_sleep.map_or(Ok(()), |finish| finish().map_err(|error| anyhow!("sleep recovery failed: {error}")))
+        } else { Ok(()) };
         for window in &windows { window.set_active(true); }
         state.wake_frame_pending = true;
+        state.last_user_activity = Instant::now();
+        state.next_power_check = Instant::now() + Duration::from_secs(60);
         if let Some(runtime) = state.runtime.as_mut() {
-            let (touch_events, button_events) = runtime.discard_pending_input()?;
-            println!(
-                "discarded input accumulated during Kobo suspend: touch_events={touch_events} button_events={button_events}"
-            );
+            let touch_events = runtime.discard_pending_touch()?;
+            println!("discarded touch accumulated during Kobo suspend: touch_events={touch_events}");
         }
-        state.suppress_next_power_release = false;
+        state.touch = TouchAccumulator::default();
 
         let geometry = if let Some(presenter) = state.presenter.as_mut() {
             presenter.reinitialize()?;
@@ -1501,7 +1589,54 @@ impl KoboPlatform {
         }
         self.full_repaint_requested.set(true);
         self.full_gc16_requested.set(true);
-        suspend_result.map_err(|error| anyhow!("Kobo application suspend failed: {error}"))
+        suspend_result.and(finish_result)
+    }
+
+    fn wait_for_sleep_input(&self, state: &mut KoboRunState, timeout: Duration) -> Result<bool> {
+        // No physical polling in host tests; the default callbacks still run once.
+        if state.runtime.is_none() { return Ok(false); }
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.poll_power(state, true)? { return Ok(true); }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() { return Ok(false); }
+            let event = state.runtime.as_mut().unwrap().next_sleep_button(remaining.min(Duration::from_millis(50)))?;
+            if let Some(event) = event {
+                if is_sleep_wake(event, &mut state.cover_closed, &mut state.suppress_next_power_release, self.options.power.sleep_cover) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
+    fn poll_power(&self, state: &mut KoboRunState, sleeping: bool) -> Result<bool> {
+        let now = Instant::now();
+        if now < state.next_power_check { return Ok(false); }
+        state.next_power_check = now + Duration::from_secs(if sleeping { 1 } else { 60 });
+        match self.options.power.poll.map_or(KoboPowerEvent::None, |poll| poll()) {
+            KoboPowerEvent::None => {}
+            KoboPowerEvent::Warning(message) => report_power_message(message),
+            KoboPowerEvent::PowerOff => {
+                let power_off = self.options.power.power_off.ok_or_else(|| anyhow!("Kobo application did not install a power-off handler"))?;
+                self.full_repaint_requested.set(true);
+                self.full_gc16_requested.set(true);
+                if let Some(mut frame) = self.last_frame() {
+                    for pixel in frame.pixels_mut() { *pixel = Luma([255]); }
+                    let dot = (frame.width() / 100).clamp(1, 8);
+                    let top = frame.height().saturating_sub(7 * dot) / 2;
+                    let width = frame.width();
+                    draw_bitmap_text(&mut frame, "POWER OFF", dot, top, 0, width);
+                    if let Some(presenter) = state.presenter.as_mut() { presenter.present_full_gc16(&frame)?; }
+                }
+                power_off().map_err(|error| anyhow!("Kobo power-off failed: {error}"))?;
+                self.quit.set(true);
+                self.return_screen_requested.set(false);
+                self.full_repaint_requested.set(false);
+                self.full_gc16_requested.set(false);
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn apply_display_geometry(&self, state: &mut KoboRunState, geometry: &crate::ScreenGeometry) {
@@ -1539,9 +1674,20 @@ impl KoboPlatform {
         })
     }
 
-    fn notify_wake_ui_ready(&self, state: &mut KoboRunState) {
+    fn notify_frame_presented(&self, state: &mut KoboRunState) {
         if std::mem::take(&mut state.wake_frame_pending) {
             if let Some(handler) = self.options.wake_ui_ready_handler {
+                handler();
+            }
+        }
+        if std::mem::take(&mut state.startup_frame_pending) {
+            if let Some(started_at) = self.application_startup_started_at.take() {
+                println!(
+                    "KOBO_APP_STARTUP phase=first_frame_presented elapsed_ms={}",
+                    started_at.elapsed().as_millis()
+                );
+            }
+            if let Some(handler) = self.options.startup_frame_ready_handler {
                 handler();
             }
         }
@@ -1593,21 +1739,12 @@ impl KoboPlatform {
             }
             self.full_gc16_requested.set(false);
             state.scheduler.record_full_presentation(&image);
-            self.notify_wake_ui_ready(state);
             println!(
                 "GPUI timing: force=true scrolling={scrolling} render_ms={render_ms} changed={} present_ms={} total_ms={}",
                 update.is_some(),
                 present_started.elapsed().as_millis(),
                 pipeline_started.elapsed().as_millis()
             );
-            if self.experience_mode.get() == KoboExperienceMode::LibraryFast
-                && let Some(started_at) = self.application_startup_started_at.take()
-            {
-                println!(
-                    "KOBO_APP_STARTUP phase=first_frame_presented elapsed_ms={}",
-                    started_at.elapsed().as_millis()
-                );
-            }
             if self.experience_mode.get() == KoboExperienceMode::ReaderQuality
                 && let Some(started_at) = self.book_launch_started_at.take()
             {
@@ -1616,6 +1753,7 @@ impl KoboPlatform {
                     started_at.elapsed().as_millis()
                 );
             }
+            self.notify_frame_presented(state);
             return Ok(());
         }
         let Some(update) = update else {
@@ -1683,6 +1821,7 @@ impl KoboPlatform {
                 pipeline_started.elapsed().as_millis(),
             );
             state.scheduler.record_fast_presentation(&update, Instant::now());
+            self.notify_frame_presented(state);
             return Ok(());
         }
         let schedule_started = Instant::now();
@@ -1708,11 +1847,12 @@ impl KoboPlatform {
                 present_started.elapsed().as_millis(),
                 pipeline_started.elapsed().as_millis()
             );
+            self.notify_frame_presented(state);
         }
         Ok(())
     }
 
-    fn dispatch_scroll(&self, state: &mut KoboRunState, canvas_delta_y: f32) -> Result<()> {
+    fn dispatch_scroll(&self, state: &mut KoboRunState, page_delta_y: f32) -> Result<()> {
         let Some(window) = self.window() else {
             return Ok(());
         };
@@ -1722,10 +1862,8 @@ impl KoboPlatform {
         window.dispatch_input(
             PlatformInput::ScrollWheel(ScrollWheelEvent {
                 position,
-                delta: ScrollDelta::Pixels(point(
-                    px(0.0),
-                    px(canvas_delta_y / self.scale_factor.get()),
-                )),
+                // The receiving surface resolves this against its own viewport.
+                delta: ScrollDelta::Pages(point(0.0, page_delta_y)),
                 touch_phase: gpui::TouchPhase::Ended,
                 ..Default::default()
             }),
@@ -1735,7 +1873,7 @@ impl KoboPlatform {
         let frame_started = Instant::now();
         let result = self.request_and_present(state, true, false);
         println!(
-            "GPUI scroll timing: delta={canvas_delta_y:.1} dispatch_ms={dispatch_ms} frame_ms={} total_ms={}",
+            "GPUI scroll timing: pages={page_delta_y:.2} dispatch_ms={dispatch_ms} frame_ms={} total_ms={}",
             frame_started.elapsed().as_millis(),
             dispatch_started.elapsed().as_millis()
         );
@@ -1788,6 +1926,7 @@ impl KoboPlatform {
         match mapped.phase {
             TouchPhase::Down => {
                 state.touch = TouchAccumulator {
+                    origin: position,
                     last_y: Some(logical_y),
                     scroll_y: 0.0,
                     exit_candidate: self.exit_button_hit(mapped.x, mapped.y),
@@ -1829,12 +1968,17 @@ impl KoboPlatform {
         if scrolling {
             window.dispatch_input(
                 PlatformInput::ScrollWheel(ScrollWheelEvent {
-                    position,
-                    delta: ScrollDelta::Pixels(point(px(0.0), px(scroll_y))),
+                    position: touch.origin,
+                    delta: ScrollDelta::Pages(match gesture {
+                        Some(Gesture::Swipe { dx, dy }) if dx.abs() > dy.abs() => {
+                            point(dx.signum(), 0.0)
+                        }
+                        _ => point(0.0, scroll_y.signum()),
+                    }),
                     touch_phase: gpui::TouchPhase::Ended,
                     ..Default::default()
                 }),
-                position,
+                touch.origin,
             );
         } else {
             let button = if matches!(gesture, Some(Gesture::LongPress { .. })) {
@@ -1907,6 +2051,20 @@ impl KoboPlatform {
                 event.button, event.pressed, event.repeated
             );
         }
+        if event.button == HardwareButton::SleepCover {
+            if self.options.power.sleep_cover {
+                let changed = state.cover_closed != event.pressed;
+                state.cover_closed = event.pressed;
+                if changed && event.pressed {
+                    if let Err(error) = self.request_suspend(state) { report_power_message(format!("Sleep failed: {error}")); }
+                }
+            }
+            return Ok(());
+        }
+        if matches!(event.button, HardwareButton::Power | HardwareButton::Sleep) && event.pressed && !event.repeated {
+            // A new press starts a new interaction if the wake release was lost.
+            state.suppress_next_power_release = false;
+        }
         if matches!(event.button, HardwareButton::Power | HardwareButton::Sleep)
             && !event.pressed
             && !event.repeated
@@ -1921,7 +2079,7 @@ impl KoboPlatform {
             }
             println!("hardware power button requested Kobo suspend");
             if let Err(error) = self.request_suspend(state) {
-                println!("hardware power suspend failed; staying in app: {error}");
+                report_power_message(format!("Sleep failed: {error}"));
             }
             return Ok(());
         }
@@ -1930,10 +2088,10 @@ impl KoboPlatform {
         }
         let result = match (event.button, self.options.page_buttons) {
             (HardwareButton::PreviousPage, PageButtonBehavior::Scroll) => {
-                self.dispatch_scroll(state, 300.0)
+                self.dispatch_scroll(state, 1.0)
             }
             (HardwareButton::NextPage, PageButtonBehavior::Scroll) => {
-                self.dispatch_scroll(state, -300.0)
+                self.dispatch_scroll(state, -1.0)
             }
             (HardwareButton::PreviousPage, PageButtonBehavior::ArrowKeys) => {
                 self.dispatch_page_key(state, "left")
@@ -1961,7 +2119,7 @@ impl KoboPlatform {
                 self.dispatch_rotation(state, rotation, from_gyro)
             }
             (HardwareButton::RotateScreen { .. }, _) => Ok(()),
-            (HardwareButton::Power | HardwareButton::Sleep | HardwareButton::Unknown(_), _) => {
+            (HardwareButton::Power | HardwareButton::Sleep | HardwareButton::SleepCover | HardwareButton::Unknown(_), _) => {
                 Ok(())
             }
         };
@@ -2014,7 +2172,7 @@ impl KoboPlatform {
     fn process_event(&self, state: &mut KoboRunState, event: RuntimeEvent) -> Result<()> {
         match event {
             RuntimeEvent::Touch { mapped, gesture } => {
-                state.suppress_next_power_release = false;
+                state.last_user_activity = Instant::now();
                 if crate::verbose_logging_enabled() {
                     if let Some(gesture) = gesture {
                         println!("input gesture: {gesture:?}");
@@ -2023,8 +2181,8 @@ impl KoboPlatform {
                 self.dispatch_touch(state, mapped, gesture)
             }
             RuntimeEvent::Button(event) => {
-                if !matches!(event.button, HardwareButton::Power | HardwareButton::Sleep) {
-                    state.suppress_next_power_release = false;
+                if !matches!(event.button, HardwareButton::RotateScreen { from_gyro: true, .. } | HardwareButton::Unknown(_)) {
+                    state.last_user_activity = Instant::now();
                 }
                 self.dispatch_button(state, event)
             }
@@ -2033,6 +2191,7 @@ impl KoboPlatform {
                     if let Some(presenter) = state.presenter.as_mut() {
                         presenter.present_update(&refresh.update, refresh.mode)?;
                     }
+                    self.notify_frame_presented(state);
                 }
                 Ok(())
             }
@@ -2072,6 +2231,16 @@ impl KoboPlatform {
             Some(Instant::now() + self.options.timeout)
         };
         while !self.quit.get() {
+            if let Err(error) = self.poll_power(state, false) {
+                report_power_message(error.to_string());
+            }
+            if self.quit.get() { break; }
+            if self.options.power.idle_timeout.is_some_and(|timeout| state.last_user_activity.elapsed() >= timeout) {
+                // Reset the deadline on failure too, so idle sleep cannot spin.
+                state.last_user_activity = Instant::now();
+                if let Err(error) = self.request_suspend(state) { report_power_message(format!("Sleep failed: {error}")); }
+                if self.quit.get() { break; }
+            }
             let ran_callbacks = self.dispatcher.run_pending() > 0;
             if self.display_geometry_refresh_requested.replace(false) && self.auto_rotate.get() {
                 let geometry = state
@@ -2351,8 +2520,8 @@ mod sleep_tests {
             let result = platform.request_suspend(&mut state);
             assert!(state.wake_frame_pending);
             WAKE_NOTIFICATIONS.with(|count| assert_eq!(count.get(), 0));
-            platform.notify_wake_ui_ready(&mut state);
-            platform.notify_wake_ui_ready(&mut state);
+            platform.notify_frame_presented(&mut state);
+            platform.notify_frame_presented(&mut state);
             WAKE_NOTIFICATIONS.with(|count| assert_eq!(count.get(), 1));
             assert_eq!(result.is_ok(), handler().is_ok());
             assert!(platform.full_repaint_requested.get());
@@ -2476,5 +2645,76 @@ mod frame_scheduling_tests {
             window.0.request_frame.set(original);
         });
         assert!(platform.take_error().is_none());
+    }
+}
+
+#[cfg(test)]
+mod power_policy_tests {
+    use super::*;
+
+    fn event(button: HardwareButton, pressed: bool) -> ButtonEvent {
+        ButtonEvent { button, pressed, repeated: false }
+    }
+
+    #[test]
+    fn unconfirmed_wakes_repeat_kernel_suspend_without_returning_to_ui() {
+        let mut cycles = 0;
+        let mut confirmations = [false, false, true].into_iter();
+        suspend_until_confirmed(|| { cycles += 1; Ok(()) }, || Ok(confirmations.next().unwrap())).unwrap();
+        assert_eq!(cycles, 3);
+    }
+
+    #[test]
+    fn kernel_failure_returns_for_peripheral_and_ui_recovery() {
+        let result = suspend_until_confirmed(|| Err("kernel error".into()), || panic!("failed suspend must abort"));
+        assert!(result.unwrap_err().to_string().contains("kernel error"));
+    }
+
+    #[test]
+    fn gyro_and_closed_cover_buttons_do_not_confirm_a_wake() {
+        let mut closed = false;
+        let mut suppress = false;
+        assert!(!is_sleep_wake(event(HardwareButton::RotateScreen { rotation: 1, from_gyro: true }, true), &mut closed, &mut suppress, true));
+        assert!(!is_sleep_wake(event(HardwareButton::SleepCover, true), &mut closed, &mut suppress, true));
+        assert!(closed);
+        assert!(!is_sleep_wake(event(HardwareButton::Power, true), &mut closed, &mut suppress, true));
+        assert!(!is_sleep_wake(event(HardwareButton::NextPage, true), &mut closed, &mut suppress, true));
+        assert!(is_sleep_wake(event(HardwareButton::SleepCover, false), &mut closed, &mut suppress, true));
+        assert!(!closed);
+        assert!(is_sleep_wake(event(HardwareButton::NextPage, true), &mut closed, &mut suppress, true));
+    }
+
+    #[test]
+    fn wake_power_release_is_suppressed_across_other_input_but_new_press_works() {
+        let platform = KoboPlatform::new(KoboPlatformOptions { display: false, interactive: false, power_button_opens_menu: true, ..Default::default() }).unwrap();
+        let mut state = platform.run_state.take().unwrap();
+        POWER_MENU_PENDING.with(|pending| pending.set(false));
+        assert!(is_sleep_wake(event(HardwareButton::Power, true), &mut state.cover_closed, &mut state.suppress_next_power_release, true));
+        platform.process_event(&mut state, RuntimeEvent::Button(event(HardwareButton::Unknown(1), true))).unwrap();
+        assert!(state.suppress_next_power_release);
+        platform.dispatch_button(&mut state, event(HardwareButton::Power, false)).unwrap();
+        assert!(!take_power_menu_request());
+        platform.dispatch_button(&mut state, event(HardwareButton::Power, true)).unwrap();
+        platform.dispatch_button(&mut state, event(HardwareButton::Power, false)).unwrap();
+        assert!(take_power_menu_request());
+        platform.run_state.set(Some(state));
+    }
+
+    #[test]
+    fn cover_key_codes_match_plato() {
+        for code in [59, 35] {
+            assert_eq!(crate::hardware_button_from_code(code), HardwareButton::SleepCover);
+        }
+    }
+
+    #[test]
+    fn repeated_cover_key_events_also_mean_cover_closed() {
+        let mut closed = false;
+        let mut suppress = false;
+        let mut cover = event(HardwareButton::SleepCover, true);
+        cover.repeated = true;
+        assert!(!is_sleep_wake(cover, &mut closed, &mut suppress, true));
+        assert!(closed);
+        assert!(is_sleep_wake(event(HardwareButton::SleepCover, false), &mut closed, &mut suppress, true));
     }
 }

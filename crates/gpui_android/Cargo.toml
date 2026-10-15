@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 license = "Apache-2.0"
+autoexamples = false
 
 [lints]
 workspace = true
@@ -25,3 +26,8 @@ parking_lot.workspace = true
 raw-window-handle = "0.6"
 uuid.workspace = true
 wgpu.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+uuid.workspace = true

@@ -1,16 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="dev.gpui.hello">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
 
     <application
-        android:debuggable="true"
-        android:extractNativeLibs="true"
-        android:hasCode="false"
         android:label="GPUI Android"
-        android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
+        android:theme="@style/AppTheme">
         <activity
-            android:name="android.app.NativeActivity"
+            android:name="dev.gpui.hello.MainActivity"
             android:configChanges="orientation|keyboardHidden|screenSize|density|uiMode"
             android:exported="true">
             <meta-data

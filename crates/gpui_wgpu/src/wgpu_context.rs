@@ -5,6 +5,10 @@ use gpui_util::ResultExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use wgpu::TextureFormat;
+#[cfg(not(target_family = "wasm"))]
+use gpui::profiler::startup::StartupProfile;
+#[cfg(not(target_family = "wasm"))]
+use crate::pipeline_cache::PersistentPipelineCache;
 
 pub struct WgpuContext {
     pub instance: wgpu::Instance,
@@ -15,6 +19,8 @@ pub struct WgpuContext {
     dual_source_blending: bool,
     color_texture_format: wgpu::TextureFormat,
     device_lost: Arc<AtomicBool>,
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) pipeline_cache: Option<PersistentPipelineCache>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +53,19 @@ pub struct PreparedWebGraphics {
 #[derive(Debug)]
 struct WebDisplaySource;
 
+#[cfg(target_os = "android")]
+#[derive(Debug)]
+struct AndroidDisplaySource;
+
+#[cfg(target_os = "android")]
+impl raw_window_handle::HasDisplayHandle for AndroidDisplaySource {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        Ok(raw_window_handle::DisplayHandle::android())
+    }
+}
+
 #[cfg(target_family = "wasm")]
 impl raw_window_handle::HasDisplayHandle for WebDisplaySource {
     fn display_handle(
@@ -63,6 +82,13 @@ pub struct CompositorGpuHint {
 }
 
 impl WgpuContext {
+    pub(crate) fn pipeline_cache(&self) -> Option<&wgpu::PipelineCache> {
+        #[cfg(not(target_family = "wasm"))]
+        { self.pipeline_cache.as_ref().map(|cache| &cache.cache) }
+        #[cfg(target_family = "wasm")]
+        { None }
+    }
+
     /// Creates a GPU context that is not tied to a window surface.
     ///
     /// A software fallback adapter is preferred so visual tests are stable on
@@ -123,6 +149,7 @@ impl WgpuContext {
             dual_source_blending,
             color_texture_format,
             device_lost,
+            pipeline_cache: None,
         })
     }
 
@@ -163,8 +190,8 @@ impl WgpuContext {
             }
         };
 
-        // Select an adapter by actually testing surface configuration with the real device.
-        // This is the only reliable way to determine compatibility on hybrid GPU systems.
+        // Desktop hybrid GPUs need a configuration probe. Android validates the
+        // actual window configuration instead of creating a throwaway swapchain.
         let (adapter, device, queue, dual_source_blending, color_texture_format) =
             gpui::block_on(Self::select_adapter_and_device(
                 &instance,
@@ -201,6 +228,7 @@ impl WgpuContext {
             dual_source_blending,
             color_texture_format,
             device_lost,
+            pipeline_cache: None,
         })
     }
 
@@ -301,9 +329,13 @@ impl WgpuContext {
     ) -> anyhow::Result<(wgpu::Device, wgpu::Queue, bool, TextureFormat)> {
         let dual_source_blending = adapter
             .features()
-            .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
+            .contains(wgpu::Features::DUAL_SOURCE_BLENDING)
+            // Adreno GLES advertises dual-source blending but drops text draws.
+            // Keep the Android GL fallback on grayscale glyphs.
+            && !(cfg!(target_os = "android") && adapter.get_info().backend == wgpu::Backend::Gl);
 
         let mut required_features = wgpu::Features::empty();
+        required_features |= adapter.features() & wgpu::Features::PIPELINE_CACHE;
         if dual_source_blending {
             required_features |= wgpu::Features::DUAL_SOURCE_BLENDING;
         } else {
@@ -351,8 +383,23 @@ impl WgpuContext {
 
     #[cfg(not(target_family = "wasm"))]
     pub fn instance(display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) -> wgpu::Instance {
+        Self::instance_with_backends(display, wgpu::Backends::VULKAN | wgpu::Backends::GL)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn instance_with_backends(
+        display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>,
+        backends: wgpu::Backends,
+    ) -> wgpu::Instance {
+        // Android's display handle is global. Retaining the window here would
+        // keep its ANativeWindow alive across TerminateWindow.
+        #[cfg(target_os = "android")]
+        let display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle> = {
+            drop(display);
+            Box::new(AndroidDisplaySource)
+        };
         wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            backends,
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
@@ -394,7 +441,9 @@ impl WgpuContext {
         bool,
         TextureFormat,
     )> {
+        let mut startup = StartupProfile::new("gpui_adapter_select");
         let mut adapters: Vec<_> = instance.enumerate_adapters(wgpu::Backends::all()).await;
+        startup.mark("enumerate");
 
         if adapters.is_empty() {
             anyhow::bail!("No GPU adapters found");
@@ -491,7 +540,7 @@ impl WgpuContext {
             match Self::try_adapter_with_surface(&adapter, surface).await {
                 Ok((device, queue, dual_source_blending, color_atlas_texture_format)) => {
                     log::info!(
-                        "Selected GPU (passed configuration test): {} ({:?})",
+                        "Selected GPU candidate: {} ({:?})",
                         info.name,
                         info.backend
                     );
@@ -520,10 +569,8 @@ impl WgpuContext {
     /// Try to use an adapter with a surface by creating a device and testing configuration.
     /// Returns the device and queue if successful, allowing them to be reused.
     #[cfg(not(target_family = "wasm"))]
-    async fn try_adapter_with_surface(
-        adapter: &wgpu::Adapter,
-        surface: &wgpu::Surface<'_>,
-    ) -> anyhow::Result<(wgpu::Device, wgpu::Queue, bool, TextureFormat)> {
+    async fn try_adapter_with_surface(adapter: &wgpu::Adapter, surface: &wgpu::Surface<'_>) -> anyhow::Result<(wgpu::Device, wgpu::Queue, bool, TextureFormat)> {
+        let mut startup = StartupProfile::new("gpui_adapter_probe");
         let caps = surface.get_capabilities(adapter);
         if caps.formats.is_empty() {
             anyhow::bail!("no compatible surface formats");
@@ -531,35 +578,38 @@ impl WgpuContext {
         if caps.alpha_modes.is_empty() {
             anyhow::bail!("no compatible alpha modes");
         }
+        startup.mark("capabilities");
 
-        let (device, queue, dual_source_blending, color_atlas_texture_format) =
-            Self::create_device(adapter).await?;
-        let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let (device, queue, dual_source_blending, color_atlas_texture_format) = Self::create_device(adapter).await?;
+        startup.mark("device");
+        #[cfg(not(target_os = "android"))]
+        {
+            let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
 
-        let test_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: caps.formats[0],
-            width: 64,
-            height: 64,
-            present_mode: wgpu::PresentMode::Fifo,
-            desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
-        };
+            let test_config = wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format: caps.formats[0],
+                width: 64,
+                height: 64,
+                present_mode: wgpu::PresentMode::Fifo,
+                desired_maximum_frame_latency: 2,
+                alpha_mode: caps.alpha_modes[0],
+                view_formats: vec![],
+            };
 
-        surface.configure(&device, &test_config);
+            surface.configure(&device, &test_config);
+            startup.mark("test_surface_configure");
 
-        let error = error_scope.pop().await;
-        if let Some(e) = error {
-            anyhow::bail!("surface configuration failed: {e}");
+            let error = error_scope.pop().await;
+            startup.mark("validation");
+            if let Some(e) = error {
+                anyhow::bail!("surface configuration failed: {e}");
+            }
         }
+        #[cfg(target_os = "android")]
+        startup.mark("test_surface_skipped");
 
-        Ok((
-            device,
-            queue,
-            dual_source_blending,
-            color_atlas_texture_format,
-        ))
+        Ok((device, queue, dual_source_blending, color_atlas_texture_format))
     }
 
     fn select_color_texture_format(adapter: &wgpu::Adapter) -> anyhow::Result<wgpu::TextureFormat> {

@@ -61,7 +61,7 @@ impl MouseButtonCode {
     fn from_scroll(e: &ScrollWheelEvent) -> Self {
         let is_positive = match e.delta {
             gpui::ScrollDelta::Pixels(pixels) => pixels.y > px(0.),
-            gpui::ScrollDelta::Lines(lines) => lines.y > 0.,
+            gpui::ScrollDelta::Lines(lines) | gpui::ScrollDelta::Pages(lines) => lines.y > 0.,
         };
 
         if is_positive {

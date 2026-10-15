@@ -17,6 +17,8 @@ use std::{
 };
 
 mod actions;
+pub mod startup;
+pub mod input_frame;
 #[cfg(feature = "profiler")]
 pub mod hang;
 #[cfg(feature = "profiler")]

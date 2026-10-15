@@ -3,11 +3,12 @@ use x11rb::connection::RequestConnection;
 
 use crate::linux::X11ClientStatePtr;
 use gpui::{
-    AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, Size,
-    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowDecorations, WindowKind, WindowParams, popup::PopupNotSupportedError, px,
+    AnyWindowHandle, Bounds, Decorations, DevicePixels, ExternalDragPayload, ForegroundExecutor,
+    GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+    ResizeEdge, ScaledPixels, Scene, Size, Tiling, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowDecorations, WindowKind, WindowParams,
+    popup::PopupNotSupportedError, px,
 };
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
 
@@ -1788,6 +1789,20 @@ impl PlatformWindow for X11Window {
     fn start_window_move(&self) {
         const MOVERESIZE_MOVE: u32 = 8;
         self.send_moveresize(MOVERESIZE_MOVE).log_err();
+    }
+
+    fn can_start_external_drag(&self) -> bool {
+        true
+    }
+
+    fn start_external_drag(&self, payload: &ExternalDragPayload) -> bool {
+        let ExternalDragPayload::Application(drag) = payload else {
+            return false;
+        };
+        let Some(client) = self.0.state.borrow().client.get_client() else {
+            return false;
+        };
+        client.start_application_drag(self.0.clone(), *drag)
     }
 
     fn start_window_resize(&self, edge: ResizeEdge) {

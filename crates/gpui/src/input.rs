@@ -83,7 +83,7 @@ pub trait EntityInputHandler: 'static + Sized {
     /// See [`InputHandler::set_selected_text_range`] for details
     fn set_selected_text_range(
         &mut self,
-        _range_utf16: Range<usize>,
+        _selection_utf16: UTF16Selection,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
@@ -217,12 +217,12 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
 
     fn set_selected_text_range(
         &mut self,
-        range_utf16: Range<usize>,
+        selection_utf16: UTF16Selection,
         window: &mut Window,
         cx: &mut App,
     ) {
         self.view.update(cx, |view, cx| {
-            view.set_selected_text_range(range_utf16, window, cx)
+            view.set_selected_text_range(selection_utf16, window, cx)
         })
     }
 

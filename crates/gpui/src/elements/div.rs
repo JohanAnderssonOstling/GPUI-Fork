@@ -20,11 +20,11 @@ use crate::{
     Display, Element, ElementId, Entity, EntityId, ExternalDragPayload, ExternalDragPayloadSource,
     FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId,
     IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent,
-    LayoutId, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
-    MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, ParentElement,
-    PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
-    StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
-    size,
+    LayoutId, LongPressEvent, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent,
+    MouseExitEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow,
+    PageScrollAnimation, ParentElement, PinchEvent, Pixels, Point, Render, ScrollDelta,
+    ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task, TooltipId,
+    TouchEvent, TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -131,6 +131,46 @@ impl Interactivity {
                     && hitbox.is_hovered(window)
                 {
                     (listener)(event, window, cx)
+                }
+            }));
+    }
+
+    /// Handle a touch long press explicitly during the bubble phase.
+    pub fn on_long_press(
+        &mut self,
+        listener: impl Fn(&LongPressEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.long_press_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Bubble && hitbox.is_under_pointer(window) {
+                    listener(event, window, cx);
+                }
+            }));
+    }
+
+    /// Handle a touch long press explicitly during the capture phase.
+    pub fn capture_long_press(
+        &mut self,
+        listener: impl Fn(&LongPressEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.long_press_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Capture && hitbox.is_under_pointer(window) {
+                    listener(event, window, cx);
+                }
+            }));
+    }
+
+    /// Capture raw touch events, including movement/release outside the
+    /// element. The listener must identify and claim its own contacts.
+    pub fn capture_any_touch(
+        &mut self,
+        listener: impl Fn(&TouchEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.touch_listeners
+            .push(Box::new(move |event, phase, window, cx| {
+                if phase == DispatchPhase::Capture {
+                    listener(event, window, cx);
                 }
             }));
     }
@@ -341,6 +381,7 @@ impl Interactivity {
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Capture
                     && let Some(drag) = &cx.active_drag
+                    && drag.window == window.window_handle().window_id()
                     && drag.value.as_ref().type_id() == TypeId::of::<T>()
                 {
                     (listener)(
@@ -853,6 +894,34 @@ pub trait InteractiveElement: Sized {
     /// This is a noop in release builds
     #[inline]
     fn debug_selector(self, _: impl FnOnce() -> String) -> Self {
+        self
+    }
+
+    /// Handle a touch long press explicitly during the bubble phase.
+    fn on_long_press(
+        mut self,
+        listener: impl Fn(&LongPressEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().on_long_press(listener);
+        self
+    }
+
+    /// Handle a touch long press explicitly during the capture phase.
+    fn capture_long_press(
+        mut self,
+        listener: impl Fn(&LongPressEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().capture_long_press(listener);
+        self
+    }
+
+    /// Capture raw touch events globally so a claimed drag can finish
+    /// outside the element. Use `prevent_default` to suppress platform gestures.
+    fn capture_any_touch(
+        mut self,
+        listener: impl Fn(&TouchEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().capture_any_touch(listener);
         self
     }
 
@@ -1637,6 +1706,10 @@ pub trait StatefulInteractiveElement: InteractiveElement {
 
 pub(crate) type MouseDownListener =
     Box<dyn Fn(&MouseDownEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
+pub(crate) type TouchListener =
+    Box<dyn Fn(&TouchEvent, DispatchPhase, &mut Window, &mut App) + 'static>;
+pub(crate) type LongPressListener =
+    Box<dyn Fn(&LongPressEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
 pub(crate) type MouseUpListener =
     Box<dyn Fn(&MouseUpEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
 pub(crate) type MousePressureListener =
@@ -2038,6 +2111,7 @@ pub struct Interactivity {
     pub(crate) tracked_scroll_handle: Option<ScrollHandle>,
     pub(crate) scroll_anchor: Option<ScrollAnchor>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    page_scroll_animation: Option<Rc<RefCell<Option<PageScrollAnimation>>>>,
     pub(crate) ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
@@ -2056,6 +2130,8 @@ pub struct Interactivity {
     )>,
     pub(crate) group_drag_over_styles: Vec<(TypeId, GroupStyle)>,
     pub(crate) mouse_down_listeners: Vec<MouseDownListener>,
+    pub(crate) long_press_listeners: Vec<LongPressListener>,
+    pub(crate) touch_listeners: Vec<TouchListener>,
     pub(crate) mouse_up_listeners: Vec<MouseUpListener>,
     pub(crate) mouse_pressure_listeners: Vec<MousePressureListener>,
     pub(crate) mouse_move_listeners: Vec<MouseMoveListener>,
@@ -2162,6 +2238,8 @@ impl Interactivity {
                 if let Some(scroll_handle) = self.tracked_scroll_handle.as_ref() {
                     let scroll_handle_state = scroll_handle.0.borrow();
                     self.scroll_offset = Some(scroll_handle_state.offset.clone());
+                    self.page_scroll_animation =
+                        Some(scroll_handle_state.page_scroll_animation.clone());
                     self.ongoing_scroll = Some(scroll_handle_state.ongoing_scroll.clone());
                 } else if (self.base_style.overflow.x == Some(Overflow::Scroll)
                     || self.base_style.overflow.y == Some(Overflow::Scroll))
@@ -2170,6 +2248,12 @@ impl Interactivity {
                     self.scroll_offset = Some(
                         element_state
                             .scroll_offset
+                            .get_or_insert_with(Rc::default)
+                            .clone(),
+                    );
+                    self.page_scroll_animation = Some(
+                        element_state
+                            .page_scroll_animation
                             .get_or_insert_with(Rc::default)
                             .clone(),
                     );
@@ -2304,6 +2388,8 @@ impl Interactivity {
             || !self.mouse_up_listeners.is_empty()
             || !self.mouse_pressure_listeners.is_empty()
             || !self.mouse_down_listeners.is_empty()
+            || !self.long_press_listeners.is_empty()
+            || !self.touch_listeners.is_empty()
             || !self.mouse_move_listeners.is_empty()
             || !self.mouse_exit_listeners.is_empty()
             || !self.click_listeners.is_empty()
@@ -2317,18 +2403,25 @@ impl Interactivity {
             || window.is_inspector_picking(cx)
     }
 
+    fn scroll_max(&self, bounds: Bounds<Pixels>, style: &Style, window: &Window) -> Point<Pixels> {
+        let padding = style
+            .padding
+            .to_pixels(bounds.size.into(), window.rem_size());
+        let padded_size =
+            self.content_size + size(padding.left + padding.right, padding.top + padding.bottom);
+        // Match Taffy's precision so subpixel rounding cannot create overflow.
+        Point::from(padded_size - bounds.size)
+            .map(|pixels| (pixels * 100.0).round() / 100.0)
+            .max(&Default::default())
+    }
+
     fn clamp_scroll_position(
         &self,
         bounds: Bounds<Pixels>,
         style: &Style,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Point<Pixels> {
-        fn round_to_two_decimals(pixels: Pixels) -> Pixels {
-            const ROUNDING_FACTOR: f32 = 100.0;
-            (pixels * ROUNDING_FACTOR).round() / ROUNDING_FACTOR
-        }
-
         if let Some(scroll_offset) = self.scroll_offset.as_ref() {
             let mut scroll_to_bottom = false;
             let mut tracked_scroll_handle = self
@@ -2340,22 +2433,27 @@ impl Interactivity {
                 scroll_to_bottom = mem::take(&mut scroll_handle_state.scroll_to_bottom);
             }
 
-            let rem_size = window.rem_size();
-            let padding = style.padding.to_pixels(bounds.size.into(), rem_size);
-            let padding_size = size(padding.left + padding.right, padding.top + padding.bottom);
-            // The floating point values produced by Taffy and ours often vary
-            // slightly after ~5 decimal places. This can lead to cases where after
-            // subtracting these, the container becomes scrollable for less than
-            // 0.00000x pixels. As we generally don't benefit from a precision that
-            // high for the maximum scroll, we round the scroll max to 2 decimal
-            // places here.
-            let padded_content_size = self.content_size + padding_size;
-            let scroll_max = Point::from(padded_content_size - bounds.size)
-                .map(round_to_two_decimals)
-                .max(&Default::default());
+            let scroll_max = self.scroll_max(bounds, style, window);
             // Clamp scroll offset in case scroll max is smaller now (e.g., if children
             // were removed or the bounds became larger).
             let mut scroll_offset = scroll_offset.borrow_mut();
+            if let Some(animation) = self.page_scroll_animation.as_ref() {
+                let mut animation = animation.borrow_mut();
+                if let Some(active) = animation.as_mut() {
+                    // Direct scrolling, scrollbars, and layout changes supersede a pan.
+                    if active.last_offset != *scroll_offset || scroll_to_bottom {
+                        *animation = None;
+                    } else {
+                        let (offset, finished) = active.advance(cx.reduce_motion());
+                        *scroll_offset = offset;
+                        if finished {
+                            *animation = None;
+                        } else {
+                            window.request_animation_frame();
+                        }
+                    }
+                }
+            }
 
             scroll_offset.x = scroll_offset.x.clamp(-scroll_max.x, px(0.));
             if scroll_to_bottom {
@@ -2453,7 +2551,8 @@ impl Interactivity {
                                                     }
                                                 } else {
                                                     if let Some(mouse_cursor) = style.mouse_cursor {
-                                                        window.set_cursor_style(mouse_cursor, hitbox);
+                                                        window
+                                                            .set_cursor_style(mouse_cursor, hitbox);
                                                     }
                                                 }
 
@@ -2499,7 +2598,10 @@ impl Interactivity {
                                             f(&style, window, cx);
 
                                             if let Some(_hitbox) = hitbox {
-                                                #[cfg(any(feature = "inspector", debug_assertions))]
+                                                #[cfg(any(
+                                                    feature = "inspector",
+                                                    debug_assertions
+                                                ))]
                                                 window.insert_inspector_hitbox(
                                                     _hitbox.id,
                                                     _inspector_id,
@@ -2678,6 +2780,17 @@ impl Interactivity {
             })
         }
 
+        for listener in self.touch_listeners.drain(..) {
+            window.on_touch(move |event, phase, window, cx| listener(event, phase, window, cx));
+        }
+
+        for listener in self.long_press_listeners.drain(..) {
+            let hitbox = hitbox.clone();
+            window.on_long_press(move |event, phase, window, cx| {
+                listener(event, phase, &hitbox, window, cx)
+            });
+        }
+
         for listener in self.mouse_up_listeners.drain(..) {
             let hitbox = hitbox.clone();
             window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
@@ -2783,6 +2896,7 @@ impl Interactivity {
             window.on_mouse_event({
                 move |_: &MouseUpEvent, phase, window, cx| {
                     if let Some(drag) = &cx.active_drag
+                        && drag.window == window.window_handle().window_id()
                         && phase == DispatchPhase::Bubble
                         && hitbox.is_hovered(window)
                     {
@@ -2878,6 +2992,7 @@ impl Interactivity {
                                         as ExternalDragPayloadSource
                                 });
                             cx.active_drag = Some(AnyDrag {
+                                window: window.window_handle().window_id(),
                                 view: drag,
                                 value: listener.value,
                                 cursor_offset,
@@ -3201,17 +3316,50 @@ impl Interactivity {
     ) {
         if let Some(scroll_offset) = self.scroll_offset.clone() {
             let ongoing_scroll = self.ongoing_scroll.clone();
+            let page_scroll_animation = self.page_scroll_animation.clone();
             let overflow = style.overflow;
             let allow_concurrent_scroll = style.allow_concurrent_scroll;
             let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
             let line_height = window.line_height();
+            let scroll_max = self.scroll_max(hitbox.bounds, style, window);
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     let mut scroll_offset = scroll_offset.borrow_mut();
+                    let paging = matches!(event.delta, ScrollDelta::Pages(_));
+                    if paging {
+                        scroll_offset.x = scroll_offset.x.clamp(-scroll_max.x, Pixels::ZERO);
+                        scroll_offset.y = scroll_offset.y.clamp(-scroll_max.y, Pixels::ZERO);
+                    }
                     let old_scroll_offset = *scroll_offset;
-                    let mut delta = event.delta.pixel_delta(line_height);
+                    let pending_target = page_scroll_animation.as_ref().and_then(|animation| {
+                        animation
+                            .borrow()
+                            .as_ref()
+                            .filter(|active| active.last_offset == old_scroll_offset)
+                            .map(|active| active.target)
+                    });
+                    let swipe = window.is_page_scroll_swipe();
+                    let page_origin = ongoing_scroll.as_ref().and_then(|ongoing| {
+                        let mut ongoing = ongoing.borrow_mut();
+                        if event.touch_phase == TouchPhase::Started {
+                            ongoing.page_origin = None;
+                        }
+                        if paging {
+                            ongoing.page_origin.take()
+                        } else {
+                            ongoing.page_origin
+                        }
+                    });
+                    if paging {
+                        *scroll_offset = page_origin.or(pending_target).unwrap_or(old_scroll_offset);
+                    } else if let Some(animation) = page_scroll_animation.as_ref() {
+                        *animation.borrow_mut() = None;
+                    }
+                    let mut delta = event
+                        .delta
+                        .pixel_delta_for_viewport(line_height, hitbox.bounds.size);
 
                     if restrict_scroll_to_axis
                         && event.delta.precise()
@@ -3227,7 +3375,10 @@ impl Interactivity {
                         Overflow::Scroll
                             if !restrict_scroll_to_axis && overflow.y != Overflow::Scroll =>
                         {
-                            delta.y
+                            match event.delta {
+                                ScrollDelta::Pages(pages) => hitbox.bounds.size.width * pages.y,
+                                _ => delta.y,
+                            }
                         }
                         _ => Pixels::ZERO,
                     };
@@ -3236,7 +3387,10 @@ impl Interactivity {
                         Overflow::Scroll
                             if !restrict_scroll_to_axis && overflow.x != Overflow::Scroll =>
                         {
-                            delta.x
+                            match event.delta {
+                                ScrollDelta::Pages(pages) => hitbox.bounds.size.height * pages.x,
+                                _ => delta.x,
+                            }
                         }
                         _ => Pixels::ZERO,
                     };
@@ -3249,8 +3403,44 @@ impl Interactivity {
                     }
                     scroll_offset.y += delta_y;
                     scroll_offset.x += delta_x;
-                    if *scroll_offset != old_scroll_offset {
+                    if paging {
+                        scroll_offset.x = scroll_offset.x.clamp(-scroll_max.x, Pixels::ZERO);
+                        scroll_offset.y = scroll_offset.y.clamp(-scroll_max.y, Pixels::ZERO);
+                    }
+                    if swipe {
+                        let origin = page_origin.unwrap_or(old_scroll_offset);
+                        scroll_offset.x = scroll_offset.x
+                            .clamp(origin.x - hitbox.bounds.size.width, origin.x + hitbox.bounds.size.width)
+                            .clamp(-scroll_max.x, Pixels::ZERO);
+                        scroll_offset.y = scroll_offset.y
+                            .clamp(origin.y - hitbox.bounds.size.height, origin.y + hitbox.bounds.size.height)
+                            .clamp(-scroll_max.y, Pixels::ZERO);
+                        if *scroll_offset != old_scroll_offset {
+                            if let Some(ongoing) = &ongoing_scroll {
+                                ongoing.borrow_mut().page_origin.get_or_insert(old_scroll_offset);
+                            }
+                        }
+                    }
+                    let target = *scroll_offset;
+                    if paging
+                        && !cx.reduce_motion()
+                        && let Some(animation) = page_scroll_animation.as_ref()
+                    {
+                        if pending_target != Some(target) {
+                            *animation.borrow_mut() = (target != old_scroll_offset)
+                                .then(|| if page_origin.is_some() { PageScrollAnimation::touch(old_scroll_offset, target, hitbox.bounds.size) } else { PageScrollAnimation::new(old_scroll_offset, target) });
+                        }
+                        *scroll_offset = old_scroll_offset;
+                    }
+                    if target != old_scroll_offset
+                        || (paging && pending_target.is_some_and(|pending| pending != target))
+                    {
                         cx.notify(current_view);
+                    }
+                    // Keep an owned drag on the same surface, including a
+                    // release which settles exactly where the preview ended.
+                    if page_origin.is_some() || ((paging || swipe) && target != old_scroll_offset) {
+                        cx.stop_propagation();
                     }
                 }
             });
@@ -3345,7 +3535,12 @@ impl Interactivity {
         }
 
         if let Some(hitbox) = hitbox {
-            if let Some(drag) = cx.active_drag.take() {
+            if cx
+                .active_drag
+                .as_ref()
+                .is_some_and(|drag| drag.window == window.window_handle().window_id())
+                && let Some(drag) = cx.active_drag.take()
+            {
                 let mut can_drop = true;
                 if let Some(can_drop_predicate) = &self.can_drop_predicate {
                     can_drop = can_drop_predicate(drag.value.as_ref(), window, cx);
@@ -3490,6 +3685,7 @@ pub struct InteractiveElementState {
     /// blur). `None` means no activation key is pending.
     pub(crate) pending_keyboard_down: Option<Rc<RefCell<Option<u64>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    page_scroll_animation: Option<Rc<RefCell<Option<PageScrollAnimation>>>>,
     ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
 }
@@ -4026,6 +4222,7 @@ impl ScrollAnchor {
 #[derive(Default, Debug)]
 struct ScrollHandleState {
     offset: Rc<RefCell<Point<Pixels>>>,
+    page_scroll_animation: Rc<RefCell<Option<PageScrollAnimation>>>,
     ongoing_scroll: Rc<RefCell<OngoingScroll>>,
     bounds: Bounds<Pixels>,
     max_offset: Point<Pixels>,
@@ -4205,7 +4402,49 @@ impl ScrollHandle {
     /// As you scroll further down the offset becomes more negative.
     pub fn set_offset(&self, mut position: Point<Pixels>) {
         let state = self.0.borrow();
+        *state.page_scroll_animation.borrow_mut() = None;
         *state.offset.borrow_mut() = position;
+    }
+
+    /// Pan by complete viewports with a 140 ms ease-in-out transition.
+    /// Platforms with reduced motion apply the destination immediately.
+    /// Returns whether the request was consumed by this scroll surface.
+    pub fn scroll_by_page(&self, pages: Point<f32>, window: &mut Window, cx: &mut App) -> bool {
+        if !pages.x.is_finite() || !pages.y.is_finite() {
+            return false;
+        }
+        let state = self.0.borrow();
+        let current = *state.offset.borrow();
+        let mut animation = state.page_scroll_animation.borrow_mut();
+        if animation
+            .as_ref()
+            .is_some_and(|active| active.last_offset != current)
+        {
+            *animation = None;
+        }
+        let base = animation.as_ref().map_or(current, |active| active.target);
+        let target = point(
+            (base.x + state.bounds.size.width * pages.x).clamp(-state.max_offset.x, Pixels::ZERO),
+            (base.y + state.bounds.size.height * pages.y).clamp(-state.max_offset.y, Pixels::ZERO),
+        );
+        if target == base && animation.is_some() {
+            return true;
+        }
+        let consumed = target != base || animation.is_some();
+        *animation = None;
+        if target == current {
+            if consumed {
+                window.refresh();
+            }
+            return consumed;
+        }
+        if cx.reduce_motion() {
+            *state.offset.borrow_mut() = target;
+        } else {
+            *animation = Some(PageScrollAnimation::new(current, target));
+        }
+        window.refresh();
+        true
     }
 
     /// Get the logical scroll top, based on a child index and a pixel offset.
@@ -4249,9 +4488,136 @@ mod tests {
     use super::*;
     use crate::{
         AnyWindowHandle, AppContext as _, Context, InputEvent, Keystroke, MouseMoveEvent,
-        TestAppContext, canvas, util::FluentBuilder as _,
+        PlatformInput, TestAppContext, TouchId, TouchPhase, canvas, util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Weak};
+
+    struct LongPressTestView {
+        events: Rc<RefCell<Vec<&'static str>>>,
+        stop_capture: bool,
+    }
+
+    impl Render for LongPressTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let capture = self.events.clone();
+            let hold = self.events.clone();
+            let right = self.events.clone();
+            let aux = self.events.clone();
+            let click = self.events.clone();
+            let stop = self.stop_capture;
+            div()
+                .size_full()
+                .capture_long_press(move |_, _, cx| {
+                    capture.borrow_mut().push("capture");
+                    if stop {
+                        cx.stop_propagation();
+                    }
+                })
+                .child(
+                    div()
+                        .id("long-press-target")
+                        .m(px(20.0))
+                        .size(px(50.0))
+                        .on_long_press(move |_, _, _| hold.borrow_mut().push("hold"))
+                        .on_mouse_down(MouseButton::Right, move |_, _, _| {
+                            right.borrow_mut().push("right")
+                        })
+                        .on_aux_click(move |_, _, _| aux.borrow_mut().push("aux"))
+                        .on_click(move |_, _, _| click.borrow_mut().push("click")),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn explicit_long_press_dispatches_without_mouse_clicks_and_obeys_capture(
+        cx: &mut TestAppContext,
+    ) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let recorded = events.clone();
+        let (view, cx) = cx.add_window_view(|_, _| LongPressTestView {
+            events: recorded,
+            stop_capture: false,
+        });
+        cx.simulate_event(LongPressEvent {
+            id: TouchId(7),
+            position: point(px(30.0), px(30.0)),
+        });
+        assert_eq!(*events.borrow(), vec!["capture", "hold"]);
+        events.borrow_mut().clear();
+        view.update(cx, |view, cx| {
+            view.stop_capture = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_event(LongPressEvent {
+            id: TouchId(8),
+            position: point(px(30.0), px(30.0)),
+        });
+        assert_eq!(*events.borrow(), vec!["capture"]);
+        events.borrow_mut().clear();
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Right,
+            position: point(px(30.0), px(30.0)),
+            click_count: 1,
+            ..Default::default()
+        });
+        cx.simulate_event(MouseUpEvent {
+            button: MouseButton::Right,
+            position: point(px(30.0), px(30.0)),
+            click_count: 1,
+            ..Default::default()
+        });
+        assert_eq!(*events.borrow(), vec!["right", "aux"]);
+    }
+
+    struct TouchCaptureTestView {
+        events: Rc<RefCell<Vec<TouchPhase>>>,
+    }
+
+    impl Render for TouchCaptureTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let events = self.events.clone();
+            div()
+                .size(px(50.0))
+                .capture_any_touch(move |event, window, cx| {
+                    if event.id == TouchId(42) {
+                        events.borrow_mut().push(event.phase);
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    }
+                })
+        }
+    }
+
+    #[gpui::test]
+    fn raw_touch_capture_can_claim_a_drag_and_finish_outside_the_element(cx: &mut TestAppContext) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let recorded = events.clone();
+        let (_, cx) = cx.add_window_view(|_, _| TouchCaptureTestView { events: recorded });
+        for (phase, position) in [
+            (TouchPhase::Started, point(px(10.0), px(10.0))),
+            (TouchPhase::Moved, point(px(200.0), px(200.0))),
+            (TouchPhase::Ended, point(px(200.0), px(200.0))),
+        ] {
+            let result = cx.update(|window, cx| {
+                window.dispatch_event(
+                    PlatformInput::Touch(TouchEvent {
+                        id: TouchId(42),
+                        phase,
+                        position,
+                        force: None,
+                    }),
+                    cx,
+                )
+            });
+            assert!(result.default_prevented);
+            assert!(!result.propagate);
+        }
+        assert_eq!(
+            *events.borrow(),
+            vec![TouchPhase::Started, TouchPhase::Moved, TouchPhase::Ended]
+        );
+    }
 
     struct GroupHoverTestView {
         render_count: Rc<Cell<usize>>,

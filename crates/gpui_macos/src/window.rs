@@ -24,13 +24,13 @@ use cocoa::{
 };
 use dispatch2::DispatchQueue;
 use gpui::{
-    AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
-    ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, KeyLocation, Keystroke,
-    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
-    WindowParams, point, px, size,
+    AnyWindowHandle, ApplicationDrag, BackgroundExecutor, Bounds, Capslock, CursorStyle,
+    ExternalDragPayload, ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent,
+    KeyLocation, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+    SharedString, Size, SystemWindowTab, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowKind, WindowParams, point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -75,6 +75,7 @@ use std::{
 };
 
 const WINDOW_STATE_IVAR: &str = "windowState";
+const APPLICATION_DRAG_TYPE: &str = "org.gpui.application-drag";
 
 static mut WINDOW_CLASS: *const Class = ptr::null();
 static mut PANEL_CLASS: *const Class = ptr::null();
@@ -999,7 +1000,7 @@ impl MacWindow {
             let () = msg_send![
                 native_window,
                 registerForDraggedTypes:
-                    NSArray::arrayWithObject(nil, NSFilenamesPboardType)
+                    NSArray::arrayWithObjects(nil, &[NSFilenamesPboardType, ns_string(APPLICATION_DRAG_TYPE)])
             ];
             let () = msg_send![
                 native_window,
@@ -2011,8 +2012,7 @@ impl PlatformWindow for MacWindow {
     }
 
     fn start_external_drag(&self, payload: &ExternalDragPayload) -> bool {
-        let ExternalDragPayload::Files(paths) = payload;
-        if paths.entries().is_empty() {
+        if matches!(payload, ExternalDragPayload::Files(paths) if paths.entries().is_empty()) {
             log::warn!("start_external_drag declined: no paths");
             return false;
         }
@@ -2047,7 +2047,27 @@ impl PlatformWindow for MacWindow {
                 NSSize::new(32., 32.),
             );
 
-            for (path, is_directory) in paths.entries() {
+            if let ExternalDragPayload::Application(drag) = payload {
+                let writer: id = msg_send![class!(NSPasteboardItem), new];
+                let _: BOOL = msg_send![writer, setString: ns_string(&drag.mime_type()) forType: ns_string(APPLICATION_DRAG_TYPE)];
+                let item: id = msg_send![class!(NSDraggingItem), alloc];
+                let item: id = msg_send![item, initWithPasteboardWriter: writer];
+                let _: () = msg_send![writer, release];
+                if item.is_null() {
+                    return false;
+                }
+                let image: id = msg_send![class!(NSImage), alloc];
+                let image: id = msg_send![image, initWithSize: NSSize::new(32., 32.)];
+                let _: () = msg_send![item, setDraggingFrame: frame contents: image];
+                let _: () = msg_send![image, release];
+                let _: () = msg_send![dragging_items, addObject: item];
+                let _: () = msg_send![item, release];
+            }
+            let file_entries = match payload {
+                ExternalDragPayload::Files(paths) => paths.entries(),
+                ExternalDragPayload::Application(_) => &[],
+            };
+            for (path, is_directory) in file_entries {
                 // Preserve non-UTF-8 paths
                 let Ok(path_bytes) = CString::new(path.as_os_str().as_bytes()) else {
                     log::warn!("start_external_drag skipped path containing an interior nul byte");
@@ -3243,8 +3263,25 @@ extern "C" fn dragging_entered(this: &Object, _: Sel, dragging_info: id) -> NSDr
     let is_source_window = is_drag_from_this_window(this, dragging_info);
     let window_state = unsafe { get_window_state(this) };
     let position = drag_event_position(&window_state, dragging_info);
-    let paths = external_paths_from_event(dragging_info);
-    if let Some(event) = paths.map(|paths| FileDropEvent::Entered { position, paths })
+    let pasteboard: id = unsafe { msg_send![dragging_info, draggingPasteboard] };
+    let identifier: id =
+        unsafe { msg_send![pasteboard, stringForType: ns_string(APPLICATION_DRAG_TYPE)] };
+    let application = if identifier.is_null() {
+        None
+    } else {
+        let identifier = unsafe { CStr::from_ptr(NSString::UTF8String(identifier)) };
+        identifier
+            .to_str()
+            .ok()
+            .and_then(ApplicationDrag::from_mime_type)
+    };
+    let event = application
+        .map(|drag| FileDropEvent::ApplicationEntered { position, drag })
+        .or_else(|| {
+            external_paths_from_event(dragging_info)
+                .map(|paths| FileDropEvent::Entered { position, paths })
+        });
+    if let Some(event) = event
         && send_file_drop_event(window_state, event)
     {
         if is_source_window {
@@ -3371,7 +3408,7 @@ fn send_file_drop_event(
     file_drop_event: FileDropEvent,
 ) -> bool {
     let external_files_dragged = match file_drop_event {
-        FileDropEvent::Entered { .. } => Some(true),
+        FileDropEvent::Entered { .. } | FileDropEvent::ApplicationEntered { .. } => Some(true),
         FileDropEvent::Exited | FileDropEvent::Ended => Some(false),
         _ => None,
     };

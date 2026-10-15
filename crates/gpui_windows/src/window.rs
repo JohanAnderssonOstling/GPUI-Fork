@@ -21,7 +21,15 @@ use windows::{
         Graphics::Dwm::*,
         Graphics::Gdi::*,
         System::{
-            Com::*, Diagnostics::Debug::MessageBeep, LibraryLoader::*, Ole::*, SystemServices::*,
+            Com::*,
+            DataExchange::RegisterClipboardFormatW,
+            Diagnostics::Debug::MessageBeep,
+            LibraryLoader::*,
+            Memory::{
+                GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+            },
+            Ole::*,
+            SystemServices::*,
         },
         UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     },
@@ -610,6 +618,43 @@ impl Drop for WindowsWindow {
 }
 
 impl PlatformWindow for WindowsWindow {
+    fn can_start_external_drag(&self) -> bool {
+        true
+    }
+
+    fn start_external_drag(&self, payload: &ExternalDragPayload) -> bool {
+        let ExternalDragPayload::Application(drag) = payload else {
+            return false;
+        };
+        let Some(data) = application_drag_data(*drag).log_err() else {
+            return false;
+        };
+        let window = self.0.clone();
+        // DoDragDrop runs a nested message loop. Start after the current GPUI update releases App.
+        self.executor
+            .spawn(async move {
+                let source: IDropSource = ApplicationDropSource.into();
+                let mut effect = DROPEFFECT_NONE;
+                unsafe {
+                    if GetCapture() == window.hwnd {
+                        ReleaseCapture().log_err();
+                    }
+                    DoDragDrop(
+                        &data,
+                        &source,
+                        DROPEFFECT_COPY | DROPEFFECT_MOVE,
+                        &mut effect,
+                    )
+                    .ok()
+                    .log_err();
+                }
+                WindowsDragDropHandler(window)
+                    .handle_drag_drop(PlatformInput::FileDrop(FileDropEvent::Ended));
+            })
+            .detach();
+        true
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.state.bounds()
     }
@@ -1088,6 +1133,97 @@ impl accesskit::ActionHandler for A11yActionHandler {
     }
 }
 
+fn application_drag_format() -> windows::core::Result<FORMATETC> {
+    let name = HSTRING::from(format!("GPUI application drag {}", std::process::id()));
+    let format = unsafe { RegisterClipboardFormatW(PCWSTR(name.as_ptr())) };
+    if format == 0 {
+        return Err(windows::core::Error::from_win32());
+    }
+    Ok(FORMATETC {
+        cfFormat: format as u16,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as u32,
+    })
+}
+
+fn application_drag_data(drag: ApplicationDrag) -> windows::core::Result<IDataObject> {
+    let format = application_drag_format()?;
+    let mut bytes = drag.mime_type().into_bytes();
+    bytes.push(0);
+    unsafe {
+        let data: IDataObject = SHCreateDataObject(None, None, None::<&IDataObject>)?;
+        let memory = Owned::new(GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes.len())?);
+        let pointer = GlobalLock(*memory);
+        if pointer.is_null() {
+            return Err(windows::core::Error::from_win32());
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.cast(), bytes.len());
+        // GlobalUnlock returns false on success when the lock count reaches zero.
+        GlobalUnlock(*memory).ok();
+        let medium = STGMEDIUM {
+            tymed: TYMED_HGLOBAL.0 as u32,
+            u: STGMEDIUM_0 { hGlobal: *memory },
+            pUnkForRelease: Default::default(),
+        };
+        data.SetData(&format, &medium, true)?;
+        std::mem::forget(memory);
+        Ok(data)
+    }
+}
+
+fn application_drag_from_data(data: &IDataObject) -> Option<ApplicationDrag> {
+    let format = application_drag_format().log_err()?;
+    unsafe {
+        if data.QueryGetData(&format) != S_OK {
+            return None;
+        }
+        let mut medium = data.GetData(&format).log_err()?;
+        let memory = medium.u.hGlobal;
+        let length = GlobalSize(memory);
+        let pointer = GlobalLock(memory);
+        let drag = if pointer.is_null() || length == 0 || length > 128 {
+            None
+        } else {
+            let bytes = std::slice::from_raw_parts(pointer.cast::<u8>(), length);
+            // GlobalAlloc may round up the allocation size.
+            let length = bytes
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(bytes.len());
+            std::str::from_utf8(&bytes[..length])
+                .ok()
+                .and_then(ApplicationDrag::from_mime_type)
+        };
+        if !pointer.is_null() {
+            GlobalUnlock(memory).ok();
+        }
+        ReleaseStgMedium(&mut medium);
+        drag
+    }
+}
+
+#[implement(IDropSource)]
+struct ApplicationDropSource;
+
+#[allow(non_snake_case)]
+impl IDropSource_Impl for ApplicationDropSource_Impl {
+    fn QueryContinueDrag(&self, escape: BOOL, keys: MODIFIERKEYS_FLAGS) -> HRESULT {
+        if escape.as_bool() {
+            DRAGDROP_S_CANCEL
+        } else if !keys.contains(MK_LBUTTON) {
+            DRAGDROP_S_DROP
+        } else {
+            S_OK
+        }
+    }
+
+    fn GiveFeedback(&self, _: DROPEFFECT) -> HRESULT {
+        DRAGDROP_S_USEDEFAULTCURSORS
+    }
+}
+
 #[implement(IDropTarget)]
 struct WindowsDragDropHandler(pub Rc<WindowsWindowInner>);
 
@@ -1119,7 +1255,19 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                 tymed: TYMED_HGLOBAL.0 as _,
             };
             let cursor_position = POINT { x: pt.x, y: pt.y };
-            if idata_obj.QueryGetData(&config as _) == S_OK {
+            if let Some(drag) = application_drag_from_data(idata_obj) {
+                *pdweffect = DROPEFFECT_COPY;
+                let mut position = cursor_position;
+                ScreenToClient(self.0.hwnd, &mut position).ok().log_err();
+                self.handle_drag_drop(PlatformInput::FileDrop(FileDropEvent::ApplicationEntered {
+                    position: logical_point(
+                        position.x as f32,
+                        position.y as f32,
+                        self.0.state.scale_factor.get(),
+                    ),
+                    drag,
+                }));
+            } else if idata_obj.QueryGetData(&config as _) == S_OK {
                 *pdweffect = DROPEFFECT_COPY;
                 let Some(mut idata) = idata_obj.GetData(&config as _).log_err() else {
                     return Ok(());

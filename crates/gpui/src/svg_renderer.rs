@@ -102,6 +102,16 @@ pub struct SvgRenderer {
 /// scales should retain this value to avoid re-paying the parse cost.
 pub struct ParsedSvg(usvg::Tree);
 
+impl ParsedSvg {
+    /// Serializes resolved SVG paint and geometry. Stylesheets, inherited
+    /// colors and fonts have been resolved, and text is represented as paths.
+    /// This lets callers adjust paint without changing font selection or
+    /// geometry; masks, filters and embedded images remain in the document.
+    pub fn to_svg(&self) -> String {
+        self.0.to_string(&usvg::WriteOptions::default())
+    }
+}
+
 /// The size in which to rasterize the SVG.
 #[derive(Clone, Copy)]
 pub enum SvgSize {
