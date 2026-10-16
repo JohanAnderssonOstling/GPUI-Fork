@@ -2,7 +2,8 @@ use anyhow::{Context as _, Ok, Result};
 use collections::HashMap;
 use cosmic_text::{
     Attrs, AttrsList, Ellipsize, Family, Font as CosmicTextFont,
-    FontFeatures as CosmicFontFeatures, FontSystem, ShapeBuffer, ShapeLine,
+    FontFeatures as CosmicFontFeatures, FontSystem, GlyphDecorationData,
+    LayoutLine as CosmicLayoutLine, ShapeBuffer, ShapeGlyph, ShapeLine, ShapeSpan, ShapeWord,
 };
 use gpui::{
     Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun, GlyphId,
@@ -14,12 +15,20 @@ use gpui::{
 use itertools::Itertools;
 use parking_lot::RwLock;
 use smallvec::SmallVec;
-use std::{borrow::Cow, ops::Range, sync::Arc};
+use std::{
+    borrow::Cow,
+    mem::{size_of, take},
+    ops::Range,
+    sync::Arc,
+};
 use swash::{
     scale::{Render, ScaleContext, Source, StrikeWith},
     zeno::{Format, Vector},
 };
 use unicode_segmentation::UnicodeSegmentation;
+
+const MAX_LAYOUT_SCRATCH_GLYPHS: usize = 4096;
+const MAX_SHAPE_SCRATCH_BYTES: usize = 256 * 1024;
 
 pub struct CosmicTextSystem(RwLock<CosmicTextSystemState>);
 
@@ -43,6 +52,8 @@ impl FontKey {
 struct CosmicTextSystemState {
     font_system: FontSystem,
     scratch: ShapeBuffer,
+    layout_lines: Vec<CosmicLayoutLine>,
+    shape_line: Option<ShapeLine>,
     swash_scale_context: ScaleContext,
     /// Contains all already loaded fonts, including all faces. Indexed by `FontId`.
     loaded_fonts: Vec<LoadedFont>,
@@ -68,6 +79,8 @@ impl CosmicTextSystem {
         Self(RwLock::new(CosmicTextSystemState {
             font_system,
             scratch: ShapeBuffer::default(),
+            layout_lines: Vec::new(),
+            shape_line: None,
             swash_scale_context: ScaleContext::new(),
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
@@ -84,6 +97,8 @@ impl CosmicTextSystem {
         Self(RwLock::new(CosmicTextSystemState {
             font_system,
             scratch: ShapeBuffer::default(),
+            layout_lines: Vec::new(),
+            shape_line: None,
             swash_scale_context: ScaleContext::new(),
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
@@ -570,22 +585,21 @@ impl CosmicTextSystemState {
                 continue;
             };
 
-            let primary_family_name: SharedString = first_family.0.clone().into();
+            let primary_family_name = &first_family.0;
             let primary_stretch = face.stretch;
             let primary_style = face.style;
             let primary_weight = face.weight;
-            let primary_features = loaded_font.features.clone();
             let fallback_chain = Arc::clone(&loaded_font.user_fallback_chain);
 
             // build one `Attrs` per slot up front. each clone of span attrs
             // would otherwise re-allocate the `font_features` Vec.
             let primary_attrs = Attrs::new()
                 .metadata(run.font_id.0)
-                .family(Family::Name(&primary_family_name))
+                .family(Family::Name(primary_family_name))
                 .stretch(primary_stretch)
                 .style(primary_style)
                 .weight(primary_weight)
-                .font_features(primary_features.clone());
+                .font_features(loaded_font.features.clone());
             let fallback_attrs: SmallVec<[Attrs<'_>; 4]> = fallback_chain
                 .iter()
                 .map(|(fb_id, fb_name)| {
@@ -595,7 +609,7 @@ impl CosmicTextSystemState {
                         .stretch(primary_stretch)
                         .style(primary_style)
                         .weight(primary_weight)
-                        .font_features(primary_features.clone())
+                        .font_features(loaded_font.features.clone())
                 })
                 .collect();
 
@@ -624,14 +638,27 @@ impl CosmicTextSystemState {
             offs = run_end;
         }
 
-        let line = ShapeLine::new(
-            &mut self.font_system,
-            text,
-            &attrs_list,
-            cosmic_text::Shaping::Advanced,
-            4,
-        );
-        let mut layout_lines = Vec::with_capacity(1);
+        let line = if let Some(mut line) = self.shape_line.take() {
+            line.build(
+                &mut self.font_system,
+                text,
+                &attrs_list,
+                cosmic_text::Shaping::Advanced,
+                4,
+            );
+            line
+        } else {
+            ShapeLine::new(
+                &mut self.font_system,
+                text,
+                &attrs_list,
+                cosmic_text::Shaping::Advanced,
+                4,
+            )
+        };
+        // Cosmic text drains the previous lines and reuses their glyph buffers.
+        // Taking the vector also permits font resolution while reading its output.
+        let mut layout_lines = take(&mut self.layout_lines);
         line.layout_to_buffer(
             &mut self.scratch,
             f32::from(font_size),
@@ -645,6 +672,7 @@ impl CosmicTextSystemState {
         );
 
         let Some(layout) = layout_lines.first() else {
+            self.retain_shaping_scratch(line, layout_lines);
             return LineLayout {
                 font_size,
                 width: Pixels::ZERO,
@@ -656,7 +684,7 @@ impl CosmicTextSystemState {
         };
 
         let mut runs: Vec<ShapedRun> = Vec::new();
-        for glyph in &layout.glyphs {
+        for (index, glyph) in layout.glyphs.iter().enumerate() {
             let mut font_id = FontId(glyph.metadata);
             let mut loaded_font = self.loaded_font(font_id);
             if loaded_font.font.id() != glyph.font_id {
@@ -694,22 +722,64 @@ impl CosmicTextSystemState {
             {
                 last_run.glyphs.push(shaped_glyph);
             } else {
-                runs.push(ShapedRun {
-                    font_id,
-                    glyphs: vec![shaped_glyph],
-                });
+                let count = 1 + layout.glyphs[index + 1..]
+                    .iter()
+                    .take_while(|next| {
+                        next.font_id == glyph.font_id && next.metadata == glyph.metadata
+                    })
+                    .count();
+                let mut glyphs = Vec::with_capacity(count);
+                glyphs.push(shaped_glyph);
+                runs.push(ShapedRun { font_id, glyphs });
             }
         }
 
-        LineLayout {
+        let result = LineLayout {
             font_size,
             width: layout.w.into(),
             ascent: layout.max_ascent.into(),
             descent: layout.max_descent.into(),
             runs,
             len: text.len(),
+        };
+        self.retain_shaping_scratch(line, layout_lines);
+        result
+    }
+
+    fn retain_shaping_scratch(&mut self, line: ShapeLine, layout_lines: Vec<CosmicLayoutLine>) {
+        // Large runs release their buffers instead of permanently raising the
+        // platform's retained high-water mark. ShapeLine::build can then reuse
+        // spans, words and glyphs from the previous ordinary run.
+        if layout_lines
+            .iter()
+            .map(|line| line.glyphs.capacity())
+            .sum::<usize>()
+            <= MAX_LAYOUT_SCRATCH_GLYPHS
+        {
+            self.layout_lines = layout_lines;
+        }
+        if shape_line_buffer_bytes(&line) <= MAX_SHAPE_SCRATCH_BYTES {
+            self.shape_line = Some(line);
         }
     }
+}
+
+fn shape_line_buffer_bytes(line: &ShapeLine) -> usize {
+    line.spans.capacity() * size_of::<ShapeSpan>()
+        + line
+            .spans
+            .iter()
+            .map(|span| {
+                span.words.capacity() * size_of::<ShapeWord>()
+                    + span.decoration_spans.capacity()
+                        * size_of::<(Range<usize>, GlyphDecorationData)>()
+                    + span
+                        .words
+                        .iter()
+                        .map(|word| word.glyphs.capacity() * size_of::<ShapeGlyph>())
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
 }
 
 #[inline(always)]
@@ -1175,6 +1245,58 @@ mod tests {
             assert!(layout.width > Pixels::ZERO, "{text:?}");
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn reused_layout_output_matches_fresh_output_and_releases_large_buffers() -> Result<()> {
+        let text_system = text_system()?;
+        let texts = [
+            "office a\u{301} text".to_owned(),
+            "long paragraph ".repeat(120),
+            "mixed אבג سلام \u{001c} next paragraph".to_owned(),
+            "x".repeat(MAX_LAYOUT_SCRATCH_GLYPHS * 3),
+            "short again".to_owned(),
+        ];
+        for text in texts {
+            let reused = layout_text(&text_system, &text)?;
+            {
+                let mut state = text_system.0.write();
+                let retained = state
+                    .layout_lines
+                    .iter()
+                    .map(|line| line.glyphs.capacity())
+                    .sum::<usize>();
+                assert!(retained <= MAX_LAYOUT_SCRATCH_GLYPHS);
+                if text.len() > MAX_LAYOUT_SCRATCH_GLYPHS * 2 {
+                    assert_eq!(
+                        retained, 0,
+                        "large outputs must not raise the retained high-water mark"
+                    );
+                }
+                if let Some(line) = &state.shape_line {
+                    assert!(shape_line_buffer_bytes(line) <= MAX_SHAPE_SCRATCH_BYTES);
+                }
+                state.layout_lines = Vec::new();
+                state.shape_line = None;
+            }
+            let fresh = layout_text(&text_system, &text)?;
+            assert_eq!(
+                (reused.width, reused.ascent, reused.descent, reused.len),
+                (fresh.width, fresh.ascent, fresh.descent, fresh.len)
+            );
+            assert_eq!(reused.runs.len(), fresh.runs.len());
+            for (reused, fresh) in reused.runs.iter().zip(&fresh.runs) {
+                assert_eq!(reused.font_id, fresh.font_id);
+                assert_eq!(reused.glyphs.len(), fresh.glyphs.len());
+                for (reused, fresh) in reused.glyphs.iter().zip(&fresh.glyphs) {
+                    assert_eq!(
+                        (reused.id, reused.position, reused.index, reused.is_emoji),
+                        (fresh.id, fresh.position, fresh.index, fresh.is_emoji)
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

@@ -29,8 +29,8 @@ use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
 use uuid::Uuid;
 
 use crate::{
-    ButtonEvent, DeviceRefreshProfile, FbInkPresenter, FrameUpdate,
-    Gesture, HardwareButton, KoboRenderMode, KoboRenderer, KoboRuntime, PixelRect, RefreshMode,
+    ButtonEvent, DeviceRefreshProfile, FbInkPresenter, FrameUpdate, Gesture, GrayFrame,
+    HardwareButton, KoboRenderMode, KoboRenderer, KoboRuntime, PixelRect, RefreshMode,
     RepaintScheduler, RuntimeEvent, TouchPhase, changed_pixel_bounds_in, render_profiling_enabled,
 };
 
@@ -262,7 +262,7 @@ pub enum KoboExperienceMode {
 impl KoboExperienceMode {
     fn render_mode(self) -> KoboRenderMode {
         match self {
-            Self::LibraryFast => KoboRenderMode::QualityGrayscale,
+            Self::LibraryFast => KoboRenderMode::FastMonochrome,
             Self::ReaderQuality => KoboRenderMode::QualityGrayscale,
         }
     }
@@ -631,7 +631,7 @@ impl PlatformKeyboardLayout for KoboKeyboardLayout {
 
 struct KoboWindowRenderState {
     renderer: KoboRenderer,
-    previous_frame: Option<crate::GrayFrame>,
+    previous_frame: Option<GrayFrame>,
 }
 
 struct KoboWindowState {
@@ -708,15 +708,12 @@ impl KoboWindow {
         self.0.handle
     }
 
-    fn request_frame(&self, force: bool) {
+    fn request_frame(&self, options: RequestFrameOptions) {
         // Clear before dispatch so demand raised by this frame survives.
         self.0.frame_requested.set(false);
         let callback = self.0.request_frame.take();
         if let Some(mut callback) = callback {
-            callback(RequestFrameOptions {
-                require_presentation: force,
-                force_render: force,
-            });
+            callback(options);
             self.0.request_frame.set(Some(callback));
         }
     }
@@ -808,13 +805,8 @@ impl KoboWindow {
         self.0.pending_update.take()
     }
 
-    fn last_frame(&self) -> Option<GrayImage> {
-        self.0
-            .render
-            .borrow()
-            .previous_frame
-            .as_ref()
-            .map(|frame| frame.as_ref().clone())
+    fn last_frame(&self) -> Option<GrayFrame> {
+        self.0.render.borrow().previous_frame.clone()
     }
 
     fn take_render_error(&self) -> Option<String> {
@@ -1201,7 +1193,7 @@ pub struct KoboPlatform {
     text_system: Arc<dyn PlatformTextSystem>,
     display: Rc<KoboDisplay>,
     windows: Cell<Vec<Weak<KoboWindowState>>>,
-    cached_frame: Cell<Option<GrayImage>>,
+    cached_frame: Cell<Option<GrayFrame>>,
     cached_render_count: Cell<u64>,
     quit: Cell<bool>,
     error: Cell<Option<String>>,
@@ -1386,10 +1378,10 @@ impl KoboPlatform {
     /// Return the last CPU-rendered framebuffer, including in no-display mode.
     pub fn last_frame(&self) -> Option<GrayImage> {
         if let Some(frame) = self.window().and_then(|window| window.last_frame()) {
-            return Some(frame);
+            return Some(frame.as_ref().clone());
         }
         let frame = self.cached_frame.take();
-        let result = frame.clone();
+        let result = frame.as_ref().map(|frame| frame.as_ref().clone());
         self.cached_frame.set(frame);
         result
     }
@@ -1705,7 +1697,14 @@ impl KoboPlatform {
         window.activate_callbacks();
         let pipeline_started = Instant::now();
         let render_started = Instant::now();
-        window.request_frame(force);
+        // GPUI already laid out and painted the scene in App::open_window.
+        // Present it without invalidating every view a second time; ordinary
+        // dirty-view tracking still applies startup changes before presenting.
+        let force_render = force && !state.startup_frame_pending;
+        window.request_frame(RequestFrameOptions {
+            require_presentation: force,
+            force_render,
+        });
         self.dispatcher.run_pending();
         let render_ms = render_started.elapsed().as_millis();
         if let Some(error) = window.take_render_error() {
@@ -1720,11 +1719,11 @@ impl KoboPlatform {
             let image = update
                 .as_ref()
                 .map(|update| update.image.clone())
-                .or_else(|| window.last_frame().map(crate::GrayFrame::unpooled));
+                .or_else(|| window.last_frame());
             let Some(image) = image else {
                 self.full_repaint_requested.set(true);
                 println!(
-                    "GPUI timing: force=true scrolling={scrolling} render_ms={render_ms} frame=false total_ms={}",
+                    "GPUI timing: force=true force_render={force_render} scrolling={scrolling} render_ms={render_ms} frame=false total_ms={}",
                     pipeline_started.elapsed().as_millis()
                 );
                 return Ok(());
@@ -1740,7 +1739,7 @@ impl KoboPlatform {
             self.full_gc16_requested.set(false);
             state.scheduler.record_full_presentation(&image);
             println!(
-                "GPUI timing: force=true scrolling={scrolling} render_ms={render_ms} changed={} present_ms={} total_ms={}",
+                "GPUI timing: force=true force_render={force_render} scrolling={scrolling} render_ms={render_ms} changed={} present_ms={} total_ms={}",
                 update.is_some(),
                 present_started.elapsed().as_millis(),
                 pipeline_started.elapsed().as_millis()
@@ -2514,7 +2513,7 @@ mod sleep_tests {
             })
             .unwrap();
             let frame = GrayImage::from_pixel(600, 800, Luma([42]));
-            platform.cached_frame.set(Some(frame.clone()));
+            platform.cached_frame.set(Some(GrayFrame::unpooled(frame.clone())));
             let mut state = platform.run_state.take().unwrap();
             WAKE_NOTIFICATIONS.with(|count| count.set(0));
             let result = platform.request_suspend(&mut state);
@@ -2559,7 +2558,9 @@ mod frame_scheduling_tests {
             let events = Rc::new(RefCell::new(Vec::new()));
             let observed = events.clone();
             window.on_active_status_change(Box::new(move |active| observed.borrow_mut().push(active)));
-            launched.cached_frame.set(Some(GrayImage::from_pixel(600, 800, Luma([42]))));
+            launched.cached_frame.set(Some(GrayFrame::unpooled(
+                GrayImage::from_pixel(600, 800, Luma([42])),
+            )));
             let mut state = launched.run_state.take().unwrap();
             // Launch already holds the App borrow; this test observes platform
             // activation directly rather than re-entering GPUI's wake callback.
@@ -2613,7 +2614,7 @@ mod frame_scheduling_tests {
             wake();
             assert_eq!(calls.get(), 0);
             assert!(window.0.frame_requested.get());
-            window.request_frame(false);
+            window.request_frame(RequestFrameOptions::default());
             assert_eq!(calls.get(), 1);
             assert!(window.0.frame_requested.get(), "demand during a frame must survive");
             let activations = Rc::new(Cell::new(0));
