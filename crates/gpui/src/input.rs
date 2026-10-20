@@ -98,6 +98,13 @@ pub trait EntityInputHandler: 'static + Sized {
         None
     }
 
+    /// See [`InputHandler::element_bounds`]. Return `None` to use the text
+    /// element's bounds. Controls can include their padding without changing
+    /// the origin used by [`Self::bounds_for_range`].
+    fn element_bounds(&self, _window: &Window, _cx: &App) -> Option<Bounds<Pixels>> {
+        None
+    }
+
     /// See [`InputHandler::accepts_text_input`] for details
     fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
         true
@@ -226,8 +233,10 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
         })
     }
 
-    fn element_bounds(&mut self, _window: &mut Window, _cx: &mut App) -> Option<Bounds<Pixels>> {
-        Some(self.element_bounds)
+    fn element_bounds(&mut self, window: &mut Window, cx: &mut App) -> Option<Bounds<Pixels>> {
+        self.view
+            .read_with(cx, |view, cx| view.element_bounds(window, cx))
+            .or(Some(self.element_bounds))
     }
 
     fn text_length_utf16(&mut self, window: &mut Window, cx: &mut App) -> Option<usize> {

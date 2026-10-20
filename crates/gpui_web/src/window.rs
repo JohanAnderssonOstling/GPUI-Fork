@@ -1,15 +1,16 @@
 use crate::display::WebDisplay;
 use crate::events::{ClickState, EventListenerHandle, WebEventListeners, is_mac_platform};
 use crate::platform::WebWindowLifecycle;
+use crate::touch::TouchState;
 use std::sync::Arc;
 use std::{cell::Cell, cell::RefCell, rc::Rc};
 
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult, GpuSpecs,
-    Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult, Edges,
+    GpuSpecs, Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
     ResizeEdge, Scene, Size, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowControls, WindowDecorations, WindowParams, px,
+    WindowControlArea, WindowControls, WindowDecorations, WindowInsets, WindowParams, px,
 };
 use gpui_wgpu::{WgpuContext, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 use wasm_bindgen::prelude::*;
@@ -25,6 +26,7 @@ pub(crate) struct WebWindowCallbacks {
     pub(crate) should_close: Option<Box<dyn FnMut() -> bool>>,
     pub(crate) close: Option<Box<dyn FnOnce()>>,
     pub(crate) appearance_changed: Option<Box<dyn FnMut()>>,
+    pub(crate) insets_changed: Option<Box<dyn FnMut(WindowInsets)>>,
     pub(crate) hit_test_window_control: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
 }
 
@@ -47,12 +49,16 @@ pub(crate) struct WebWindowInner {
     pub(crate) browser_window: web_sys::Window,
     pub(crate) canvas: web_sys::HtmlCanvasElement,
     pub(crate) input_element: web_sys::HtmlInputElement,
+    inset_probe: web_sys::HtmlElement,
+    insets: RefCell<WindowInsets>,
+    keyboard_visible: Cell<bool>,
     pub(crate) has_device_pixel_support: bool,
     pub(crate) is_mac: bool,
     pub(crate) state: RefCell<WebWindowMutableState>,
     pub(crate) callbacks: RefCell<WebWindowCallbacks>,
     pub(crate) click_state: RefCell<ClickState>,
     pub(crate) pressed_button: Cell<Option<MouseButton>>,
+    pub(crate) touches: RefCell<TouchState>,
     pub(crate) last_physical_size: Cell<(u32, u32)>,
     pub(crate) notify_scale: Cell<bool>,
     pub(crate) is_composing: Cell<bool>,
@@ -152,9 +158,24 @@ impl WebWindow {
         input_style.set_property("width", "1px").ok();
         input_style.set_property("height", "1px").ok();
         input_style.set_property("opacity", "0").ok();
+        input_style.set_property("font-size", "16px").ok();
+        input_element.set_attribute("aria-label", "Text input").ok();
+        input_element.set_attribute("autocomplete", "off").ok();
+        input_element.set_attribute("autocapitalize", "none").ok();
+        input_element.set_attribute("autocorrect", "off").ok();
+        input_element.set_attribute("spellcheck", "false").ok();
+        input_element.set_attribute("inputmode", "none").ok();
         body.append_child(&input_element)
             .map_err(|e| anyhow::anyhow!("Failed to append input to body: {e:?}"))?;
         input_element.focus().ok();
+
+        let inset_probe: web_sys::HtmlElement = document
+            .create_element("div")
+            .map_err(|error| anyhow::anyhow!("Failed to create inset probe: {error:?}"))?
+            .unchecked_into();
+        inset_probe.set_attribute("aria-hidden", "true").ok();
+        inset_probe.set_attribute("style", "position:fixed;visibility:hidden;pointer-events:none;padding:env(safe-area-inset-top,0px) env(safe-area-inset-right,0px) env(safe-area-inset-bottom,0px) env(safe-area-inset-left,0px)").ok();
+        body.append_child(&inset_probe).ok();
 
         let display: Rc<dyn PlatformDisplay> = Rc::new(WebDisplay::new(browser_window.clone()));
 
@@ -184,12 +205,16 @@ impl WebWindow {
             browser_window,
             canvas,
             input_element,
+            inset_probe,
+            insets: RefCell::new(WindowInsets::default()),
+            keyboard_visible: Cell::new(false),
             has_device_pixel_support,
             is_mac,
             state: RefCell::new(mutable_state),
             callbacks: RefCell::new(WebWindowCallbacks::default()),
             click_state: RefCell::new(ClickState::default()),
             pressed_button: Cell::new(None),
+            touches: RefCell::new(TouchState::default()),
             last_physical_size: Cell::new((0, 0)),
             notify_scale: Cell::new(false),
             is_composing: Cell::new(false),
@@ -201,6 +226,7 @@ impl WebWindow {
         });
 
         let raf_closure = inner.create_raf_closure();
+        inner.update_viewport_insets();
         inner.wake_frame_loop();
 
         let resize_observer_closure = Self::create_resize_observer_closure(Rc::clone(&inner));
@@ -238,26 +264,28 @@ impl WebWindow {
             let dpr = inner.browser_window.device_pixel_ratio();
             let dpr_f32 = dpr as f32;
 
-            let (physical_width, physical_height, logical_width, logical_height) =
-                if inner.has_device_pixel_support {
-                    let size: web_sys::ResizeObserverSize = entry
-                        .device_pixel_content_box_size()
-                        .get(0)
-                        .unchecked_into();
-                    let pw = size.inline_size() as u32;
-                    let ph = size.block_size() as u32;
-                    let lw = pw as f64 / dpr;
-                    let lh = ph as f64 / dpr;
-                    (pw, ph, lw as f32, lh as f32)
-                } else {
-                    // Safari fallback: use contentRect (always CSS px).
-                    let rect = entry.content_rect();
-                    let lw = rect.width() as f32;
-                    let lh = rect.height() as f32;
-                    let pw = (lw as f64 * dpr).round() as u32;
-                    let ph = (lh as f64 * dpr).round() as u32;
-                    (pw, ph, lw, lh)
-                };
+            // GPUI layout and pointer coordinates are always CSS pixels. Some
+            // browsers/emulators report devicePixelContentBoxSize before the
+            // emulated DPR is applied; dividing that box by DPR shrinks a phone
+            // viewport to a fraction of its actual width.
+            let rect = entry.content_rect();
+            let logical_width = rect.width() as f32;
+            let logical_height = rect.height() as f32;
+            let expected_width = (rect.width() * dpr).round() as u32;
+            let expected_height = (rect.height() * dpr).round() as u32;
+            let device_box = inner
+                .has_device_pixel_support
+                .then(|| entry.device_pixel_content_box_size().get(0))
+                .and_then(|size| size.dyn_into::<web_sys::ResizeObserverSize>().ok());
+            let (physical_width, physical_height) = match device_box {
+                Some(size)
+                    if (size.inline_size() - f64::from(expected_width)).abs() <= 1.0
+                        && (size.block_size() - f64::from(expected_height)).abs() <= 1.0 =>
+                {
+                    (size.inline_size() as u32, size.block_size() as u32)
+                }
+                _ => (expected_width, expected_height),
+            };
 
             let scale_changed = inner.notify_scale.replace(false);
             let prev = inner.last_physical_size.get();
@@ -444,6 +472,119 @@ impl WebWindowInner {
         });
     }
 
+    pub(crate) fn set_keyboard_visible(&self, visible: bool) {
+        let changed = self.keyboard_visible.replace(visible) != visible;
+        self.input_element
+            .set_attribute("inputmode", if visible { "text" } else { "none" })
+            .ok();
+        if changed {
+            self.input_element.blur().ok();
+            self.reset_text_proxy();
+        }
+        // inputmode=none keeps hardware keyboard events available without
+        // opening a software keyboard when a navigation button is tapped.
+        self.input_element.focus().ok();
+    }
+
+    pub(crate) fn reset_text_proxy(&self) {
+        // Keep characters on both sides of the DOM caret. Mobile keyboards
+        // otherwise omit deletion events for an empty proxy even though the
+        // focused GPUI editor contains text. These sentinels never enter GPUI.
+        self.input_element.set_value("\u{200b}\u{200b}");
+        self.input_element.set_selection_range(1, 1).ok();
+    }
+
+    pub(crate) fn update_viewport_insets(&self) {
+        let style = self
+            .browser_window
+            .get_computed_style(&self.inset_probe)
+            .ok()
+            .flatten();
+        let padding = |side: &str| -> Pixels {
+            px(style
+                .as_ref()
+                .and_then(|style| style.get_property_value(side).ok())
+                .and_then(|value| value.trim_end_matches("px").parse::<f32>().ok())
+                .unwrap_or(0.0))
+        };
+        let mut insets = WindowInsets {
+            safe_area: Edges {
+                top: padding("padding-top"),
+                right: padding("padding-right"),
+                bottom: padding("padding-bottom"),
+                left: padding("padding-left"),
+            },
+            ..WindowInsets::default()
+        };
+        if let Some(viewport) = self.browser_window.visual_viewport() {
+            // Browser page zoom also shrinks the visual viewport, but is not a
+            // keyboard inset. GPUI handles document pinch separately.
+            if (viewport.scale() - 1.0).abs() < 0.01 {
+                // Measure the canvas itself: some mobile browsers change
+                // innerHeight when the keyboard opens while the layout canvas
+                // retains its height. Comparing two visual sizes loses the IME.
+                let bounds = self.canvas.get_bounding_client_rect();
+                insets.ime.bottom = px(
+                    (bounds.bottom() - viewport.height() - viewport.offset_top()).max(0.0) as f32,
+                );
+                insets.ime.top = px((viewport.offset_top() - bounds.top()).max(0.0) as f32);
+                insets.ime.left = px((viewport.offset_left() - bounds.left()).max(0.0) as f32);
+                insets.ime.right = px(
+                    (bounds.right() - viewport.width() - viewport.offset_left()).max(0.0) as f32
+                );
+            }
+        }
+        if *self.insets.borrow() != insets {
+            *self.insets.borrow_mut() = insets.clone();
+            self.with_callback(
+                |callbacks| &mut callbacks.insets_changed,
+                |callback| callback(insets),
+            );
+        }
+    }
+
+    pub(crate) fn register_viewport_changes(self: &Rc<Self>) -> Vec<EventListenerHandle> {
+        let mut handles = Vec::new();
+        let mut targets: Vec<web_sys::EventTarget> =
+            vec![self.browser_window.clone().unchecked_into()];
+        if let Some(viewport) = self.browser_window.visual_viewport() {
+            targets.push(viewport.unchecked_into());
+        }
+        for target in targets {
+            for event in ["resize", "scroll"] {
+                let this = Rc::clone(self);
+                handles.push(EventListenerHandle::add(&target, event, move |_| {
+                    this.update_viewport_insets()
+                }));
+            }
+        }
+        handles
+    }
+
+    pub(crate) fn register_input_capability_change(self: &Rc<Self>) -> Option<EventListenerHandle> {
+        let query = self
+            .browser_window
+            .match_media("(pointer: coarse)")
+            .ok()??;
+        let this = Rc::clone(self);
+        Some(EventListenerHandle::add(
+            query.as_ref(),
+            "change",
+            move |_| {
+                this.cancel_touches();
+                // The resize callback invalidates all view caches even when the
+                // canvas dimensions are unchanged, so runtime metrics take effect.
+                let state = this.state.borrow();
+                let (size, scale) = (state.bounds.size, state.scale_factor);
+                drop(state);
+                this.with_callback(
+                    |callbacks| &mut callbacks.resize,
+                    |callback| callback(size, scale),
+                );
+            },
+        ))
+    }
+
     pub(crate) fn register_visibility_change(self: &Rc<Self>) -> Option<EventListenerHandle> {
         let document = self.browser_window.document()?;
         let this = Rc::clone(self);
@@ -468,6 +609,9 @@ impl WebWindowInner {
                 {
                     let mut state = this.state.borrow_mut();
                     state.is_active = is_visible;
+                }
+                if !is_visible {
+                    this.cancel_touches();
                 }
                 this.with_callback(
                     |callbacks| &mut callbacks.active_status_change,
@@ -545,6 +689,7 @@ impl Drop for WebWindow {
         if let Some(ref observer) = self._resize_observer {
             observer.disconnect();
         }
+        self.inner.inset_probe.remove();
 
         // The DPR media-query closure captures an `Rc<WebWindowInner>` and is
         // stored inside the inner itself, forming a reference cycle; take it
@@ -672,6 +817,24 @@ impl PlatformWindow for WebWindow {
 
     fn capslock(&self) -> Capslock {
         self.inner.state.borrow().capslock
+    }
+
+    fn insets(&self) -> WindowInsets {
+        self.inner.insets.borrow().clone()
+    }
+
+    fn on_insets_changed(&self, callback: Box<dyn FnMut(WindowInsets)>) {
+        self.inner.callbacks.borrow_mut().insets_changed = Some(callback);
+    }
+
+    fn show_soft_keyboard(&self) {
+        self.inner.set_keyboard_visible(true);
+    }
+    fn hide_soft_keyboard(&self) {
+        self.inner.set_keyboard_visible(false);
+    }
+    fn is_text_input_active(&self) -> bool {
+        self.inner.keyboard_visible.get()
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {

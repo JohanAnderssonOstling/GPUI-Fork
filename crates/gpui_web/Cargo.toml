@@ -59,6 +59,7 @@ web-sys = { version = "0.3", features = [
     "HtmlInputElement",
     "IdleDeadline",
     "IdleRequestOptions",
+    "InputEvent",
     "KeyboardEvent",
     "Location",
     "MediaQueryList",
@@ -66,6 +67,7 @@ web-sys = { version = "0.3", features = [
     "MouseEvent",
     "Navigator",
     "PointerEvent",
+    "Performance",
     "ReadableStream",
     "ReadableStreamDefaultReader",
     "ReadableStreamReadResult",
@@ -89,3 +91,6 @@ web-sys = { version = "0.3", features = [
 
 [package.metadata.cargo-shear]
 ignored = ["scheduler"]
+
+[dev-dependencies]
+gpui.workspace = true

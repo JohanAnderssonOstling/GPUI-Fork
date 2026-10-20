@@ -414,6 +414,12 @@ async fn initialize_graphics(
 }
 
 impl Platform for WebPlatform {
+    fn supports_touch_input(&self) -> bool {
+        web_sys::window()
+            .and_then(|window| window.match_media("(pointer: coarse)").ok().flatten())
+            .is_some_and(|query| query.matches())
+    }
+
     fn background_executor(&self) -> BackgroundExecutor {
         self.background_executor.clone()
     }

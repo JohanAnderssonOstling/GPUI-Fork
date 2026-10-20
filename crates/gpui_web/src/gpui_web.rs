@@ -12,6 +12,7 @@ mod http_client;
 mod keyboard;
 mod logging;
 mod platform;
+mod touch;
 mod window;
 
 pub use dispatcher::WebDispatcher;
