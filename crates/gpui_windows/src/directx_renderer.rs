@@ -54,6 +54,8 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+    #[cfg(feature = "snapshot")]
+    captures: crate::directx_capture::DirectXCaptures,
 }
 
 /// Direct3D objects
@@ -194,6 +196,8 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             skip_draws: false,
+            #[cfg(feature = "snapshot")]
+            captures: Default::default(),
         })
     }
 
@@ -261,6 +265,8 @@ impl DirectXRenderer {
     }
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
+        #[cfg(feature = "snapshot")]
+        self.captures.fail("GPU reset during capture");
         let disable_direct_composition = self.direct_composition.is_none();
 
         unsafe {
@@ -327,12 +333,43 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    #[cfg(feature = "snapshot")]
+    pub(crate) fn capture_region(&mut self, bounds: Bounds<DevicePixels>, executor: &BackgroundExecutor) -> Task<Result<image::RgbaImage>> {
+        self.captures.request(bounds, executor)
+    }
+
+    #[cfg(feature = "snapshot")]
+    pub(crate) fn poll_region_captures(&mut self) -> bool {
+        if let Some(devices) = &self.devices {
+            self.captures.poll(&devices.device_context);
+        } else {
+            self.captures.fail("Direct3D device is unavailable");
+        }
+        self.captures.is_pending()
+    }
+
+    #[cfg(feature = "snapshot")]
+    pub(crate) fn cancel_region_captures(&mut self) {
+        self.captures.fail("Direct3D capture timed out before rendering");
+    }
+
     pub(crate) fn draw(
         &mut self,
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
+        let result = self.draw_frame(scene, background_appearance);
+        #[cfg(feature = "snapshot")]
+        if let Err(error) = &result {
+            self.captures.fail(&format!("Could not draw captured frame: {error:#}"));
+        }
+        result
+    }
+
+    fn draw_frame(&mut self, scene: &Scene, background_appearance: WindowBackgroundAppearance) -> Result<()> {
         if self.skip_draws {
+            #[cfg(feature = "snapshot")]
+            self.captures.fail("GPU reset during capture");
             // skip drawing this frame, we just recovered from a device lost event
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
@@ -387,6 +424,12 @@ impl DirectXRenderer {
                     scene.surfaces.len(),
                 )
             })?;
+        }
+        #[cfg(feature = "snapshot")]
+        {
+            let devices = self.devices.as_ref().context("Direct3D device is unavailable")?;
+            let source = self.resources.as_ref().and_then(|resources| resources.render_target.as_ref()).context("Direct3D render target is unavailable")?;
+            self.captures.submit(&devices.device, &devices.device_context, source, background_appearance);
         }
         self.present()
     }

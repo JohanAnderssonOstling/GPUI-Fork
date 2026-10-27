@@ -10,6 +10,8 @@ use web_time::Instant;
 
 #[cfg(feature = "multithreaded")]
 const MIN_BACKGROUND_THREADS: usize = 2;
+#[cfg(feature = "multithreaded")]
+const MAX_BACKGROUND_THREADS: usize = 4;
 
 fn shared_memory_supported() -> bool {
     let global = js_sys::global();
@@ -176,10 +178,10 @@ impl WebDispatcher {
 
         #[cfg(feature = "multithreaded")]
         let background_threads = if supports_threads {
-            let thread_count = browser_window
-                .navigator()
-                .hardware_concurrency()
-                .max(MIN_BACKGROUND_THREADS as f64) as usize;
+            // Every worker initializes a WASM instance. Bound that startup cost
+            // even when the browser reports many logical CPU threads.
+            let thread_count = (browser_window.navigator().hardware_concurrency() as usize)
+                .clamp(MIN_BACKGROUND_THREADS, MAX_BACKGROUND_THREADS);
 
             // TODO-Wasm: Is it bad to have web workers blocking for a long time like this?
             (0..thread_count)
@@ -228,7 +230,7 @@ impl WebDispatcher {
         function: impl FnOnce() + Send + 'static,
     ) {
         if self.on_main_thread() {
-            let callback = Closure::once_into_js(function);
+            let callback = Closure::once_aborting(function).into_js_value();
             browser_window().queue_microtask(callback.unchecked_ref());
         } else {
             self.main_thread_mailbox
@@ -271,9 +273,9 @@ impl PlatformDispatcher for WebDispatcher {
     fn dispatch_after(&self, duration: Duration, runnable: RunnableVariant) {
         let millis = duration.as_millis().min(i32::MAX as u128) as i32;
         if self.on_main_thread() {
-            let callback = Closure::once_into_js(move || {
+            let callback = Closure::once_aborting(move || {
                 runnable.run();
-            });
+            }).into_js_value();
             browser_window()
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
                     callback.unchecked_ref(),
@@ -288,9 +290,9 @@ impl PlatformDispatcher for WebDispatcher {
 
     fn spawn_realtime(&self, function: Box<dyn FnOnce() + Send>) {
         if self.on_main_thread() {
-            let callback = Closure::once_into_js(move || {
+            let callback = Closure::once_aborting(move || {
                 function();
-            });
+            }).into_js_value();
             browser_window().queue_microtask(callback.unchecked_ref());
         } else {
             self.main_thread_mailbox
@@ -341,9 +343,9 @@ fn execute_on_main_thread(window: &web_sys::Window, item: MainThreadItem) {
             schedule_idle_runnable(window, runnable, timeout);
         }
         MainThreadItem::Delayed { runnable, millis } => {
-            let callback = Closure::once_into_js(move || {
+            let callback = Closure::once_aborting(move || {
                 runnable.run();
-            });
+            }).into_js_value();
             window
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
                     callback.unchecked_ref(),
@@ -384,11 +386,11 @@ fn schedule_idle_runnable(
         schedule_runnable(window, runnable, Priority::Low);
         return;
     }
-    let callback = Closure::once_into_js(move |deadline: web_sys::IdleDeadline| {
+    let callback = Closure::once_aborting(move |deadline: web_sys::IdleDeadline| {
         IDLE_DEADLINE.with(|current| *current.borrow_mut() = Some(deadline));
         runnable.run();
         IDLE_DEADLINE.with(|current| *current.borrow_mut() = None);
-    });
+    }).into_js_value();
     let result = match timeout {
         Some(timeout) => {
             let options = web_sys::IdleRequestOptions::new();
@@ -416,9 +418,9 @@ fn idle_callback_supported(window: &web_sys::Window) -> bool {
 }
 
 fn schedule_runnable(window: &web_sys::Window, runnable: RunnableVariant, priority: Priority) {
-    let callback = Closure::once_into_js(move || {
+    let callback = Closure::once_aborting(move || {
         runnable.run();
-    });
+    }).into_js_value();
     let callback: &js_sys::Function = callback.unchecked_ref();
 
     match priority {

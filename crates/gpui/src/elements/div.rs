@@ -2917,6 +2917,10 @@ impl Interactivity {
                                     listener(drag.value.as_ref(), window, cx);
                                     window.refresh();
                                     cx.stop_propagation();
+                                } else {
+                                    // Let an ancestor accept the drop, or let mouse-up
+                                    // cleanup clear the drag and redraw its preview.
+                                    cx.active_drag = Some(drag);
                                 }
                             }
                         }

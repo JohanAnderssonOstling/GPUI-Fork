@@ -4,11 +4,16 @@ use bytemuck::{Pod, Zeroable};
 use gpui::profiler::startup::StartupProfile;
 #[cfg(not(target_family = "wasm"))]
 use crate::pipeline_cache::PersistentPipelineCache;
+#[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+use gpui::{BackgroundExecutor, Task};
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
     ScaledPixels, Scene, Size, get_gamma_correction_ratios,
 };
-#[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "test-support", feature = "snapshot")
+))]
 use image::RgbaImage;
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -239,7 +244,10 @@ enum WgpuTarget {
     Headless(HeadlessTarget),
 }
 
-#[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "test-support", feature = "snapshot")
+))]
 struct HeadlessTarget {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -288,6 +296,8 @@ pub struct WgpuRenderer {
     failed_frame_count: u32,
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     needs_redraw: bool,
+    #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+    region_captures: crate::region_capture::RegionCaptures,
     #[cfg(not(target_family = "wasm"))]
     recovery_not_before: Option<Instant>,
 }
@@ -504,7 +514,12 @@ impl WgpuRenderer {
         }
 
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: {
+                let usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+                #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+                let usage = usage | (surface_caps.usages & wgpu::TextureUsages::COPY_SRC);
+                usage
+            },
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
@@ -725,6 +740,8 @@ impl WgpuRenderer {
             failed_frame_count: 0,
             device_lost: context.device_lost_flag(),
             needs_redraw: false,
+            #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+            region_captures: Default::default(),
             #[cfg(not(target_family = "wasm"))]
             recovery_not_before: None,
         })
@@ -908,12 +925,17 @@ impl WgpuRenderer {
             failed_frame_count: 0,
             device_lost: context.device_lost_flag(),
             needs_redraw: false,
+            #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+            region_captures: Default::default(),
             #[cfg(not(target_family = "wasm"))]
             recovery_not_before: None,
         })
     }
 
-    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "test-support", feature = "snapshot")
+    ))]
     fn create_headless_target(
         device: &wgpu::Device,
         width: u32,
@@ -1578,7 +1600,10 @@ impl WgpuRenderer {
         Ok(self.render_scene_to_view(scene, &view))
     }
 
-    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "test-support", feature = "snapshot")
+    ))]
     fn render_scene_to_view(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> bool {
         let last_error = self.last_error.lock().unwrap().take();
         if let Some(error) = last_error {
@@ -1649,6 +1674,14 @@ impl WgpuRenderer {
         let WgpuTarget::Headless(target) = &self.target else {
             anyhow::bail!("headless readback requested from a window renderer");
         };
+        self.read_snapshot(target)
+    }
+
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "test-support", feature = "snapshot")
+    ))]
+    fn read_snapshot(&self, target: &HeadlessTarget) -> anyhow::Result<RgbaImage> {
         let width = self.surface_config.width;
         let height = self.surface_config.height;
         let mut encoder =
@@ -1712,6 +1745,23 @@ impl WgpuRenderer {
         }
         RgbaImage::from_raw(width, height, rgba)
             .ok_or_else(|| anyhow::anyhow!("Failed to construct headless RGBA image"))
+    }
+
+    /// Captures a window scene using its existing GPU context and sprite atlas.
+    #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+    pub fn snapshot(&mut self, scene: &Scene) -> anyhow::Result<RgbaImage> {
+        anyhow::ensure!(!self.device_lost(), "snapshot requested after GPU device loss");
+        let target = Self::create_headless_target(
+            &self.resources().device,
+            self.surface_config.width,
+            self.surface_config.height,
+            self.surface_config.format,
+        );
+        anyhow::ensure!(
+            self.render_scene_to_view(scene, &target.view),
+            "could not render the window scene for snapshot"
+        );
+        self.read_snapshot(&target)
     }
 
     pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
@@ -1778,7 +1828,26 @@ impl WgpuRenderer {
         self.max_texture_size
     }
 
+    /// Requests a region from the next frame; readback runs on the supplied executor.
+    #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+    pub fn capture_region(
+        &mut self,
+        bounds: Bounds<DevicePixels>,
+        executor: &BackgroundExecutor,
+    ) -> Task<Result<RgbaImage>> {
+        self.region_captures.request(bounds, executor)
+    }
+
     pub fn draw(&mut self, scene: &Scene) -> bool {
+        let drawn = self.draw_frame(scene);
+        #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+        if !drawn {
+            self.region_captures.fail("Could not render the frame for capture");
+        }
+        drawn
+    }
+
+    fn draw_frame(&mut self, scene: &Scene) -> bool {
         #[cfg(target_family = "wasm")]
         if self.device_lost() {
             if self.surface_is_configured() {
@@ -1917,6 +1986,49 @@ impl WgpuRenderer {
             return false;
         }
 
+        #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+        if !self.region_captures.is_empty() {
+            // Most native surfaces can be copied directly. Render a temporary target
+            // only on backends whose presentation textures do not allow COPY_SRC.
+            let source = if self.surface_config.usage.contains(wgpu::TextureUsages::COPY_SRC) {
+                Some(frame.texture.clone())
+            } else {
+                let texture = self.resources().device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("gpui_capture_fallback"),
+                    size: wgpu::Extent3d {
+                        width: self.surface_config.width,
+                        height: self.surface_config.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self.surface_config.format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                match self.record_frame(scene, &view) {
+                    Ok(()) => Some(texture),
+                    Err(error) => {
+                        self.region_captures
+                            .fail(&format!("Could not render capture: {error:#}"));
+                        None
+                    }
+                }
+            };
+            if let Some(source) = source {
+                let device = Arc::clone(&self.resources().device);
+                let queue = Arc::clone(&self.resources().queue);
+                self.region_captures.submit(
+                    &source,
+                    &device,
+                    &queue,
+                    self.viewport_size,
+                    self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied,
+                );
+            }
+        }
         frame.present();
         true
     }

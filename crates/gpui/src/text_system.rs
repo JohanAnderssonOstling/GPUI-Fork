@@ -17,11 +17,12 @@ use crate::{
     StrikethroughStyle, TextRenderingMode, UnderlineStyle, px,
 };
 use anyhow::{Context as _, anyhow};
-use collections::FxHashMap;
+use collections::{FxHashMap, FxHashSet};
 use core::fmt;
 use derive_more::{Add, Deref, FromStr, Sub};
 use itertools::Itertools;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
+use sha2::{Digest, Sha256};
 use smallvec::{SmallVec, smallvec};
 use std::{
     borrow::Cow,
@@ -47,9 +48,32 @@ pub const SUBPIXEL_VARIANTS_X: u8 = 4;
 /// Number of subpixel glyph variants along the Y axis.
 pub const SUBPIXEL_VARIANTS_Y: u8 = 1;
 
+#[derive(Default)]
+struct FontRegistrations {
+    hashes: FxHashSet<[u8; 32]>,
+}
+
+impl FontRegistrations {
+    fn add_fonts(
+        &mut self,
+        fonts: Vec<Cow<'static, [u8]>>,
+        mut register: impl FnMut(Cow<'static, [u8]>) -> Result<()>,
+    ) -> Result<()> {
+        for bytes in fonts {
+            let hash = Sha256::digest(bytes.as_ref()).into();
+            if !self.hashes.contains(&hash) {
+                register(bytes)?;
+                self.hashes.insert(hash);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The GPUI text rendering sub system.
 pub struct TextSystem {
     platform_text_system: Arc<dyn PlatformTextSystem>,
+    font_registrations: Mutex<FontRegistrations>,
     font_ids_by_font: RwLock<FxHashMap<Font, Result<FontId>>>,
     font_metrics: RwLock<FxHashMap<FontId, FontMetrics>>,
     raster_bounds: RwLock<FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>>,
@@ -63,6 +87,7 @@ impl TextSystem {
     pub fn new(platform_text_system: Arc<dyn PlatformTextSystem>) -> Self {
         TextSystem {
             platform_text_system,
+            font_registrations: Mutex::default(),
             font_metrics: RwLock::default(),
             raster_bounds: RwLock::default(),
             font_ids_by_font: RwLock::default(),
@@ -98,13 +123,17 @@ impl TextSystem {
         names
     }
 
-    /// Add a font's data to the text system.
+    /// Add a font's data to the text system, reusing identical registered data.
     pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
-        self.platform_text_system.add_fonts(fonts)
+        // Readers and windows share this text system. Keep the lock through
+        // registration so concurrent callers cannot install duplicate copies.
+        self.font_registrations.lock().add_fonts(fonts, |font| {
+            self.platform_text_system.add_fonts(vec![font])
+        })
     }
 
-    /// Get the FontId for the configure font family and style.
-    fn font_id(&self, font: &Font) -> Result<FontId> {
+    /// Resolve the requested family and style without using the default font stack.
+    pub fn font_id(&self, font: &Font) -> Result<FontId> {
         fn clone_font_id_result(font_id: &Result<FontId>) -> Result<FontId> {
             match font_id {
                 Ok(font_id) => Ok(*font_id),
@@ -1240,5 +1269,93 @@ pub fn font_name_with_fallbacks_shared<'a>(
         ".ZedSans" | "Zed Plex Sans" => const { &SharedString::new_static("IBM Plex Sans") },
         ".ZedMono" | "Zed Plex Mono" => const { &SharedString::new_static("Lilex") },
         _ => name,
+    }
+}
+
+#[cfg(test)]
+mod font_registration_tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_ui_fonts_and_owned_reader_fonts_share_a_registration() -> Result<()> {
+        let mut registrations = FontRegistrations::default();
+        let mut installed = Vec::new();
+        registrations.add_fonts(vec![Cow::Borrowed(b"shared font")], |font| {
+            installed.push(font.into_owned());
+            Ok(())
+        })?;
+        registrations.add_fonts(vec![Cow::Owned(b"shared font".to_vec())], |_| {
+            panic!("an existing font must not be registered again")
+        })?;
+        assert_eq!(installed, [b"shared font".to_vec()]);
+        Ok(())
+    }
+
+    #[test]
+    fn duplicates_in_a_batch_are_skipped_and_distinct_data_is_registered() -> Result<()> {
+        let mut registrations = FontRegistrations::default();
+        let mut installed = Vec::new();
+        registrations.add_fonts(
+            vec![
+                Cow::Borrowed(b"family A: Latin subset"),
+                Cow::Borrowed(b"family A: Latin subset"),
+                Cow::Borrowed(b"family A: full coverage"),
+                Cow::Borrowed(b"family A: revised outlines"),
+            ],
+            |font| {
+                installed.push(font.into_owned());
+                Ok(())
+            },
+        )?;
+        assert_eq!(
+            installed,
+            [
+                b"family A: Latin subset".to_vec(),
+                b"family A: full coverage".to_vec(),
+                b"family A: revised outlines".to_vec(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_registration_can_retry_without_reinstalling_successful_fonts() -> Result<()> {
+        let mut registrations = FontRegistrations::default();
+        let fonts = vec![
+            Cow::Borrowed(b"font A".as_slice()),
+            Cow::Borrowed(b"font B"),
+        ];
+        let mut attempted = Vec::new();
+        let error = registrations.add_fonts(fonts.clone(), |font| {
+            attempted.push(font.into_owned());
+            if attempted.len() == 2 {
+                Err(anyhow!("platform rejected font B"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(error.is_err());
+        registrations.add_fonts(fonts, |font| {
+            attempted.push(font.into_owned());
+            Ok(())
+        })?;
+        assert_eq!(
+            attempted,
+            [b"font A".to_vec(), b"font B".to_vec(), b"font B".to_vec()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn registration_is_scoped_to_each_text_system() -> Result<()> {
+        let mut installed = 0;
+        for _ in 0..2 {
+            FontRegistrations::default().add_fonts(vec![Cow::Borrowed(b"shared font")], |_| {
+                installed += 1;
+                Ok(())
+            })?;
+        }
+        assert_eq!(installed, 2);
+        Ok(())
     }
 }

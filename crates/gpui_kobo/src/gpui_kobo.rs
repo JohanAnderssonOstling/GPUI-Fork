@@ -5,10 +5,12 @@
 //! deliberately e-ink-specific backend rather than a desktop compatibility layer.
 
 mod platform;
+mod touch_decoder;
+pub use touch_decoder::KoboTouchProtocol;
 mod virtual_keyboard;
 pub use platform::{
-    take_power_menu_request, take_power_message, request_sleep,
-    KoboExperienceMode, KoboPlatform, KoboPlatformOptions, KoboPowerOptions, KoboPowerEvent, KoboWindow, PageButtonBehavior,
+    take_power_menu_request, take_power_message, request_sleep, on_power_event, on_prepare_sleep, on_idle_sleep_check,
+    KoboExperienceMode, KoboInputProfile, KoboPlatform, KoboPlatformOptions, KoboPowerOptions, KoboPowerEvent, KoboWindow, PageButtonBehavior,
     begin_application_startup_profile, begin_book_launch_profile, current_experience_mode,
     current_render_mode, request_auto_rotation, request_experience_mode, request_full_repaint,
     request_reader_page_repaint, request_render_mode,

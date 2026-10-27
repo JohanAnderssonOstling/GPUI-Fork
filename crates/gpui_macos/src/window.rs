@@ -23,6 +23,8 @@ use cocoa::{
     },
 };
 use dispatch2::DispatchQueue;
+#[cfg(feature = "snapshot")]
+use gpui::{BackgroundExecutor, DevicePixels, Task};
 use gpui::{
     AnyWindowHandle, ApplicationDrag, BackgroundExecutor, Bounds, Capslock, CursorStyle,
     ExternalDragPayload, ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent,
@@ -1902,6 +1904,14 @@ impl PlatformWindow for MacWindow {
 
     fn on_toggle_tab_bar(&self, callback: Box<dyn FnMut()>) {
         self.0.as_ref().lock().toggle_tab_bar_callback = Some(callback);
+    }
+
+    #[cfg(feature = "snapshot")]
+    fn supports_region_capture(&self) -> bool { true }
+
+    #[cfg(feature = "snapshot")]
+    fn capture_region(&self, bounds: Bounds<DevicePixels>, executor: &BackgroundExecutor) -> Task<anyhow::Result<image::RgbaImage>> {
+        self.0.lock().renderer.capture_region(bounds, executor)
     }
 
     fn draw(&self, scene: &gpui::Scene) {

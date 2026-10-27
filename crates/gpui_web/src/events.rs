@@ -28,12 +28,14 @@ pub(crate) struct EventListenerHandle {
 }
 
 impl EventListenerHandle {
+    // GPUI callbacks mutate application state without an unwind-safety
+    // contract. Keep aborting if a panic escapes the task's recovery boundary.
     pub(crate) fn add(
         target: &web_sys::EventTarget,
         event_name: &'static str,
         handler: impl FnMut(JsValue) + 'static,
     ) -> Self {
-        let closure = Closure::<dyn FnMut(JsValue)>::new(handler);
+        let closure = Closure::<dyn FnMut(JsValue)>::own_aborting(handler);
         target
             .add_event_listener_with_callback(event_name, closure.as_ref().unchecked_ref())
             .ok();
@@ -53,7 +55,7 @@ impl EventListenerHandle {
         event_name: &'static str,
         handler: impl FnMut(JsValue) + 'static,
     ) -> Self {
-        let closure = Closure::<dyn FnMut(JsValue)>::new(handler);
+        let closure = Closure::<dyn FnMut(JsValue)>::own_aborting(handler);
         let target_js: &JsValue = target.as_ref();
         let callback_js: &JsValue = closure.as_ref();
         let options = js_sys::Object::new();
@@ -368,14 +370,14 @@ impl WebWindowInner {
                 .ceil()
                 .max(0.0) as i32;
             let weak = Rc::downgrade(self);
-            let callback = Closure::once_into_js(move || {
+            let callback = Closure::once_aborting(move || {
                 if let Some(this) = weak.upgrade() {
                     let press = this.touches.borrow_mut().long_press(clock.now());
                     if let Some(press) = press {
                         this.dispatch_input(press);
                     }
                 }
-            });
+            }).into_js_value();
             self.browser_window
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
                     callback.unchecked_ref(),

@@ -17,6 +17,7 @@ categories = ["gui"]
 workspace = true
 
 [features]
+snapshot = []
 default = ["font-kit", "image-formats", "wayland", "x11", "windows-manifest"]
 test-support = [
     "leak-detection",
@@ -83,6 +84,7 @@ usvg.workspace = true
 ttf-parser = "0.25"
 util_macros.workspace = true
 schemars.workspace = true
+sha2.workspace = true
 seahash = "4.1"
 serde.workspace = true
 serde_json.workspace = true

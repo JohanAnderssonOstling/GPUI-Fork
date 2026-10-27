@@ -286,6 +286,11 @@ impl RepaintScheduler {
         })
     }
 
+    pub(crate) fn idle_cleanup_deadline(&self) -> Option<Instant> {
+        if !self.policy.has_fast_updates() { return None; }
+        self.last_fast_update.map(|last| last + self.profile.idle_cleanup_after)
+    }
+
     pub fn idle_cleanup(&mut self, now: Instant) -> Option<ScheduledRefresh> {
         let last_fast_update = self.last_fast_update?;
         if now.saturating_duration_since(last_fast_update) < self.profile.idle_cleanup_after
@@ -351,11 +356,13 @@ mod tests {
     fn scroll_cleanup_survives_small_ui_updates_and_uses_latest_grayscale_frame() {
         let mut scheduler = RepaintScheduler::new(DeviceRefreshProfile::default());
         let now = Instant::now();
+        assert!(scheduler.idle_cleanup_deadline().is_none());
         let content = PixelRect { x: 10, y: 20, width: 70, height: 60 };
         scheduler.enqueue(update(content, 120), true);
         assert_eq!(scheduler.flush(now).unwrap().mode, RefreshMode::FastMono);
         scheduler.enqueue(update(PixelRect { x: 0, y: 0, width: 5, height: 5 }, 160), false);
         assert_eq!(scheduler.flush(now + Duration::from_millis(100)).unwrap().mode, RefreshMode::PartialGray);
+        assert_eq!(scheduler.idle_cleanup_deadline(), Some(now + Duration::from_millis(800)));
         assert!(scheduler.idle_cleanup(now + Duration::from_millis(799)).is_none());
         let cleanup = scheduler.idle_cleanup(now + Duration::from_millis(800)).unwrap();
         assert_eq!(cleanup.mode, RefreshMode::PartialGray);
@@ -363,6 +370,7 @@ mod tests {
         assert_eq!(cleanup.update.image.get_pixel(15, 25).0[0], 160);
         assert!(cleanup.update.previous_image.is_none());
         assert!(scheduler.idle_cleanup(now + Duration::from_secs(2)).is_none());
+        assert!(scheduler.idle_cleanup_deadline().is_none());
     }
 
     #[test]
@@ -379,6 +387,7 @@ mod tests {
     fn fast_reader_page_turns_receive_grayscale_cleanup() {
         let mut scheduler = RepaintScheduler::new(DeviceRefreshProfile::default());
         let now = Instant::now();
+        assert!(scheduler.idle_cleanup_deadline().is_none());
         let content = PixelRect { x: 0, y: 10, width: 100, height: 90 };
         scheduler.record_fast_presentation(&update(content, 128), now);
         let cleanup = scheduler.idle_cleanup(now + Duration::from_secs(1)).unwrap();

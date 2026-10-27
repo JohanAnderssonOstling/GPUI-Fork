@@ -89,6 +89,7 @@ x11rb::atom_manager! {
         TIFF_MIME: ImageFormat::mime_type(ImageFormat::Tiff).as_bytes(),
         ICO__MIME: ImageFormat::mime_type(ImageFormat::Ico ).as_bytes(),
         PNM__MIME: ImageFormat::mime_type(ImageFormat::Pnm ).as_bytes(),
+        KDE_FORCE_IMAGE_COPY: b"x-kde-force-image-copy",
         // This is just some random name for the property on our window, into which
         // the clipboard owner writes the data we requested.
         ARBOARD_CLIPBOARD,
@@ -1004,7 +1005,6 @@ impl Clipboard {
         }
     }
 
-    #[allow(unused)]
     pub(crate) fn set_image(
         &self,
         image: Image,
@@ -1012,10 +1012,17 @@ impl Clipboard {
         wait: WaitConfig,
     ) -> Result<()> {
         let format = self.image_format_atom(image.format);
-        let data = vec![ClipboardData {
-            bytes: image.bytes,
-            format: self.inner.atoms.PNG__MIME,
-        }];
+        // Klipper uses this marker to retain explicitly copied images in history.
+        let data = vec![
+            ClipboardData {
+                bytes: image.bytes,
+                format,
+            },
+            ClipboardData {
+                bytes: Vec::new(),
+                format: self.inner.atoms.KDE_FORCE_IMAGE_COPY,
+            },
+        ];
         self.inner.write(data, selection, wait)
     }
 
