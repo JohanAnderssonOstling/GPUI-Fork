@@ -5,6 +5,8 @@ mod destination_list;
 mod direct_manipulation;
 mod direct_write;
 mod directx_atlas;
+#[cfg(feature = "snapshot")]
+mod directx_capture;
 mod directx_devices;
 mod directx_renderer;
 mod dispatcher;

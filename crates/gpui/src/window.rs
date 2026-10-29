@@ -22,7 +22,7 @@ use crate::{
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
     TextStyleRefinement, ThermalState, TouchEvent, TransformationMatrix, Underline, UnderlineStyle,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
+    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, WrappedLine, point, prelude::*, px, rems, size,
     transparent_black,
 };
 
@@ -1430,6 +1430,19 @@ pub(crate) struct ElementStateBox {
     pub(crate) type_name: &'static str,
 }
 
+fn intrinsic_height_for_ink(
+    ascent: Pixels,
+    descent: Pixels,
+    ink_top: Pixels,
+    ink_bottom: Pixels,
+) -> Pixels {
+    // paint_line centers the font metrics inside the line box. Solve for the
+    // smallest height that keeps both ink edges inside that same box.
+    (ascent + descent)
+        .max(descent - ascent - ink_top * 2.)
+        .max(ascent - descent + ink_bottom * 2.)
+}
+
 fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
     // TODO, BUG: if you open a window with the currently active window
     // on the stack, this will erroneously fallback to `None`
@@ -2619,10 +2632,35 @@ impl Window {
     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-support", feature = "snapshot"))]
     pub fn render_to_image(&self) -> anyhow::Result<image::RgbaImage> {
         self.platform_window
             .render_to_image(&self.rendered_frame.scene)
+    }
+
+    /// Whether the active renderer supports frame-region readback.
+    #[cfg(feature = "snapshot")]
+    pub fn supports_region_capture(&self) -> bool {
+        self.platform_window.supports_region_capture()
+    }
+
+    /// Captures a region in window-local logical coordinates from the next frame.
+    /// Remove any selection overlay before requesting capture. The task resolves
+    /// after native GPU readback, without requiring desktop capture permission.
+    #[cfg(feature = "snapshot")]
+    pub fn capture_region(&mut self, bounds: Bounds<Pixels>, cx: &App) -> Task<anyhow::Result<image::RgbaImage>> {
+        let scale = self.scale_factor();
+        let left = (f32::from(bounds.left()) * scale).floor();
+        let top = (f32::from(bounds.top()) * scale).floor();
+        let right = (f32::from(bounds.right()) * scale).ceil();
+        let bottom = (f32::from(bounds.bottom()) * scale).ceil();
+        let bounds = Bounds::new(
+            point(DevicePixels(left as i32), DevicePixels(top as i32)),
+            size(DevicePixels((right - left) as i32), DevicePixels((bottom - top) as i32)),
+        );
+        let capture = self.platform_window.capture_region(bounds, cx.background_executor());
+        self.refresh();
+        capture
     }
 
     /// Returns the quads in the most recently rendered frame's scene, so tests can assert on
@@ -2874,9 +2912,61 @@ impl Window {
         }
     }
 
-    /// The line height associated with the current text style.
+    /// The line height associated with the current text style. Intrinsic styles
+    /// use the font metrics; measured text also accounts for glyph overshoot.
     pub fn line_height(&self) -> Pixels {
-        self.text_style().line_height_in_pixels(self.rem_size())
+        let style = self.text_style();
+        if style.line_height_auto {
+            let font_size = style.font_size.to_pixels(self.rem_size());
+            let font_id = self.text_system().resolve_font(&style.font());
+            let height = self.text_system().ascent(font_id, font_size)
+                - self.text_system().descent(font_id, font_size);
+            return px((height.0 * self.scale_factor()).ceil() / self.scale_factor());
+        }
+        style.line_height_in_pixels(self.rem_size())
+    }
+
+    pub(crate) fn intrinsic_line_height(&self, line: &WrappedLine, dilation: u8) -> Pixels {
+        let scale = self.scale_factor();
+        let mut height = line.ascent() + line.descent();
+        for run in line.runs() {
+            for glyph in &run.glyphs {
+                let subpixel_rendering =
+                    !glyph.is_emoji && self.should_use_subpixel_rendering(run.font_id, line.font_size());
+                let mut params = RenderGlyphParams {
+                    font_id: run.font_id,
+                    glyph_id: glyph.id,
+                    font_size: line.font_size(),
+                    subpixel_variant: Point::default(),
+                    scale_factor: scale,
+                    is_emoji: glyph.is_emoji,
+                    subpixel_rendering,
+                    dilation: if glyph.is_emoji { 0 } else { dilation },
+                };
+                for variant in 0..SUBPIXEL_VARIANTS_X {
+                    params.subpixel_variant.x = variant;
+                    if let Ok(bounds) = self.text_system().raster_bounds(&params) {
+                        if bounds.size.height.0 == 0 {
+                            continue;
+                        }
+                        // Painting rounds the baseline to a device pixel. Reserve
+                        // its half-pixel rounding error on either side of the ink.
+                        let ink_top =
+                            glyph.position.y + px((bounds.origin.y.0 as f32 - 0.5) / scale);
+                        let ink_bottom = glyph.position.y
+                            + px((bounds.origin.y.0 as f32 + bounds.size.height.0 as f32 + 0.5)
+                                / scale);
+                        height = height.max(intrinsic_height_for_ink(
+                            line.ascent(),
+                            line.descent(),
+                            ink_top,
+                            ink_bottom,
+                        ));
+                    }
+                }
+            }
+        }
+        px((height.0 * scale).ceil() / scale)
     }
 
     /// Rounds a logical value to the nearest device pixel.
@@ -4006,6 +4096,18 @@ impl Window {
                     size: self.viewport_size,
                 },
             })
+    }
+
+    /// Whether local paint bounds can contribute pixels to the current clip.
+    /// Accounts for ancestor transforms and leaves room for raster rounding.
+    pub fn is_bounds_visible(&self, bounds: Bounds<Pixels>) -> bool {
+        let bounds = self.transform_hitbox_bounds(bounds, self.current_transform());
+        let padding = px(2.0 / self.scale_factor());
+        let mask = self.content_mask().bounds;
+        bounds.right() + padding >= mask.left()
+            && bounds.left() - padding <= mask.right()
+            && bounds.bottom() + padding >= mask.top()
+            && bounds.top() - padding <= mask.bottom()
     }
 
     /// Provide elements in the called function with a new namespace in which their identifiers must be unique.

@@ -32,6 +32,8 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
+#[cfg(feature = "snapshot")]
+use gpui::{BackgroundExecutor, Task};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, ExternalDragPayload, GpuSpecs,
     Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
@@ -1972,6 +1974,14 @@ impl PlatformWindow for WaylandWindow {
 
     fn on_button_layout_changed(&self, callback: Box<dyn FnMut()>) {
         self.0.callbacks.borrow_mut().button_layout_changed = Some(callback);
+    }
+
+    #[cfg(feature = "snapshot")]
+    fn supports_region_capture(&self) -> bool { true }
+
+    #[cfg(feature = "snapshot")]
+    fn capture_region(&self, bounds: Bounds<DevicePixels>, executor: &BackgroundExecutor) -> Task<anyhow::Result<image::RgbaImage>> {
+        self.0.state.borrow_mut().renderer.capture_region(bounds, executor)
     }
 
     fn draw(&self, scene: &Scene) {

@@ -1,3 +1,4 @@
+use crate::clipboard::clipboard_write_text;
 use crate::dispatcher::WebDispatcher;
 use crate::display::WebDisplay;
 use crate::events::EventListenerHandle;
@@ -840,7 +841,7 @@ impl Platform for WebPlatform {
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
-        if let Some(text) = item.text()
+        if let Some(text) = clipboard_write_text(&item)
             && let Some(window) = web_sys::window()
         {
             // Fire-and-forget; called synchronously inside the user's input

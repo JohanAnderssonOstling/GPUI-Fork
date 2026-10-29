@@ -8,8 +8,8 @@ use cosmic_text::{
 use gpui::{
     Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun, GlyphId,
     LineLayout, Pixels, PlatformTextSystem, RenderGlyphParams, SUBPIXEL_VARIANTS_X,
-    SUBPIXEL_VARIANTS_Y, ShapedGlyph, ShapedRun, SharedString, Size, TextRenderingMode, point,
-    size,
+    SUBPIXEL_VARIANTS_Y, ShapedCluster, ShapedGlyph, ShapedRun, SharedString, Size,
+    TextRenderingMode, point, px, size,
 };
 
 use itertools::Itertools;
@@ -293,19 +293,8 @@ impl CosmicTextSystemState {
                 .get_font(font_id, cosmic_text::Weight::NORMAL)
                 .context("Could not load font")?;
 
-            // HACK: To let the storybook run and render Windows caption icons. We should actually do better font fallback.
-            let allowed_bad_font_names = [
-                "SegoeFluentIcons", // NOTE: Segoe fluent icons postscript name is inconsistent
-                "Segoe Fluent Icons",
-            ];
-
-            if font.as_swash().charmap().map('m') == 0
-                && !allowed_bad_font_names.contains(&postscript_name.as_str())
-            {
-                self.font_system.db_mut().remove_face(font.id());
-                continue;
-            };
-
+            // Script-specific and symbol fonts can legitimately lack Latin glyphs.
+            // get_font already validates that this face can be loaded.
             let font_id = FontId(self.loaded_fonts.len());
             loaded_font_ids.push(font_id);
             self.loaded_fonts.push(LoadedFont {
@@ -531,6 +520,14 @@ impl CosmicTextSystemState {
         let segment =
             self.layout_line_no_separators(&text[range.clone()], font_size, &segment_font_runs);
 
+        layout
+            .clusters
+            .extend(segment.clusters.into_iter().map(|mut cluster| {
+                cluster.bytes = cluster.bytes.start + range.start..cluster.bytes.end + range.start;
+                cluster.x += layout.width;
+                cluster
+            }));
+
         let mut segment_runs = segment.runs;
         for run in &mut segment_runs {
             for glyph in &mut run.glyphs {
@@ -679,6 +676,7 @@ impl CosmicTextSystemState {
                 ascent: Pixels::ZERO,
                 descent: Pixels::ZERO,
                 runs: Vec::new(),
+                clusters: Vec::new(),
                 len: text.len(),
             };
         };
@@ -740,6 +738,7 @@ impl CosmicTextSystemState {
             ascent: layout.max_ascent.into(),
             descent: layout.max_descent.into(),
             runs,
+            clusters: shaped_clusters(layout),
             len: text.len(),
         };
         self.retain_shaping_scratch(line, layout_lines);
@@ -762,6 +761,32 @@ impl CosmicTextSystemState {
             self.shape_line = Some(line);
         }
     }
+}
+
+fn shaped_clusters(layout: &CosmicLayoutLine) -> Vec<ShapedCluster> {
+    let mut clusters: Vec<ShapedCluster> = Vec::with_capacity(layout.glyphs.len());
+    for glyph in &layout.glyphs {
+        if let Some(cluster) = clusters.last_mut().filter(|cluster| {
+            cluster.bytes == (glyph.start..glyph.end) && cluster.is_rtl == glyph.level.is_rtl()
+        }) {
+            cluster.x = cluster.x.min(px(glyph.x));
+            cluster.advance += px(glyph.w);
+        } else {
+            clusters.push(ShapedCluster {
+                bytes: glyph.start..glyph.end,
+                x: px(glyph.x),
+                advance: px(glyph.w),
+                is_rtl: glyph.level.is_rtl(),
+            });
+        }
+    }
+    if !clusters
+        .windows(2)
+        .all(|pair| pair[0].bytes.start <= pair[1].bytes.start)
+    {
+        clusters.sort_unstable_by_key(|cluster| cluster.bytes.start);
+    }
+    clusters
 }
 
 fn shape_line_buffer_bytes(line: &ShapeLine) -> usize {
@@ -1066,6 +1091,7 @@ fn check_is_known_emoji_font(postscript_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{font, px};
 
     fn fid(i: usize) -> FontId {
         FontId(i)
@@ -1099,6 +1125,98 @@ mod tests {
         let text_system = CosmicTextSystem::new_without_system_fonts("IBM Plex Sans");
         text_system.add_fonts(vec![Cow::Borrowed(IBM_PLEX)])?;
         Ok(text_system)
+    }
+
+    #[test]
+    fn non_latin_face_loads_and_remains_available_for_glyph_fallback() -> Result<()> {
+        let text_system = text_system()?;
+        text_system.add_fonts(vec![Cow::Borrowed(include_bytes!("../fixtures/cjk.ttf"))])?;
+        let cjk = text_system.font_id(&font("GPUI CJK Test"))?;
+        assert!(text_system.glyph_for_char(cjk, 'm').is_none());
+        assert!(text_system.glyph_for_char(cjk, '漢').is_some());
+        assert_eq!(text_system.font_id(&font("GPUI CJK Test"))?, cjk);
+        assert!(
+            text_system
+                .all_font_names()
+                .iter()
+                .any(|name| name == "GPUI CJK Test")
+        );
+
+        let mut descriptor = font("IBM Plex Sans");
+        descriptor.fallbacks = Some(FontFallbacks::from_fonts(vec!["GPUI CJK Test".into()]));
+        let primary = text_system.font_id(&descriptor)?;
+        let text = "Latin 漢";
+        let layout = text_system.layout_line(
+            text,
+            px(14.0),
+            &[FontRun {
+                len: text.len(),
+                font_id: primary,
+            }],
+        );
+        assert!(
+            layout
+                .runs
+                .iter()
+                .any(|run| run.font_id == cjk && run.glyphs.iter().any(|glyph| glyph.id.0 != 0))
+        );
+
+        let primary = text_system.font_id(&font("IBM Plex Sans"))?;
+        let layout = text_system.layout_line(
+            text,
+            px(14.0),
+            &[FontRun {
+                len: text.len(),
+                font_id: primary,
+            }],
+        );
+        assert!(
+            layout
+                .runs
+                .iter()
+                .any(|run| run.font_id == cjk && run.glyphs.iter().any(|glyph| glyph.id.0 != 0))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shared_text_system_reports_a_missing_family_without_falling_back() -> Result<()> {
+        let text_system = gpui::TextSystem::new(Arc::new(text_system()?));
+        assert!(text_system.font_id(&font("Missing CJK family")).is_err());
+        let latin = text_system.font_id(&font("IBM Plex Sans"))?;
+        assert!(text_system.advance(latin, px(14.0), '漢').is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn registering_non_latin_fallback_preserves_latin_layout() -> Result<()> {
+        let text_system = text_system()?;
+        let text = "Office AV ffi café Ångström 123 — a\u{301}";
+        let before = layout_text(&text_system, text)?;
+        text_system.add_fonts(vec![Cow::Borrowed(include_bytes!("../fixtures/cjk.ttf"))])?;
+        let after = layout_text(&text_system, text)?;
+        assert_eq!(
+            (before.width, before.ascent, before.descent, before.len),
+            (after.width, after.ascent, after.descent, after.len)
+        );
+        let glyphs = |line: &LineLayout| {
+            line.runs
+                .iter()
+                .flat_map(|run| {
+                    run.glyphs.iter().map(move |glyph| {
+                        (
+                            run.font_id,
+                            glyph.id,
+                            glyph.position,
+                            glyph.index,
+                            glyph.is_emoji,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(glyphs(&before), glyphs(&after));
+        Ok(())
     }
 
     fn layout_text(text_system: &CosmicTextSystem, text: &str) -> Result<LineLayout> {

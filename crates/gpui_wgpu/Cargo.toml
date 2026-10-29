@@ -12,6 +12,7 @@ workspace = true
 path = "src/gpui_wgpu.rs"
 
 [features]
+snapshot = ["dep:image", "gpui/snapshot"]
 default = []
 font-kit = ["dep:font-kit"]
 test-support = ["gpui/test-support", "dep:image"]

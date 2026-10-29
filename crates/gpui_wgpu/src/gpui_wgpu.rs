@@ -1,3 +1,5 @@
+#[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+mod region_capture;
 mod cosmic_text_system;
 #[cfg(not(target_family = "wasm"))]
 mod pipeline_cache;

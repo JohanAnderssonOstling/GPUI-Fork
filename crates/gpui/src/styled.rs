@@ -745,6 +745,14 @@ pub trait Styled: Sized {
     /// Sets the line height of this element and its children.
     fn line_height(mut self, line_height: impl Into<DefiniteLength>) -> Self {
         self.text_style().line_height = Some(line_height.into());
+        self.text_style().line_height_auto = Some(false);
+        self
+    }
+
+    /// Size text lines intrinsically, including fallback fonts and glyphs
+    /// extending beyond the font's nominal ascent or descent.
+    fn line_height_auto(mut self) -> Self {
+        self.text_style().line_height_auto = Some(true);
         self
     }
 

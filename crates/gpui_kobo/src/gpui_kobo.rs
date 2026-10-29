@@ -5,10 +5,12 @@
 //! deliberately e-ink-specific backend rather than a desktop compatibility layer.
 
 mod platform;
+mod touch_decoder;
+pub use touch_decoder::KoboTouchProtocol;
 mod virtual_keyboard;
 pub use platform::{
-    take_power_menu_request, take_power_message, request_sleep,
-    KoboExperienceMode, KoboPlatform, KoboPlatformOptions, KoboPowerOptions, KoboPowerEvent, KoboWindow, PageButtonBehavior,
+    take_power_menu_request, take_power_message, request_sleep, on_power_event, on_prepare_sleep, on_idle_sleep_check,
+    KoboExperienceMode, KoboInputProfile, KoboPlatform, KoboPlatformOptions, KoboPowerOptions, KoboPowerEvent, KoboWindow, PageButtonBehavior,
     begin_application_startup_profile, begin_book_launch_profile, current_experience_mode,
     current_render_mode, request_auto_rotation, request_experience_mode, request_full_repaint,
     request_reader_page_repaint, request_render_mode,
@@ -990,6 +992,10 @@ impl KoboRenderer {
         let history_regions = regions.clone();
         let region_count = history_regions.len();
         let damage = regions.into_iter().reduce(union_pixel_rect).unwrap_or(full);
+        let grayscale_regions = snapshot.primitives.iter().filter_map(|primitive| {
+            matches!(primitive.primitive, ScenePrimitive::PolychromeSprite { .. })
+                .then_some(primitive.bounds)
+        }).collect();
         let next_generation = self.frame_generation.wrapping_add(1).max(1);
         self.frame_generation = next_generation;
         self.damage_history.push_back(FrameDamage {
@@ -1012,7 +1018,7 @@ impl KoboRenderer {
             );
         }
         Ok(Some((
-            GrayFrame::pooled(target, next_generation, &self.frame_pool),
+            GrayFrame::pooled(target, next_generation, &self.frame_pool, grayscale_regions),
             damage,
         )))
     }
@@ -1293,25 +1299,37 @@ pub struct GrayFrame(Arc<GrayFrameInner>);
 
 struct GrayFrameInner {
     image: GrayImage,
+    grayscale_regions: Vec<PixelRect>,
     generation: u64,
     pool: Option<Weak<Mutex<Vec<FramePoolEntry>>>>,
 }
 
 impl GrayFrame {
-    fn pooled(image: GrayImage, generation: u64, pool: &Arc<Mutex<Vec<FramePoolEntry>>>) -> Self {
+    fn pooled(image: GrayImage, generation: u64, pool: &Arc<Mutex<Vec<FramePoolEntry>>>, grayscale_regions: Vec<PixelRect>) -> Self {
         Self(Arc::new(GrayFrameInner {
             image,
+            grayscale_regions,
             generation,
             pool: Some(Arc::downgrade(pool)),
         }))
     }
 
     pub fn unpooled(image: GrayImage) -> Self {
+        Self::unpooled_with_grayscale_regions(image, Vec::new())
+    }
+
+    pub(crate) fn unpooled_with_grayscale_regions(image: GrayImage, grayscale_regions: Vec<PixelRect>) -> Self {
         Self(Arc::new(GrayFrameInner {
             image,
+            grayscale_regions,
             generation: 0,
             pool: None,
         }))
+    }
+
+    /// Visible bitmap artwork that must retain grayscale during presentation.
+    pub fn grayscale_regions(&self) -> &[PixelRect] {
+        &self.0.grayscale_regions
     }
 
     pub(crate) fn image_mut(&mut self) -> &mut GrayImage {

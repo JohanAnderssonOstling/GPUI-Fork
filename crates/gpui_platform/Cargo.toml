@@ -13,6 +13,7 @@ path = "src/gpui_platform.rs"
 
 [features]
 default = []
+snapshot = ["gpui/snapshot", "gpui_linux/snapshot", "gpui_windows/snapshot", "gpui_macos/snapshot"]
 font-kit = ["gpui_macos/font-kit"]
 test-support = [
     "gpui/test-support",

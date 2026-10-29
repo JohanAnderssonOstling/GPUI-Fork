@@ -509,6 +509,10 @@ pub struct TextStyle {
     /// The line height to use, in pixels or fractions
     pub line_height: DefiniteLength,
 
+    /// Size text lines from the shaped font metrics and glyph extents instead
+    /// of a fixed line height. Explicit line-height styling disables this.
+    pub line_height_auto: bool,
+
     /// The font weight, e.g. bold
     pub font_weight: FontWeight,
 
@@ -547,6 +551,7 @@ impl Default for TextStyle {
             font_fallbacks: None,
             font_size: rems(1.).into(),
             line_height: phi(),
+            line_height_auto: false,
             font_weight: FontWeight::default(),
             font_style: FontStyle::default(),
             background_color: None,
@@ -605,7 +610,9 @@ impl TextStyle {
         }
     }
 
-    /// Returns the rounded line height in pixels.
+    /// Returns the configured explicit line height in pixels.
+    /// For intrinsic text, use `Window::line_height` for font metrics or
+    /// `TextLayout::line_height` after measurement to include actual glyph ink.
     pub fn line_height_in_pixels(&self, rem_size: Pixels) -> Pixels {
         self.line_height.to_pixels(self.font_size, rem_size).round()
     }

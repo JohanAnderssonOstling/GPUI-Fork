@@ -12,6 +12,7 @@ workspace = true
 path = "src/gpui_macos.rs"
 
 [features]
+snapshot = ["gpui/snapshot", "gpui_apple/snapshot"]
 default = ["gpui/default"]
 test-support = ["gpui/test-support", "gpui_apple/test-support"]
 runtime_shaders = ["gpui_apple/runtime_shaders"]

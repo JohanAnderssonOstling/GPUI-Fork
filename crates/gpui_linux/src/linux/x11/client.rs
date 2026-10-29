@@ -60,10 +60,11 @@ use crate::linux::{
 use crate::linux::{LinuxCommon, LinuxKeyboardLayout, X11Window, modifiers_from_xinput_info};
 
 use gpui::{
-    AnyWindowHandle, ApplicationDrag, Bounds, ClipboardItem, CursorStyle, DisplayId, FileDropEvent,
-    Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, Pixels, PlatformDisplay,
-    PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point, RequestFrameOptions, ScrollDelta,
-    Size, TouchPhase, WindowButtonLayout, WindowParams, point, px,
+    AnyWindowHandle, ApplicationDrag, Bounds, ClipboardEntry, ClipboardItem, CursorStyle,
+    DisplayId, FileDropEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, Pixels,
+    PlatformDisplay, PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point,
+    RequestFrameOptions, ScrollDelta, Size, TouchPhase, WindowButtonLayout, WindowParams, point,
+    px,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 
@@ -1906,13 +1907,23 @@ impl LinuxClient for X11Client {
 
     fn write_to_clipboard(&self, item: gpui::ClipboardItem) {
         let mut state = self.0.borrow_mut();
-        state
-            .clipboard
-            .set_text(
+        let result = if let Some(image) = item.entries().iter().find_map(|entry| match entry {
+            ClipboardEntry::Image(image) => Some(image),
+            _ => None,
+        }) {
+            state.clipboard.set_image(
+                image.clone(),
+                clipboard::ClipboardKind::Clipboard,
+                clipboard::WaitConfig::None,
+            )
+        } else {
+            state.clipboard.set_text(
                 std::borrow::Cow::Owned(item.text().unwrap_or_default()),
                 clipboard::ClipboardKind::Clipboard,
                 clipboard::WaitConfig::None,
             )
+        };
+        result
             .context("X11: Failed to write to clipboard (clipboard)")
             .log_with_level(log::Level::Debug);
         state.clipboard_item.replace(item);

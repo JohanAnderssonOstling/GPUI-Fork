@@ -74,6 +74,11 @@ impl ShapedLine {
             ascent: layout.ascent,
             descent: layout.descent,
             runs: layout.runs.clone(),
+            clusters: if len == layout.len {
+                layout.clusters.clone()
+            } else {
+                Vec::new()
+            },
             len,
         });
         self
@@ -813,6 +818,7 @@ mod tests {
                     font_id: FontId(0),
                     glyphs: shaped_glyphs,
                 }],
+                clusters: Vec::new(),
                 len: text.len(),
             }),
             text: SharedString::new(text),
@@ -931,6 +937,7 @@ mod tests {
                         ],
                     },
                 ],
+                clusters: Vec::new(),
                 len: 6,
             }),
             text: "abcdef".into(),

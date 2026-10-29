@@ -301,26 +301,23 @@ fn run_self_test() -> Result<()> {
         .flush(scheduler_started)
         .context("SELFTEST FAIL repaint flush")?;
     ensure!(
-        coalesced.mode == RefreshMode::FastMono
+        coalesced.mode == RefreshMode::PartialGray
             && coalesced.update.damage.x == 2
             && coalesced.update.damage.y == 3
             && coalesced.update.damage.width == 7
             && coalesced.update.damage.height == 8,
         "SELFTEST FAIL repaint coalescing"
     );
-    let idle = scheduler
-        .idle_cleanup(scheduler_started + Duration::from_millis(101))
-        .context("SELFTEST FAIL idle cleanup was not scheduled")?;
     ensure!(
-        idle.mode == RefreshMode::PartialGray,
-        "SELFTEST FAIL idle cleanup waveform"
+        scheduler.idle_cleanup(scheduler_started + Duration::from_millis(101)).is_none(),
+        "SELFTEST FAIL grayscale update scheduled redundant idle cleanup"
     );
     ensure!(
-        presenter_self_test(&idle.update.image, idle.update.damage)? == 56,
+        presenter_self_test(&coalesced.update.image, coalesced.update.damage)? == 56,
         "SELFTEST FAIL native presenter buffer sizing"
     );
     println!(
-        "SELFTEST PASS repaint_scheduler coalesced=true idle_cleanup=true direct_buffer_pixels=56"
+        "SELFTEST PASS repaint_scheduler coalesced=true gc16_only=true idle_cleanup=false direct_buffer_pixels=56"
     );
 
     let (red_gray, red_alpha) = rgba8_to_grayscale([255, 0, 0, 128], 0.5);
