@@ -2,10 +2,14 @@ use anyhow::Result;
 use collections::{FxHashMap, FxHashSet};
 use sha2::{Digest, Sha256};
 use std::{borrow::Cow, ptr};
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::{Path, PathBuf};
 
 #[derive(Default)]
 pub(crate) struct FontRegistrations {
     by_length: FxHashMap<usize, RegisteredFonts>,
+    #[cfg(not(target_arch = "wasm32"))]
+    files: FxHashSet<PathBuf>,
 }
 
 enum RegisteredFonts {
@@ -14,6 +18,20 @@ enum RegisteredFonts {
 }
 
 impl FontRegistrations {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn add_font_file(
+        &mut self,
+        path: &Path,
+        register: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
+        let path = path.canonicalize()?;
+        if !self.files.contains(&path) {
+            register(&path)?;
+            self.files.insert(path);
+        }
+        Ok(())
+    }
+
     pub(crate) fn add_fonts(
         &mut self,
         fonts: Vec<Cow<'static, [u8]>>,

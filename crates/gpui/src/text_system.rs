@@ -134,6 +134,14 @@ impl TextSystem {
         })
     }
 
+    /// Register a font file without retaining a heap copy of its contents.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn add_font_file(&self, path: &std::path::Path) -> Result<()> {
+        self.font_registrations.lock().add_font_file(path, |path| {
+            self.platform_text_system.add_font_file(path)
+        })
+    }
+
     /// Resolve the requested family and style without using the default font stack.
     pub fn font_id(&self, font: &Font) -> Result<FontId> {
         fn clone_font_id_result(font_id: &Result<FontId>) -> Result<FontId> {

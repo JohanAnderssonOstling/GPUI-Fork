@@ -1194,6 +1194,11 @@ pub trait PlatformDispatcher: Send + Sync {
 #[expect(missing_docs)]
 pub trait PlatformTextSystem: Send + Sync {
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()>;
+    /// Register a reloadable font file when the backend supports file sources.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn add_font_file(&self, path: &std::path::Path) -> Result<()> {
+        self.add_fonts(vec![Cow::Owned(std::fs::read(path)?)])
+    }
     /// Get all available font names.
     fn all_font_names(&self) -> Vec<String>;
     /// Avoid discovering system fonts when the backend tracks registered families separately.

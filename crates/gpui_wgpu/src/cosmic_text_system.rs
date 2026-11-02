@@ -129,6 +129,12 @@ impl PlatformTextSystem for CosmicTextSystem {
         self.0.write().add_fonts(fonts)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn add_font_file(&self, path: &std::path::Path) -> Result<()> {
+        self.0.write().font_system.db_mut().load_font_file(path)?;
+        Ok(())
+    }
+
     fn all_font_names(&self) -> Vec<String> {
         let mut names = self.registered_font_names();
         let allow_system_fonts = self.0.read().allow_system_fonts;
@@ -1559,7 +1565,7 @@ fn metrics_for_font(font: &CosmicTextFont, angle: Option<f32>, slant_axis: bool)
 
 fn cosmic_font_features(features: &FontFeatures) -> Result<CosmicFontFeatures> {
     let mut result = CosmicFontFeatures::new();
-    for feature in features.0.iter() {
+    for feature in features.tag_value_list() {
         let name_bytes: [u8; 4] = feature
             .0
             .as_bytes()
