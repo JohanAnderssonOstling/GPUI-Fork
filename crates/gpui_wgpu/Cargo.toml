@@ -22,8 +22,8 @@ gpui.workspace = true
 anyhow.workspace = true
 bytemuck = { version = "1", features = ["extern_crate_alloc"] }
 collections.workspace = true
-# Shaping and rasterization share the local font-instance API.
-cosmic-text = { path = "../../../Html-Prototype/vendor/cosmic-text", version = "0.19.0" }
+# Release workspaces provide the patched font-instance API through Cargo overrides.
+cosmic-text = "0.19.0"
 etagere.workspace = true
 itertools.workspace = true
 image = { workspace = true, optional = true }
@@ -32,7 +32,7 @@ parking_lot.workspace = true
 profiling.workspace = true
 raw-window-handle.workspace = true
 smallvec.workspace = true
-swash = { path = "../../../Html-Prototype/vendor/swash", version = "0.2.10" }
+swash = "0.2.10"
 sys-locale = "0.3"
 unicode-bidi.workspace = true
 unicode-segmentation.workspace = true
