@@ -5,4 +5,6 @@
 //! by GPUI's Apple platform backends.
 
 mod metal_atlas;
+#[cfg(feature = "snapshot")]
+mod metal_capture;
 pub mod metal_renderer;

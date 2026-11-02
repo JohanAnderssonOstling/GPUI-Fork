@@ -1,5 +1,8 @@
 //! Convenience crate that re-exports GPUI's platform traits and the
 //! `current_platform` constructor so consumers don't need `#[cfg]` gating.
+//!
+//! Native system notifications require the `system-notifications` feature.
+//! Without it, the platform notification methods use GPUI's no-op defaults.
 
 pub use gpui::Platform;
 
@@ -33,16 +36,14 @@ pub fn application_with_web_backend(backend_preference: WebBackendPreference) ->
         true,
         backend_preference,
     ));
-    let http_client = std::sync::Arc::new(platform.fetch_http_client());
-    gpui::Application::with_platform(platform).with_http_client(http_client)
+    gpui::Application::with_platform(platform)
 }
 
 /// Unlike `application`, this function returns a single-threaded web application.
 #[cfg(target_family = "wasm")]
 pub fn single_threaded_web() -> gpui::Application {
     let platform = Rc::new(gpui_web::WebPlatform::new(false));
-    let http_client = std::sync::Arc::new(platform.fetch_http_client());
-    gpui::Application::with_platform(platform).with_http_client(http_client)
+    gpui::Application::with_platform(platform)
 }
 
 /// Initializes panic hooks and logging for the web platform.

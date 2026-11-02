@@ -386,9 +386,15 @@ impl ListState {
         let new_items = state
             .items
             .iter()
-            .map(|item| ListItem::Unmeasured {
-                size_hint: Some(item.size_hint().unwrap_or(size_hint)),
-                focus_handle: item.focus_handle(),
+            .map(|item| match item {
+                ListItem::Unmeasured {
+                    size_hint: None,
+                    focus_handle,
+                } => ListItem::Unmeasured {
+                    size_hint: Some(size_hint),
+                    focus_handle: focus_handle.clone(),
+                },
+                _ => item.clone(),
             })
             .collect::<Vec<_>>();
         let mut tree = SumTree::default();
@@ -507,6 +513,27 @@ impl ListState {
         self.splice_focusable(old_range, (0..count).map(|_| None))
     }
 
+    /// Replace a range with unmeasured rows carrying an estimated height.
+    /// Measurements and focus handles outside the range remain intact.
+    pub fn splice_with_uniform_height(
+        &self,
+        old_range: Range<usize>,
+        count: usize,
+        height: Pixels,
+    ) {
+        let size_hint = Some(Size {
+            width: px(0.),
+            height,
+        });
+        self.splice_items(
+            old_range,
+            (0..count).map(|_| ListItem::Unmeasured {
+                size_hint,
+                focus_handle: None,
+            }),
+        );
+    }
+
     /// Register with the list state that the items in `old_range` have been replaced
     /// by new items. As opposed to [`Self::splice`], this method allows an iterator of optional focus handles
     /// to be supplied to properly integrate with items in the list that can be focused. If a focused item
@@ -516,6 +543,18 @@ impl ListState {
         old_range: Range<usize>,
         focus_handles: impl IntoIterator<Item = Option<FocusHandle>>,
     ) {
+        self.splice_items(
+            old_range,
+            focus_handles
+                .into_iter()
+                .map(|focus_handle| ListItem::Unmeasured {
+                    size_hint: None,
+                    focus_handle,
+                }),
+        );
+    }
+
+    fn splice_items(&self, old_range: Range<usize>, items: impl IntoIterator<Item = ListItem>) {
         let state = &mut *self.0.borrow_mut();
 
         let mut old_items = state.items.cursor::<Count>(());
@@ -523,16 +562,7 @@ impl ListState {
         old_items.seek_forward(&Count(old_range.end), Bias::Right);
 
         let mut spliced_count = 0;
-        new_items.extend(
-            focus_handles.into_iter().map(|focus_handle| {
-                spliced_count += 1;
-                ListItem::Unmeasured {
-                    size_hint: None,
-                    focus_handle,
-                }
-            }),
-            (),
-        );
+        new_items.extend(items.into_iter().inspect(|_| spliced_count += 1), ());
         new_items.append(old_items.suffix(), ());
         drop(old_items);
         state.items = new_items;
@@ -1812,15 +1842,53 @@ impl sum_tree::SeekTarget<'_, ListItemSummary, ListItemSummary> for Height {
 #[cfg(test)]
 mod test {
 
+    use super::ListItem;
     use gpui::{ScrollDelta, ScrollWheelEvent};
     use std::cell::Cell;
     use std::rc::Rc;
+    use sum_tree::SumTree;
 
     use crate::{
         self as gpui, AppContext, Bounds, Context, Element, FollowMode, InteractiveElement,
         IntoElement, ListState, Render, Styled, TestAppContext, Window, canvas, div, list, point,
         px, size,
     };
+
+    #[test]
+    fn test_splice_height_estimates_preserve_measurements_and_scroll_anchor() {
+        let state = ListState::new(0, crate::ListAlignment::Top, px(0.));
+        state.0.borrow_mut().items = SumTree::from_iter(
+            [20., 40., 60.].map(|height| ListItem::Measured {
+                size: size(px(100.), px(height)),
+                focus_handle: None,
+            }),
+            (),
+        );
+        state.scroll_to(gpui::ListOffset {
+            item_ix: 2,
+            offset_in_item: px(5.),
+        });
+        state.splice_with_uniform_height(1..2, 2, px(80.));
+        // Seeding missing estimates must also preserve measured rows. This
+        // happens after a sidebar's width changes and visible rows are laid out.
+        state.clone().with_uniform_item_height(px(80.));
+        {
+            let stored = state.0.borrow();
+            let items = stored.items.iter().collect::<Vec<_>>();
+            assert_eq!(items.len(), 4);
+            assert_eq!(items[0].size(), Some(size(px(100.), px(20.))));
+            for item in &items[1..3] {
+                assert!(item.size().is_none());
+                assert_eq!(item.size_hint(), Some(size(px(0.), px(80.))));
+            }
+            assert_eq!(items[3].size(), Some(size(px(100.), px(60.))));
+        }
+        assert_eq!(state.logical_scroll_top().item_ix, 3);
+        assert_eq!(state.logical_scroll_top().offset_in_item, px(5.));
+        state.splice_with_uniform_height(1..3, 0, px(80.));
+        assert_eq!(state.0.borrow().items.summary().rendered_count, 2);
+        assert_eq!(state.logical_scroll_top().item_ix, 1);
+    }
 
     #[gpui::test]
     fn test_autoscroll_above_item_top_renders_items_above(cx: &mut TestAppContext) {

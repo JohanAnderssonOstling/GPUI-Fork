@@ -1,11 +1,13 @@
 mod font_fallbacks;
 mod font_features;
+mod font_registrations;
 mod line;
 mod line_layout;
 mod line_wrapper;
 
 pub use font_fallbacks::*;
 pub use font_features::*;
+use font_registrations::FontRegistrations;
 pub use line::*;
 pub use line_layout::*;
 pub use line_wrapper::*;
@@ -50,6 +52,7 @@ pub const SUBPIXEL_VARIANTS_Y: u8 = 1;
 /// The GPUI text rendering sub system.
 pub struct TextSystem {
     platform_text_system: Arc<dyn PlatformTextSystem>,
+    font_registrations: Mutex<FontRegistrations>,
     font_ids_by_font: RwLock<FxHashMap<Font, Result<FontId>>>,
     font_metrics: RwLock<FxHashMap<FontId, FontMetrics>>,
     raster_bounds: RwLock<FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>>,
@@ -63,6 +66,7 @@ impl TextSystem {
     pub fn new(platform_text_system: Arc<dyn PlatformTextSystem>) -> Self {
         TextSystem {
             platform_text_system,
+            font_registrations: Mutex::default(),
             font_metrics: RwLock::default(),
             raster_bounds: RwLock::default(),
             font_ids_by_font: RwLock::default(),
@@ -86,7 +90,15 @@ impl TextSystem {
 
     /// Get a list of all available font names from the operating system.
     pub fn all_font_names(&self) -> Vec<String> {
-        let mut names = self.platform_text_system.all_font_names();
+        self.font_names_with_fallbacks(self.platform_text_system.all_font_names())
+    }
+
+    /// Avoid system-font discovery for families already registered with the backend.
+    pub fn registered_font_names(&self) -> Vec<String> {
+        self.font_names_with_fallbacks(self.platform_text_system.registered_font_names())
+    }
+
+    fn font_names_with_fallbacks(&self, mut names: Vec<String>) -> Vec<String> {
         names.extend(
             self.fallback_font_stack
                 .iter()
@@ -98,13 +110,32 @@ impl TextSystem {
         names
     }
 
-    /// Add a font's data to the text system.
-    pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
-        self.platform_text_system.add_fonts(fonts)
+    /// Release font data retained by previews while preserving existing font IDs.
+    pub fn release_font_data(&self) {
+        self.platform_text_system.release_font_data();
     }
 
-    /// Get the FontId for the configure font family and style.
-    fn font_id(&self, font: &Font) -> Result<FontId> {
+    /// Release completed shaping scratch after a batch of layout requests.
+    pub fn release_shaping_scratch(&self) {
+        self.platform_text_system.release_shaping_scratch();
+    }
+
+    /// Check font coverage without populating the rendering caches.
+    pub fn font_supports_any_text(&self, font: &Font, samples: &[&str]) -> bool {
+        self.platform_text_system.font_supports_any_text(font, samples)
+    }
+
+    /// Add a font's data to the text system, reusing identical registered data.
+    pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+        // Readers and windows share this text system. Keep the lock through
+        // registration so concurrent callers cannot install duplicate copies.
+        self.font_registrations.lock().add_fonts(fonts, |font| {
+            self.platform_text_system.add_fonts(vec![font])
+        })
+    }
+
+    /// Resolve the requested family and style without using the default font stack.
+    pub fn font_id(&self, font: &Font) -> Result<FontId> {
         fn clone_font_id_result(font_id: &Result<FontId>) -> Result<FontId> {
             match font_id {
                 Ok(font_id) => Ok(*font_id),
@@ -149,8 +180,11 @@ impl TextSystem {
         if let Ok(font_id) = self.font_id(font) {
             return font_id;
         }
+        // A missing family must not discard the requested style or weight.
+        let mut fallback_font = font.clone();
         for fallback in &self.fallback_font_stack {
-            if let Ok(font_id) = self.font_id(fallback) {
+            fallback_font.family = fallback.family.clone();
+            if let Ok(font_id) = self.font_id(&fallback_font) {
                 return font_id;
             }
         }
@@ -687,6 +721,41 @@ impl WindowTextSystem {
         runs: &[TextRun],
         force_width: Option<Pixels>,
     ) -> Arc<LineLayout> {
+        let font_runs = self.resolve_font_runs(runs);
+        let layout = self.line_layout_cache.layout_line(
+            &SharedString::new(text),
+            font_size,
+            &font_runs,
+            force_width,
+        );
+
+        self.font_runs_pool.lock().push(font_runs);
+
+        layout
+    }
+
+    /// Shape a line without retaining its text or layout in the frame cache.
+    ///
+    /// Use this when the caller converts the result into its own persistent
+    /// paint resources. The returned layout has its natural shaped width.
+    pub fn layout_line_uncached(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[TextRun],
+    ) -> LineLayout {
+        let font_runs = self.resolve_font_runs(runs);
+        let layout = self.platform_text_system.layout_line_reusing_clusters(text, font_size, &font_runs);
+        self.font_runs_pool.lock().push(font_runs);
+        layout
+    }
+
+    /// Return consumed cluster storage to the platform's bounded shaping scratch.
+    pub fn recycle_line_clusters(&self, clusters: Vec<ShapedCluster>) {
+        self.platform_text_system.recycle_line_clusters(clusters);
+    }
+
+    fn resolve_font_runs(&self, runs: &[TextRun]) -> Vec<FontRun> {
         let mut last_run = None::<&TextRun>;
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
         font_runs.clear();
@@ -719,16 +788,7 @@ impl WindowTextSystem {
             }
         }
 
-        let layout = self.line_layout_cache.layout_line(
-            &SharedString::new(text),
-            font_size,
-            &font_runs,
-            force_width,
-        );
-
-        self.font_runs_pool.lock().push(font_runs);
-
-        layout
+        font_runs
     }
 
     /// Returns the shaped layout width of for the given character, in the given font and size.
@@ -1067,6 +1127,7 @@ pub struct RenderGlyphParams {
     pub is_emoji: bool,
     pub subpixel_rendering: bool,
     pub dilation: u8,
+    pub foreground_color: Option<[u8; 4]>,
 }
 
 impl Eq for RenderGlyphParams {}
@@ -1081,6 +1142,132 @@ impl Hash for RenderGlyphParams {
         self.is_emoji.hash(state);
         self.subpixel_rendering.hash(state);
         self.dilation.hash(state);
+        self.foreground_color.hash(state);
+    }
+}
+
+/// A built-in CPAL palette selected by index or background suitability.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum FontPaletteBase {
+    /// The first palette in the font.
+    #[default]
+    Normal,
+    /// A numbered CPAL palette, falling back to the first if absent.
+    Index(u16),
+    /// The first palette marked suitable for a light background.
+    Light,
+    /// The first palette marked suitable for a dark background.
+    Dark,
+}
+
+/// Immutable colors for a color-font instance. Overrides are RGBA entries;
+/// the last override for a repeated index wins.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct FontPalette {
+    /// Which built-in palette supplies unmodified entries.
+    pub base: FontPaletteBase,
+    /// Replacement palette entries in RGBA order.
+    pub colors: Arc<[(u16, [u8; 4])]>,
+    /// Family-specific palettes, selected after resolving fallback glyphs.
+    /// The last matching family wins; unmatched fonts use `base` and `colors`.
+    #[serde(default)]
+    pub families: Arc<[FontFamilyPalette]>,
+}
+
+/// A color palette restricted to one registered font family.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct FontFamilyPalette {
+    /// Registered family name, including private publication aliases.
+    pub family: SharedString,
+    /// Built-in palette supplying entries without overrides.
+    pub base: FontPaletteBase,
+    /// Replacement palette entries in RGBA order.
+    pub colors: Arc<[(u16, [u8; 4])]>,
+}
+
+/// Width and optional CSS oblique angle for a font instance.
+/// Width is a percentage of normal width; positive angles lean to the right.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, JsonSchema)]
+pub struct FontVariations {
+    stretch: f32,
+    oblique_angle: Option<f32>,
+    slant_axis: bool,
+    synthesis: bool,
+}
+
+impl FontVariations {
+    /// Returns `None` for non-finite values, negative widths or angles outside ±90°.
+    pub fn new(stretch: f32, oblique_angle: Option<f32>) -> Option<Self> {
+        if !stretch.is_finite()
+            || stretch < 0.0
+            || oblique_angle.is_some_and(|angle| !angle.is_finite() || angle.abs() > 90.0)
+        {
+            return None;
+        }
+        let canonical = |value: f32| if value == 0.0 { 0.0 } else { value };
+        Some(Self {
+            stretch: canonical(stretch),
+            oblique_angle: oblique_angle.map(canonical),
+            slant_axis: true,
+            synthesis: true,
+        })
+    }
+
+    /// Whether native slant/italic axes may select the requested style.
+    pub fn with_slant_axis(mut self, enabled: bool) -> Self { self.slant_axis = enabled; self }
+    /// Whether a missing slanted design may be synthesized.
+    pub fn with_synthesis(mut self, enabled: bool) -> Self { self.synthesis = enabled; self }
+    /// Permission to select native style axes.
+    pub fn slant_axis(self) -> bool { self.slant_axis }
+    /// Permission to synthesize a slanted outline.
+    pub fn synthesis(self) -> bool { self.synthesis }
+
+    /// Font width as a percentage of normal width.
+    pub fn stretch(self) -> f32 {
+        self.stretch
+    }
+
+    /// Requested oblique angle in CSS degrees, if explicitly selected.
+    pub fn oblique_angle(self) -> Option<f32> {
+        self.oblique_angle
+    }
+}
+
+impl Default for FontVariations {
+    fn default() -> Self {
+        Self {
+            stretch: 100.0,
+            oblique_angle: None,
+            slant_axis: true,
+            synthesis: true,
+        }
+    }
+}
+
+impl Eq for FontVariations {}
+
+impl Hash for FontVariations {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.stretch.to_bits().hash(state);
+        self.slant_axis.hash(state);
+        self.synthesis.hash(state);
+        self.oblique_angle.map(f32::to_bits).hash(state);
+    }
+}
+
+impl<'de> Deserialize<'de> for FontVariations {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Settings {
+            stretch: f32,
+            oblique_angle: Option<f32>,
+            slant_axis: Option<bool>,
+            synthesis: Option<bool>,
+        }
+        let settings = Settings::deserialize(deserializer)?;
+        Self::new(settings.stretch, settings.oblique_angle)
+            .map(|value| value.with_slant_axis(settings.slant_axis.unwrap_or(true)).with_synthesis(settings.synthesis.unwrap_or(true)))
+            .ok_or_else(|| serde::de::Error::custom("invalid font width or oblique angle"))
     }
 }
 
@@ -1103,6 +1290,12 @@ pub struct Font {
 
     /// The font style.
     pub style: FontStyle,
+
+    /// Width and oblique angle for this font instance.
+    pub variations: FontVariations,
+
+    /// Color palette for color-font glyphs.
+    pub palette: Option<FontPalette>,
 }
 
 impl Default for Font {
@@ -1118,6 +1311,8 @@ pub fn font(family: impl Into<SharedString>) -> Font {
         features: FontFeatures::default(),
         weight: FontWeight::default(),
         style: FontStyle::default(),
+        variations: FontVariations::default(),
+        palette: None,
         fallbacks: None,
     }
 }

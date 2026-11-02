@@ -12,8 +12,10 @@ workspace = true
 path = "src/gpui_linux.rs"
 
 [features]
+snapshot = ["gpui/snapshot", "gpui_wgpu?/snapshot", "dep:image"]
 default = ["wayland", "x11"]
 test-support = ["gpui/test-support"]
+system-notifications = ["dep:notify-rust"]
 wayland = [
     "bitflags",
     "gpui_wgpu",
@@ -60,7 +62,7 @@ futures.workspace = true
 gpui.workspace = true
 gpui_util.workspace = true
 gpui_wgpu = { workspace = true, optional = true, features = ["font-kit"] }
-http_client.workspace = true
+image = { workspace = true, optional = true }
 libc.workspace = true
 log.workspace = true
 parking_lot.workspace = true
@@ -71,16 +73,13 @@ url.workspace = true
 uuid.workspace = true
 
 # Always used
-oo7 = { version = "0.6", default-features = false, features = [
-    "async-std",
-    "native_crypto",
-] }
 calloop = "0.14.3"
-notify-rust.workspace = true
+notify-rust = { workspace = true, optional = true }
 raw-window-handle.workspace = true
 
 # Used in both windowing options
-ashpd = { workspace = true, optional = true }
+# GPUI uses a subset of the portals enabled for Zed in the workspace.
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "open_uri", "file_chooser", "settings"], optional = true }
 bitflags = { workspace = true, optional = true }
 filedescriptor = { version = "0.8.2", optional = true }
 open = { version = "5.2.0", optional = true }

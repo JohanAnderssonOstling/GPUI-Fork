@@ -7,11 +7,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use gpui::{
     App, AppContext, AssetSource, Bounds, Context, ImageSource, KeyBinding, Menu, MenuItem, Point,
-    SharedString, SharedUri, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
+    SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
     img, prelude::*, px, rgb, size,
 };
-#[cfg(not(target_family = "wasm"))]
-use reqwest_client::ReqwestClient;
 
 struct Assets {
     base: PathBuf,
@@ -70,7 +68,7 @@ impl RenderOnce for ImageContainer {
 
 struct ImageShowcase {
     local_resource: Arc<std::path::Path>,
-    remote_resource: SharedUri,
+    memory_resource: Arc<gpui::Image>,
     asset_resource: SharedString,
 }
 
@@ -104,8 +102,8 @@ impl Render for ImageShowcase {
                                 self.local_resource.clone(),
                             ))
                             .child(ImageContainer::new(
-                                "Image loaded from a remote resource",
-                                self.remote_resource.clone(),
+                                "Image loaded from a in-memory image",
+                                self.memory_resource.clone(),
                             ))
                             .child(ImageContainer::new(
                                 "Image loaded from an asset",
@@ -121,13 +119,13 @@ impl Render for ImageShowcase {
                                 div()
                                     .flex_col()
                                     .child("Auto Width")
-                                    .child(img("https://picsum.photos/800/400").h(px(180.))),
+                                    .child(img(self.memory_resource.clone()).h(px(180.))),
                             )
                             .child(
                                 div()
                                     .flex_col()
                                     .child("Auto Height")
-                                    .child(img("https://picsum.photos/800/400").w(px(180.))),
+                                    .child(img(self.memory_resource.clone()).w(px(180.))),
                             ),
                     )
                     .child(
@@ -140,7 +138,7 @@ impl Render for ImageShowcase {
                             .border_1()
                             .border_color(rgb(0xC0C0C0))
                             .child("image with max width 100%")
-                            .child(img("https://picsum.photos/800/400").max_w_full()),
+                            .child(img(self.memory_resource.clone()).max_w_full()),
                     ),
             )
     }
@@ -159,12 +157,6 @@ fn run_example() {
         base: manifest_dir.join("examples"),
     })
     .run(move |cx: &mut App| {
-        #[cfg(not(target_family = "wasm"))]
-        {
-            let http_client = ReqwestClient::user_agent("gpui example").unwrap();
-            cx.set_http_client(Arc::new(http_client));
-        }
-
         cx.activate(true);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
@@ -195,7 +187,9 @@ fn run_example() {
                 local_resource: manifest_dir
                     .join("examples/image/exif-orientation-rotate-180.jpg")
                     .into(),
-                remote_resource: "https://picsum.photos/800/400".into(),
+                memory_resource: Arc::new(gpui::Image::from_bytes(
+                    gpui::ImageFormat::Svg, include_bytes!("color.svg").to_vec(),
+                )),
                 asset_resource: "image/color.svg".into(),
             })
         })

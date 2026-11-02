@@ -2917,6 +2917,10 @@ impl Interactivity {
                                     listener(drag.value.as_ref(), window, cx);
                                     window.refresh();
                                     cx.stop_propagation();
+                                } else {
+                                    // Let an ancestor accept the drop, or let mouse-up
+                                    // cleanup clear the drag and redraw its preview.
+                                    cx.active_drag = Some(drag);
                                 }
                             }
                         }
@@ -3394,6 +3398,12 @@ impl Interactivity {
                         }
                         _ => Pixels::ZERO,
                     };
+                    // Leave some visible context between touch page turns.
+                    // Custom paginators handle their own page events.
+                    if paging && page_origin.is_some() {
+                        delta_x *= 0.9;
+                        delta_y *= 0.9;
+                    }
                     if !allow_concurrent_scroll && !delta_x.is_zero() && !delta_y.is_zero() {
                         if delta_x.abs() > delta_y.abs() {
                             delta_y = Pixels::ZERO;

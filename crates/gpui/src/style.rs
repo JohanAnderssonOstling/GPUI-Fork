@@ -7,9 +7,9 @@ use std::{
 use crate::{
     AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
-    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
-    PointRefinement, Rgba, ScaledPixels, SharedString, Size, SizeRefinement, Styled, TextRun,
-    TransformationMatrix, Window, black, phi, point, px, quad, rems, size,
+    FontFallbacks, FontFeatures, FontPalette, FontStyle, FontVariations, FontWeight, GridLocation, Hsla, Length,
+    Pixels, Point, PointRefinement, Rgba, ScaledPixels, SharedString, Size, SizeRefinement, Styled,
+    TextRun, TransformationMatrix, Window, black, phi, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -509,11 +509,21 @@ pub struct TextStyle {
     /// The line height to use, in pixels or fractions
     pub line_height: DefiniteLength,
 
+    /// Size text lines from the shaped font metrics and glyph extents instead
+    /// of a fixed line height. Explicit line-height styling disables this.
+    pub line_height_auto: bool,
+
     /// The font weight, e.g. bold
     pub font_weight: FontWeight,
 
     /// The font style, e.g. italic
     pub font_style: FontStyle,
+
+    /// Width and oblique angle for this font instance.
+    pub font_variations: FontVariations,
+
+    /// Color palette for color-font glyphs.
+    pub font_palette: Option<FontPalette>,
 
     /// The background color of the text
     pub background_color: Option<Hsla>,
@@ -547,8 +557,11 @@ impl Default for TextStyle {
             font_fallbacks: None,
             font_size: rems(1.).into(),
             line_height: phi(),
+            line_height_auto: false,
             font_weight: FontWeight::default(),
             font_style: FontStyle::default(),
+            font_variations: FontVariations::default(),
+            font_palette: None,
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -569,6 +582,10 @@ impl TextStyle {
         }
         if let Some(style) = style.font_style {
             self.font_style = style;
+        }
+
+        if let Some(variations) = style.font_variations {
+            self.font_variations = variations;
         }
 
         if let Some(color) = style.color {
@@ -602,10 +619,14 @@ impl TextStyle {
             fallbacks: self.font_fallbacks.clone(),
             weight: self.font_weight,
             style: self.font_style,
+            variations: self.font_variations,
+            palette: self.font_palette.clone(),
         }
     }
 
-    /// Returns the rounded line height in pixels.
+    /// Returns the configured explicit line height in pixels.
+    /// For intrinsic text, use `Window::line_height` for font metrics or
+    /// `TextLayout::line_height` after measurement to include actual glyph ink.
     pub fn line_height_in_pixels(&self, rem_size: Pixels) -> Pixels {
         self.line_height.to_pixels(self.font_size, rem_size).round()
     }
@@ -620,6 +641,8 @@ impl TextStyle {
                 fallbacks: self.font_fallbacks.clone(),
                 weight: self.font_weight,
                 style: self.font_style,
+                variations: self.font_variations,
+            palette: self.font_palette.clone(),
             },
             color: self.color,
             background_color: self.background_color,
@@ -642,6 +665,9 @@ pub struct HighlightStyle {
     /// The font style, e.g. italic
     pub font_style: Option<FontStyle>,
 
+    /// Width and oblique angle for this font instance.
+    pub font_variations: Option<FontVariations>,
+
     /// The background color of the text
     pub background_color: Option<Hsla>,
 
@@ -662,6 +688,7 @@ impl Hash for HighlightStyle {
         self.color.hash(state);
         self.font_weight.hash(state);
         self.font_style.hash(state);
+        self.font_variations.hash(state);
         self.background_color.hash(state);
         self.underline.hash(state);
         self.strikethrough.hash(state);
@@ -958,6 +985,7 @@ impl From<&TextStyle> for HighlightStyle {
             color: Some(other.color),
             font_weight: Some(other.font_weight),
             font_style: Some(other.font_style),
+            font_variations: Some(other.font_variations),
             background_color: other.background_color,
             underline: other.underline,
             strikethrough: other.strikethrough,
@@ -991,6 +1019,7 @@ impl HighlightStyle {
                 .or(self.color),
             font_weight: other.font_weight.or(self.font_weight),
             font_style: other.font_style.or(self.font_style),
+            font_variations: other.font_variations.or(self.font_variations),
             background_color: other.background_color.or(self.background_color),
             underline: other.underline.or(self.underline),
             strikethrough: other.strikethrough.or(self.strikethrough),
@@ -1411,6 +1440,7 @@ mod tests {
             }),
             fade_out: Some(0.),
             font_style: Some(FontStyle::Italic),
+            font_variations: None,
             font_weight: Some(FontWeight(300.)),
             background_color: Some(yellow()),
             underline: Some(UnderlineStyle {
@@ -1443,6 +1473,7 @@ mod tests {
             }),
             fade_out: Some(0.),
             font_style: Some(FontStyle::Oblique),
+            font_variations: None,
             font_weight: Some(FontWeight(800.)),
             background_color: Some(green()),
             underline: Some(UnderlineStyle {
@@ -1461,6 +1492,7 @@ mod tests {
             // TODO this does not seem right
             fade_out: Some(0.),
             font_style: Some(FontStyle::Oblique),
+            font_variations: None,
             font_weight: Some(FontWeight(800.)),
             background_color: Some(green()),
             underline: Some(UnderlineStyle {

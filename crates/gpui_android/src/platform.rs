@@ -1192,22 +1192,6 @@ impl Platform for AndroidPlatform {
         }));
     }
 
-    fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {
-        Task::ready(Err(anyhow::anyhow!(
-            "credential storage is not implemented on Android"
-        )))
-    }
-
-    fn read_credentials(&self, _url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
-        Task::ready(Ok(None))
-    }
-
-    fn delete_credentials(&self, _url: &str) -> Task<Result<()>> {
-        Task::ready(Err(anyhow::anyhow!(
-            "credential storage is not implemented on Android"
-        )))
-    }
-
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
         Box::new(AndroidKeyboardLayout)
     }

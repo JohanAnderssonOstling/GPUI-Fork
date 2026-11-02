@@ -74,6 +74,11 @@ impl ShapedLine {
             ascent: layout.ascent,
             descent: layout.descent,
             runs: layout.runs.clone(),
+            clusters: if len == layout.len {
+                layout.clusters.clone()
+            } else {
+                Vec::new()
+            },
             len,
         });
         self
@@ -540,11 +545,12 @@ fn paint_line(
                 ) {
                     let vertical_offset = point(px(0.0), glyph.position.y);
                     if glyph.is_emoji {
-                        window.paint_emoji(
+                        window.paint_color_glyph(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
                             layout.font_size,
+                            color,
                         )?;
                     } else {
                         window.paint_glyph(
@@ -813,6 +819,7 @@ mod tests {
                     font_id: FontId(0),
                     glyphs: shaped_glyphs,
                 }],
+                clusters: Vec::new(),
                 len: text.len(),
             }),
             text: SharedString::new(text),
@@ -931,6 +938,7 @@ mod tests {
                         ],
                     },
                 ],
+                clusters: Vec::new(),
                 len: 6,
             }),
             text: "abcdef".into(),

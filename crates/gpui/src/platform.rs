@@ -39,7 +39,7 @@ use crate::{
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
     FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap,
     LineLayout, Pixels, PlatformGestures, PlatformInput, Point, Priority, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString,
+    RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedCluster, ShapedGlyph, ShapedRun, SharedString,
     Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
 };
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -47,10 +47,9 @@ use anyhow::bail;
 use anyhow::{Context as _, Result};
 use async_task::Runnable;
 use futures::channel::oneshot;
-#[cfg(any(test, feature = "test-support"))]
-use image::RgbaImage;
 use image::codecs::gif::GifDecoder;
-use image::{AnimationDecoder as _, DynamicImage, Frame};
+use image::codecs::png::PngEncoder;
+use image::{AnimationDecoder as _, DynamicImage, ExtendedColorType, Frame, ImageEncoder, RgbaImage};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use scheduler::Instant;
 pub use scheduler::RunnableMeta;
@@ -428,10 +427,6 @@ pub trait Platform: 'static {
     fn read_from_find_pasteboard(&self) -> Option<ClipboardItem>;
     #[cfg(target_os = "macos")]
     fn write_to_find_pasteboard(&self, item: ClipboardItem);
-
-    fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>>;
-    fn read_credentials(&self, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>>;
-    fn delete_credentials(&self, url: &str) -> Task<Result<()>>;
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout>;
     fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper>;
@@ -910,6 +905,9 @@ pub enum TextInputStateChange {
     ContentChanged,
 }
 
+/// Default interval used by GPUI backends with fixed double-click timing.
+pub const DEFAULT_DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
+
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
@@ -921,6 +919,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;
     fn mouse_position(&self) -> Point<Pixels>;
+    /// The interval used by this window's native click-count detection.
+    fn double_click_interval(&self) -> Duration {
+        DEFAULT_DOUBLE_CLICK_INTERVAL
+    }
     fn modifiers(&self) -> Modifiers;
     fn capslock(&self) -> Capslock;
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler);
@@ -938,6 +940,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         answers: &[PromptButton],
     ) -> Option<oneshot::Receiver<usize>>;
     fn activate(&self);
+    /// Activate using a launcher's token when the platform supports it.
+    fn activate_with_token(&self, _token: &str) {
+        self.activate();
+    }
     /// Requests that the operating system draw attention to this window.
     fn request_attention(&self) {}
     fn is_active(&self) -> bool;
@@ -964,6 +970,20 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    /// Whether this window can copy pixels from its renderer.
+    #[cfg(feature = "snapshot")]
+    fn supports_region_capture(&self) -> bool {
+        false
+    }
+    /// Copies a region of the next rendered frame into an image.
+    #[cfg(feature = "snapshot")]
+    fn capture_region(
+        &self,
+        _bounds: Bounds<DevicePixels>,
+        _executor: &BackgroundExecutor,
+    ) -> Task<Result<RgbaImage>> {
+        Task::ready(Err(anyhow::anyhow!("Region capture is not supported by this renderer")))
+    }
     fn schedule_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
@@ -1085,7 +1105,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Renders the given scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-support", feature = "snapshot"))]
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
     }
@@ -1176,6 +1196,24 @@ pub trait PlatformTextSystem: Send + Sync {
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()>;
     /// Get all available font names.
     fn all_font_names(&self) -> Vec<String>;
+    /// Avoid discovering system fonts when the backend tracks registered families separately.
+    fn registered_font_names(&self) -> Vec<String> {
+        self.all_font_names()
+    }
+    /// Drop reloadable font data without invalidating font IDs or existing layouts.
+    fn release_font_data(&self) {}
+    /// Release completed shaping scratch pages while preserving reusable capacity.
+    fn release_shaping_scratch(&self) {}
+    /// Return consumed cluster storage for reuse. Existing contents are discarded.
+    fn recycle_line_clusters(&self, _clusters: Vec<ShapedCluster>) {}
+    /// Check sample coverage without retaining font data when supported by the platform.
+    fn font_supports_any_text(&self, descriptor: &Font, samples: &[&str]) -> bool {
+        self.font_id(descriptor).is_ok_and(|id| {
+            samples.iter().any(|sample| sample.chars().all(|character| {
+                self.glyph_for_char(id, character).is_some()
+            }))
+        })
+    }
     /// Get the font ID for a font descriptor.
     fn font_id(&self, descriptor: &Font) -> Result<FontId>;
     /// Get metrics for a font.
@@ -1196,6 +1234,11 @@ pub trait PlatformTextSystem: Send + Sync {
     ) -> Result<(Size<DevicePixels>, Vec<u8>)>;
     /// Layout a line of text with the given font runs.
     fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout;
+    /// Layout a line using recycled cluster storage when supported.
+    /// Callers can return the consumed clusters with [`Self::recycle_line_clusters`].
+    fn layout_line_reusing_clusters(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
+        self.layout_line(text, font_size, runs)
+    }
     /// Returns the recommended text rendering mode for the given font and size.
     fn recommended_rendering_mode(&self, _font_id: FontId, _font_size: Pixels)
     -> TextRenderingMode;
@@ -1322,6 +1365,7 @@ impl PlatformTextSystem for NoopTextSystem {
             ascent: font_size * (metrics.ascent / metrics.units_per_em as f32),
             descent: font_size * (metrics.descent / metrics.units_per_em as f32),
             runs,
+            clusters: Vec::new(),
             len: text.len(),
         }
     }
@@ -2884,6 +2928,18 @@ impl Image {
         }
     }
 
+    /// Encode RGBA pixels as a PNG image, preserving their alpha channel.
+    pub fn from_rgba(pixels: &RgbaImage) -> Result<Self> {
+        let mut encoded = Vec::new();
+        PngEncoder::new(&mut encoded).write_image(
+            pixels.as_raw(),
+            pixels.width(),
+            pixels.height(),
+            ExtendedColorType::Rgba8,
+        )?;
+        Ok(Self::from_bytes(ImageFormat::Png, encoded))
+    }
+
     /// Get this image's ID
     pub fn id(&self) -> u64 {
         self.id
@@ -3046,6 +3102,17 @@ impl From<String> for ClipboardString {
 mod image_tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn test_rgba_image_preserves_dimensions_and_alpha() -> Result<()> {
+        let pixels = RgbaImage::from_raw(2, 1, vec![12, 34, 56, 0, 78, 90, 123, 128])
+            .context("creating test pixels")?;
+        let image = Image::from_rgba(&pixels)?;
+        assert_eq!(image.format, ImageFormat::Png);
+        let decoded = image::load_from_memory_with_format(&image.bytes, image::ImageFormat::Png)?;
+        assert_eq!(decoded.into_rgba8(), pixels);
+        Ok(())
+    }
 
     #[test]
     fn test_image_to_image_data_applies_exif_orientation() {

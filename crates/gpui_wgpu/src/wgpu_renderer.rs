@@ -1,14 +1,24 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "test-support", feature = "snapshot")
+))]
+use bytemuck::allocation::cast_vec;
 use gpui::profiler::startup::StartupProfile;
 #[cfg(not(target_family = "wasm"))]
 use crate::pipeline_cache::PersistentPipelineCache;
+#[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+use gpui::{BackgroundExecutor, Task};
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
     ScaledPixels, Scene, Size, get_gamma_correction_ratios,
 };
-#[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "test-support", feature = "snapshot")
+))]
 use image::RgbaImage;
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -26,6 +36,40 @@ use std::time::{Duration, Instant};
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
 const INSTANCE_TEXTURE_TEXEL_SIZE: u64 = 16;
+
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "test-support", feature = "snapshot")
+))]
+fn snapshot_rgba_bytes(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    bgra: bool,
+) -> Vec<u8> {
+    let row_bytes = width as usize * 4;
+    let rows = bytes.chunks_exact(stride as usize).take(height as usize);
+    if bgra {
+        let mut pixels = Vec::with_capacity(width as usize * height as usize);
+        for row in rows {
+            // Convert while removing row padding, using whole-pixel arithmetic
+            // that the compiler can vectorize instead of a second byte-swap pass.
+            pixels.extend(row[..row_bytes].as_chunks::<4>().0.iter().map(|pixel| {
+                let value = u32::from_le_bytes(*pixel);
+                ((value & 0xff00_ff00) | (value.rotate_left(16) & 0x00ff_00ff)).to_le_bytes()
+            }));
+        }
+        // Both element types have alignment one, so this reuses the allocation.
+        cast_vec(pixels)
+    } else {
+        let mut pixels = Vec::with_capacity(row_bytes * height as usize);
+        for row in rows {
+            pixels.extend_from_slice(&row[..row_bytes]);
+        }
+        pixels
+    }
+}
 
 /// Shader variant for backends with storage buffer support: the shared shader
 /// logic plus the storage-buffer instance transport.
@@ -196,8 +240,21 @@ pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
 pub struct WgpuRendererOptions {
     /// Private application directory for persistent GPU pipeline caches.
     pub pipeline_cache_directory: Option<PathBuf>,
-    /// Restricts backend selection. Android tries Vulkan, then GL when unset.
+    /// Restricts backend selection. Linux and Android try Vulkan, then GL when unset.
     pub backends: Option<wgpu::Backends>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl WgpuRendererOptions {
+    fn backend_attempts(&self) -> Vec<wgpu::Backends> {
+        match self.backends {
+            Some(backends) => vec![backends],
+            None if cfg!(any(target_os = "linux", target_os = "android")) => {
+                vec![wgpu::Backends::VULKAN, wgpu::Backends::GL]
+            }
+            None => vec![wgpu::Backends::VULKAN | wgpu::Backends::GL],
+        }
+    }
 }
 
 enum InstanceData {
@@ -239,7 +296,10 @@ enum WgpuTarget {
     Headless(HeadlessTarget),
 }
 
-#[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "test-support", feature = "snapshot")
+))]
 struct HeadlessTarget {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -288,6 +348,8 @@ pub struct WgpuRenderer {
     failed_frame_count: u32,
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     needs_redraw: bool,
+    #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+    region_captures: crate::region_capture::RegionCaptures,
     #[cfg(not(target_family = "wasm"))]
     recovery_not_before: Option<Instant>,
 }
@@ -357,13 +419,8 @@ impl WgpuRenderer {
             return Ok(renderer);
         }
 
-        let backends = match options.backends {
-            Some(backends) => vec![backends],
-            None if cfg!(target_os = "android") => vec![wgpu::Backends::VULKAN, wgpu::Backends::GL],
-            None => vec![wgpu::Backends::VULKAN | wgpu::Backends::GL],
-        };
         let mut last_error = None;
-        for backends in backends {
+        for backends in options.backend_attempts() {
             let attempt = (|| -> anyhow::Result<_> {
                 let instance = WgpuContext::instance_with_backends(Box::new(window.clone()), backends);
                 startup.mark("instance");
@@ -504,7 +561,12 @@ impl WgpuRenderer {
         }
 
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: {
+                let usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+                #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+                let usage = usage | (surface_caps.usages & wgpu::TextureUsages::COPY_SRC);
+                usage
+            },
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
@@ -725,6 +787,8 @@ impl WgpuRenderer {
             failed_frame_count: 0,
             device_lost: context.device_lost_flag(),
             needs_redraw: false,
+            #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+            region_captures: Default::default(),
             #[cfg(not(target_family = "wasm"))]
             recovery_not_before: None,
         })
@@ -908,12 +972,17 @@ impl WgpuRenderer {
             failed_frame_count: 0,
             device_lost: context.device_lost_flag(),
             needs_redraw: false,
+            #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+            region_captures: Default::default(),
             #[cfg(not(target_family = "wasm"))]
             recovery_not_before: None,
         })
     }
 
-    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "test-support", feature = "snapshot")
+    ))]
     fn create_headless_target(
         device: &wgpu::Device,
         width: u32,
@@ -1578,7 +1647,10 @@ impl WgpuRenderer {
         Ok(self.render_scene_to_view(scene, &view))
     }
 
-    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "test-support", feature = "snapshot")
+    ))]
     fn render_scene_to_view(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> bool {
         let last_error = self.last_error.lock().unwrap().take();
         if let Some(error) = last_error {
@@ -1649,6 +1721,14 @@ impl WgpuRenderer {
         let WgpuTarget::Headless(target) = &self.target else {
             anyhow::bail!("headless readback requested from a window renderer");
         };
+        self.read_snapshot(target)
+    }
+
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "test-support", feature = "snapshot")
+    ))]
+    fn read_snapshot(&self, target: &HeadlessTarget) -> anyhow::Result<RgbaImage> {
         let width = self.surface_config.width;
         let height = self.surface_config.height;
         let mut encoder =
@@ -1698,20 +1778,34 @@ impl WgpuRenderer {
             .map_err(|error| anyhow::anyhow!("Failed to map headless readback: {error}"))?;
 
         let mapped = slice.get_mapped_range();
-        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
-        let row_bytes = width as usize * 4;
-        for row in mapped.chunks_exact(target.padded_bytes_per_row as usize) {
-            rgba.extend_from_slice(&row[..row_bytes]);
-        }
+        let rgba = snapshot_rgba_bytes(
+            &mapped,
+            width,
+            height,
+            target.padded_bytes_per_row,
+            self.surface_config.format == wgpu::TextureFormat::Bgra8Unorm,
+        );
         drop(mapped);
         target.readback.unmap();
-        if self.surface_config.format == wgpu::TextureFormat::Bgra8Unorm {
-            for pixel in rgba.chunks_exact_mut(4) {
-                pixel.swap(0, 2);
-            }
-        }
         RgbaImage::from_raw(width, height, rgba)
             .ok_or_else(|| anyhow::anyhow!("Failed to construct headless RGBA image"))
+    }
+
+    /// Captures a window scene using its existing GPU context and sprite atlas.
+    #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+    pub fn snapshot(&mut self, scene: &Scene) -> anyhow::Result<RgbaImage> {
+        anyhow::ensure!(!self.device_lost(), "snapshot requested after GPU device loss");
+        let target = Self::create_headless_target(
+            &self.resources().device,
+            self.surface_config.width,
+            self.surface_config.height,
+            self.surface_config.format,
+        );
+        anyhow::ensure!(
+            self.render_scene_to_view(scene, &target.view),
+            "could not render the window scene for snapshot"
+        );
+        self.read_snapshot(&target)
     }
 
     pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
@@ -1778,7 +1872,26 @@ impl WgpuRenderer {
         self.max_texture_size
     }
 
+    /// Requests a region from the next frame; readback runs on the supplied executor.
+    #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+    pub fn capture_region(
+        &mut self,
+        bounds: Bounds<DevicePixels>,
+        executor: &BackgroundExecutor,
+    ) -> Task<Result<RgbaImage>> {
+        self.region_captures.request(bounds, executor)
+    }
+
     pub fn draw(&mut self, scene: &Scene) -> bool {
+        let drawn = self.draw_frame(scene);
+        #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+        if !drawn {
+            self.region_captures.fail("Could not render the frame for capture");
+        }
+        drawn
+    }
+
+    fn draw_frame(&mut self, scene: &Scene) -> bool {
         #[cfg(target_family = "wasm")]
         if self.device_lost() {
             if self.surface_is_configured() {
@@ -1917,6 +2030,49 @@ impl WgpuRenderer {
             return false;
         }
 
+        #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+        if !self.region_captures.is_empty() {
+            // Most native surfaces can be copied directly. Render a temporary target
+            // only on backends whose presentation textures do not allow COPY_SRC.
+            let source = if self.surface_config.usage.contains(wgpu::TextureUsages::COPY_SRC) {
+                Some(frame.texture.clone())
+            } else {
+                let texture = self.resources().device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("gpui_capture_fallback"),
+                    size: wgpu::Extent3d {
+                        width: self.surface_config.width,
+                        height: self.surface_config.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self.surface_config.format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                match self.record_frame(scene, &view) {
+                    Ok(()) => Some(texture),
+                    Err(error) => {
+                        self.region_captures
+                            .fail(&format!("Could not render capture: {error:#}"));
+                        None
+                    }
+                }
+            };
+            if let Some(source) = source {
+                let device = Arc::clone(&self.resources().device);
+                let queue = Arc::clone(&self.resources().queue);
+                self.region_captures.submit(
+                    &source,
+                    &device,
+                    &queue,
+                    self.viewport_size,
+                    self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied,
+                );
+            }
+        }
         frame.present();
         true
     }
@@ -2720,7 +2876,13 @@ impl WgpuRenderer {
 
         self.unconfigure_surface();
 
-        let surface = if needs_new_context {
+        let config = WgpuSurfaceConfig {
+            size: self.viewport_size,
+            transparent: self.surface_config.alpha_mode != wgpu::CompositeAlphaMode::Opaque,
+            size_policy: self.surface_size_policy,
+            preferred_present_mode: Some(self.surface_config.present_mode),
+        };
+        if needs_new_context {
             let now = Instant::now();
             match self.recovery_not_before {
                 None => {
@@ -2733,29 +2895,52 @@ impl WgpuRenderer {
                 Some(_) => {}
             }
 
-            // Restart the cooldown if surface or device creation fails.
-            self.recovery_not_before = Some(now + Duration::from_millis(350));
-            let (surface, new_context) = (|| -> Result<_> {
-                let window_handle = window
-                    .window_handle()
-                    .context("failed to get window handle")?;
-                let instance = WgpuContext::instance_with_backends(Box::new(window.clone()), self.options.backends.unwrap_or(wgpu::Backends::VULKAN | wgpu::Backends::GL));
-                let surface = create_surface(&instance, window_handle.as_raw())?;
-                let mut context =
-                    WgpuContext::new_rejecting_software(instance, &surface, self.compositor_gpu)?;
-                Self::install_pipeline_cache(&mut context, &self.options);
-                Ok((surface, context))
-            })()
-            .inspect_err(|error| {
-                self.recovery_not_before = Some(Instant::now() + Duration::from_millis(350));
-                log::error!("GPU context recovery failed: {error:#}");
-            })?;
-            *gpu_context.borrow_mut() = Some(new_context);
-            surface
-        } else {
-            let window_handle = window
-                .window_handle()
-                .context("failed to get window handle")?;
+            let mut last_error = None;
+            for backends in self.options.backend_attempts() {
+                let attempt = (|| -> Result<_> {
+                    let window_handle = window
+                        .window_handle()
+                        .context("failed to get window handle")?;
+                    let instance =
+                        WgpuContext::instance_with_backends(Box::new(window.clone()), backends);
+                    let surface = create_surface(&instance, window_handle.as_raw())?;
+                    let mut context =
+                        WgpuContext::new_rejecting_software(instance, &surface, self.compositor_gpu)?;
+                    Self::install_pipeline_cache(&mut context, &self.options);
+                    self.atlas.handle_device_lost(&context);
+                    let renderer = Self::new_internal(
+                        Some(gpu_context.clone()),
+                        &context,
+                        surface,
+                        config,
+                        self.compositor_gpu,
+                        self.atlas.clone(),
+                    )?;
+                    Ok((renderer, context))
+                })();
+                match attempt {
+                    Ok((mut renderer, context)) => {
+                        *gpu_context.borrow_mut() = Some(context);
+                        renderer.options = self.options.clone();
+                        renderer.needs_redraw = true;
+                        *self = renderer;
+                        log::info!("GPU recovery complete");
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        log::warn!("GPU recovery with {backends:?} failed: {error:#}");
+                        last_error = Some(error);
+                    }
+                }
+            }
+            self.recovery_not_before = Some(Instant::now() + Duration::from_millis(350));
+            return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("No GPU backend was enabled")));
+        }
+
+        let window_handle = window
+            .window_handle()
+            .context("failed to get window handle")?;
+        let surface = {
             let context = gpu_context.borrow();
             let context = context
                 .as_ref()
@@ -2763,12 +2948,6 @@ impl WgpuRenderer {
             create_surface(&context.instance, window_handle.as_raw())?
         };
 
-        let config = WgpuSurfaceConfig {
-            size: self.viewport_size,
-            transparent: self.surface_config.alpha_mode != wgpu::CompositeAlphaMode::Opaque,
-            size_policy: self.surface_size_policy,
-            preferred_present_mode: Some(self.surface_config.present_mode),
-        };
         let ctx_ref = gpu_context.borrow();
         let context = ctx_ref
             .as_ref()

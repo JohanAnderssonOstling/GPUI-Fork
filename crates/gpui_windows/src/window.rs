@@ -68,7 +68,7 @@ pub struct WindowsWindowState {
     pub last_reported_modifiers: Cell<Option<Modifiers>>,
     pub last_reported_capslock: Cell<Option<Capslock>>,
     pub hovered: Cell<bool>,
-    pub direct_manipulation: DirectManipulationHandler,
+    pub direct_manipulation: Option<DirectManipulationHandler>,
 
     pub renderer: RefCell<DirectXRenderer>,
     /// Set when the next `draw_window` call must be treated as a forced
@@ -160,8 +160,17 @@ impl WindowsWindowState {
         let fullscreen = None;
         let initial_placement = None;
 
-        let direct_manipulation = DirectManipulationHandler::new(hwnd, scale_factor)
-            .context("initializing Direct Manipulation")?;
+        // Touchpad gestures must not prevent mouse and keyboard users from
+        // opening windows when Direct Manipulation is unavailable.
+        let direct_manipulation = match DirectManipulationHandler::new(hwnd, scale_factor) {
+            Ok(handler) => Some(handler),
+            Err(error) => {
+                log::warn!(
+                    "Direct Manipulation unavailable; touchpad gestures are disabled: {error:#}"
+                );
+                None
+            }
+        };
 
         Ok(Self {
             origin: Cell::new(origin),
@@ -725,6 +734,10 @@ impl PlatformWindow for WindowsWindow {
         logical_point(point.x as f32, point.y as f32, scale_factor)
     }
 
+    fn double_click_interval(&self) -> Duration {
+        self.state.click_state.double_click_interval.get()
+    }
+
     fn modifiers(&self) -> Modifiers {
         current_modifiers()
     }
@@ -1031,6 +1044,32 @@ impl PlatformWindow for WindowsWindow {
             .callbacks
             .appearance_changed
             .set(Some(callback));
+    }
+
+    #[cfg(feature = "snapshot")]
+    fn supports_region_capture(&self) -> bool { true }
+
+    #[cfg(feature = "snapshot")]
+    fn capture_region(&self, bounds: Bounds<DevicePixels>, executor: &BackgroundExecutor) -> Task<Result<image::RgbaImage>> {
+        let task = self.state.renderer.borrow_mut().capture_region(bounds, executor);
+        let window = Rc::downgrade(&self.0);
+        let executor = executor.clone();
+        self.executor.spawn(async move {
+            let started = Instant::now();
+            loop {
+                executor.timer(Duration::from_millis(2)).await;
+                let Some(window) = window.upgrade() else { return };
+                // The immediate D3D11 context is also used for rendering and
+                // presentation, so all Map/Unmap calls stay on this thread.
+                let mut renderer = window.state.renderer.borrow_mut();
+                if started.elapsed() > Duration::from_secs(10) {
+                    renderer.cancel_region_captures();
+                    return;
+                }
+                if !renderer.poll_region_captures() { return; }
+            }
+        }).detach();
+        task
     }
 
     fn draw(&self, scene: &Scene) {

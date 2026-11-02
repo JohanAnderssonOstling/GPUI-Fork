@@ -10,6 +10,7 @@ mod display_link;
 mod events;
 mod keyboard;
 mod pasteboard;
+#[cfg(feature = "system-notifications")]
 mod system_notifications;
 
 #[cfg(feature = "screen-capture")]

@@ -703,6 +703,8 @@ mod tests {
                     fallbacks: None,
                     weight: FontWeight::default(),
                     style: FontStyle::Normal,
+                    variations: Default::default(),
+                    palette: None,
                 },
                 ..Default::default()
             })

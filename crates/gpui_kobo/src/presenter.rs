@@ -218,7 +218,7 @@ impl FbInkPresenter {
                 previous,
                 &update.image,
                 damage,
-                matches!(mode, RefreshMode::FastMono | RefreshMode::TextMono | RefreshMode::FullMono)
+                matches!(mode, RefreshMode::FastMono | RefreshMode::TextMono | RefreshMode::FullMono | RefreshMode::CleanMono)
                     .then_some(self.monochrome_threshold),
             )
         } else {
@@ -283,7 +283,7 @@ impl FbInkPresenter {
             self.scratch_pixels
                 .extend_from_slice(&image.as_raw()[row_start..row_end]);
         }
-        if matches!(mode, RefreshMode::FastMono | RefreshMode::TextMono | RefreshMode::FullMono) {
+        if matches!(mode, RefreshMode::FastMono | RefreshMode::TextMono | RefreshMode::FullMono | RefreshMode::CleanMono) {
             for pixel in &mut self.scratch_pixels {
                 *pixel = monochrome_value(*pixel, self.monochrome_threshold);
             }
@@ -294,6 +294,8 @@ impl FbInkPresenter {
             RefreshMode::FullGray => 2,
             RefreshMode::TextMono => 3,
             RefreshMode::FullMono => 4,
+            RefreshMode::CleanMono => 5,
+            RefreshMode::CleanGray => 6,
         };
         let result = unsafe {
             native::gpui_fbink_present_gray(

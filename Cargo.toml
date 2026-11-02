@@ -652,13 +652,11 @@ zstd = "0.11"
 [workspace.dependencies.windows]
 version = "0.61"
 features = [
-    "Data_Xml_Dom",
     "Foundation_Numerics",
     "Globalization_DateTimeFormatting",
     "Storage_Search",
     "Storage_Streams",
     "System_Threading",
-    "UI_Notifications",
     "UI_ViewManagement",
     "Wdk_System_SystemServices",
     "Win32_Foundation",
@@ -677,7 +675,6 @@ features = [
     "Win32_Graphics_Hlsl",
     "Win32_Networking_WinSock",
     "Win32_Security",
-    "Win32_Security_Credentials",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_Storage_Packaging_Appx",

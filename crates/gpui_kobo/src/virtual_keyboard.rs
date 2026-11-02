@@ -37,21 +37,21 @@ pub const KOBO_KEYBOARD_LAYOUTS: &[KoboKeyboardLayout] = &[
     KoboKeyboardLayout { name: "Македонски", code: "MK", rows: ["љњертѕуиопшѓ", "асдфгхјклчќж", "зџцвбнм"] },
 ];
 
-/// The enabled layouts by code, the current one first. The layout key rotates
-/// the list, so the order and the current choice are one value. The
-/// application sets it from its preferences and observes it to save switches;
-/// without that every layout is enabled for the session.
+/// The selected layout by code. Legacy preference lists are accepted, with
+/// the first known code used as the current layout. The application restores
+/// this value from its preferences and observes it to save switches.
+/// All layouts are always available in the keyboard's layout chooser.
 pub struct KoboKeyboardLayouts(pub Vec<String>);
 
 impl Global for KoboKeyboardLayouts {}
 
 impl Default for KoboKeyboardLayouts {
     fn default() -> Self {
-        Self(KOBO_KEYBOARD_LAYOUTS.iter().map(|layout| layout.code.to_owned()).collect())
+        Self(vec![KOBO_KEYBOARD_LAYOUTS[0].code.to_owned()])
     }
 }
 
-/// The current layout: the first enabled code that names a known layout.
+/// The current layout: the first saved code that names a known layout.
 fn current_layout(cx: &App) -> &'static KoboKeyboardLayout {
     cx.try_global::<KoboKeyboardLayouts>()
         .and_then(|layouts| {
@@ -99,6 +99,7 @@ pub struct KoboKeyboardRoot<V: Render + 'static> {
     font_family: fn(&App) -> SharedString,
     shifted: bool,
     symbols: bool,
+    choosing_layout: bool,
 }
 
 impl<V: Render + 'static> KoboKeyboardRoot<V> {
@@ -110,6 +111,7 @@ impl<V: Render + 'static> KoboKeyboardRoot<V> {
             font_family,
             shifted: false,
             symbols: false,
+            choosing_layout: false,
         }
     }
 
@@ -135,7 +137,7 @@ impl<V: Render + 'static> KoboKeyboardRoot<V> {
             .active(|style| style.bg(rgb(INK)).text_color(rgb(PAPER)))
     }
 
-    /// Solid black marks a key whose state is on (shift).
+    /// Solid black marks an active key (shift or the selected layout).
     fn action_key(id: &'static str, label: impl Into<SharedString>, units: f32, on: bool) -> Stateful<Div> {
         Self::key(id, units, if on { INK } else { ACTION_FILL })
             .when(on, |key| key.text_color(rgb(PAPER)))
@@ -205,8 +207,7 @@ impl<V: Render + 'static> KoboKeyboardRoot<V> {
             )
             .child(
                 Self::action_key("kobo-layout", layout.code, 1.0, false).on_click(cx.listener(|this, _, _, cx| {
-                    cx.default_global::<KoboKeyboardLayouts>().0.rotate_left(1);
-                    this.shifted = false;
+                    this.choosing_layout = true;
                     cx.notify();
                 })),
             )
@@ -231,6 +232,43 @@ impl<V: Render + 'static> KoboKeyboardRoot<V> {
             )
     }
 
+    fn layout_chooser(
+        &self,
+        keyboard: Stateful<Div>,
+        current: &KoboKeyboardLayout,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let mut keyboard = keyboard;
+        // Fifteen layouts and Cancel fit in four rows, keeping exactly the
+        // same height as the keys so the focused input never moves.
+        for (row_index, layouts) in KOBO_KEYBOARD_LAYOUTS.chunks(4).enumerate() {
+            let mut row = Self::row();
+            for layout in layouts {
+                row = row.child(
+                    Self::action_key(layout.code, layout.name, 1.0, layout.code == current.code)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.set_global(KoboKeyboardLayouts(vec![layout.code.to_owned()]));
+                            this.choosing_layout = false;
+                            this.shifted = false;
+                            this.symbols = false;
+                            cx.notify();
+                        })),
+                );
+            }
+            if row_index == 3 {
+                row = row.child(
+                    Self::action_key("kobo-layout-cancel", "Cancel", 1.0, false)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.choosing_layout = false;
+                            cx.notify();
+                        })),
+                );
+            }
+            keyboard = keyboard.child(row);
+        }
+        keyboard
+    }
+
     fn keyboard(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let layout = current_layout(cx);
         // Heights here must stay in step with `keyboard_height`.
@@ -252,6 +290,10 @@ impl<V: Render + 'static> KoboKeyboardRoot<V> {
                 window.prevent_default();
                 cx.stop_propagation();
             });
+
+        if self.choosing_layout {
+            return self.layout_chooser(keyboard, layout, cx);
+        }
 
         if self.symbols {
             let [top, middle, bottom] = SYMBOL_ROWS;
@@ -296,6 +338,7 @@ impl<V: Render + 'static> Render for KoboKeyboardRoot<V> {
         if !input_active {
             self.shifted = false;
             self.symbols = false;
+            self.choosing_layout = false;
         }
 
         // The content keeps the same place in the tree whether or not the
