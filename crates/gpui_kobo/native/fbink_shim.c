@@ -96,7 +96,7 @@ int gpui_fbink_present_gray(
     quiet_config(&config);
     config.scaled_width = (short int) target_width;
     config.scaled_height = (short int) target_height;
-    bool is_monochrome = refresh_mode == 0 || refresh_mode == 3 || refresh_mode == 4;
+    bool is_monochrome = refresh_mode == 0 || refresh_mode == 3 || refresh_mode == 4 || refresh_mode == 5;
     bool is_full = refresh_mode == 2 || refresh_mode == 4;
     if (refresh_mode == 0) {
         config.wfm_mode = WFM_A2;
@@ -106,7 +106,7 @@ int gpui_fbink_present_gray(
         config.wfm_mode = WFM_GC16;
     }
     config.dithering_mode = is_monochrome ? HWD_QUANT_ONLY : HWD_PASSTHROUGH;
-    config.is_flashing = is_full;
+    config.is_flashing = is_full || refresh_mode == 5 || refresh_mode == 6;
     config.is_cleared = is_full;
     int result = fbink_print_raw_data(
         fd,
@@ -118,7 +118,7 @@ int gpui_fbink_present_gray(
         (short int) target_y,
         &config
     );
-    if (result >= 0 && is_full) {
+    if (result >= 0 && config.is_flashing) {
         int wait_result = fbink_wait_for_complete(fd, LAST_MARKER);
         if (wait_result < 0) {
             return wait_result;

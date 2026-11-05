@@ -21,7 +21,6 @@ gpui.workspace = true
 scheduler.workspace = true
 parking_lot = { workspace = true, features = ["nightly"] }
 gpui_wgpu.workspace = true
-http_client.workspace = true
 anyhow.workspace = true
 futures.workspace = true
 log.workspace = true
@@ -68,9 +67,6 @@ web-sys = { version = "0.3", features = [
     "Navigator",
     "PointerEvent",
     "Performance",
-    "ReadableStream",
-    "ReadableStreamDefaultReader",
-    "ReadableStreamReadResult",
     "ResizeObserver",
     "ResizeObserverBoxOptions",
     "ResizeObserverEntry",
@@ -79,12 +75,6 @@ web-sys = { version = "0.3", features = [
     "Screen",
     "Storage",
     "VisualViewport",
-    "Headers",
-    "Request",
-    "RequestCredentials",
-    "RequestInit",
-    "RequestRedirect",
-    "Response",
     "WheelEvent",
     "Window",
 ] }

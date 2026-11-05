@@ -1,22 +1,64 @@
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Arc, OnceLock};
 
 use schemars::{JsonSchema, json_schema};
 
 /// The OpenType features that can be configured for a given font.
-#[derive(Default, Clone, Eq, PartialEq, Hash)]
-pub struct FontFeatures(pub Arc<Vec<(String, u32)>>);
+#[derive(Clone)]
+pub struct FontFeatures(Arc<FeatureSettings>);
+
+struct FeatureSettings {
+    values: Vec<(String, u32)>,
+    hash: u64,
+}
+
+impl Default for FontFeatures {
+    fn default() -> Self {
+        static EMPTY: OnceLock<FontFeatures> = OnceLock::new();
+        EMPTY.get_or_init(|| Self::new(Vec::new())).clone()
+    }
+}
+
+impl PartialEq for FontFeatures {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+            || (self.0.hash == other.0.hash && self.0.values == other.0.values)
+    }
+}
+
+impl Eq for FontFeatures {}
+
+impl Hash for FontFeatures {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash.hash(state);
+    }
+}
 
 impl FontFeatures {
+    /// Create immutable settings, hashing their contents once for font-cache
+    /// lookups. Clones share both the values and the cached hash.
+    pub fn new(values: Vec<(String, u32)>) -> Self {
+        let mut hasher = DefaultHasher::new();
+        values.hash(&mut hasher);
+        Self(Arc::new(FeatureSettings {
+            values,
+            hash: hasher.finish(),
+        }))
+    }
+
     /// Disables `calt`.
     pub fn disable_ligatures() -> Self {
-        Self(Arc::new(vec![("calt".into(), 0)]))
+        static DISABLED: OnceLock<FontFeatures> = OnceLock::new();
+        DISABLED
+            .get_or_init(|| Self::new(vec![("calt".into(), 0)]))
+            .clone()
     }
 
     /// Get the tag name list of the font OpenType features
     /// only enabled or disabled features are returned
     pub fn tag_value_list(&self) -> &[(String, u32)] {
-        self.0.as_slice()
+        &self.0.values
     }
 
     /// Returns whether the `calt` feature is enabled.
@@ -24,6 +66,7 @@ impl FontFeatures {
     /// Returns `None` if the feature is not present.
     pub fn is_calt_enabled(&self) -> Option<bool> {
         self.0
+            .values
             .iter()
             .find(|(feature, _)| feature == "calt")
             .map(|(_, value)| *value == 1)
@@ -103,7 +146,7 @@ impl<'de> serde::Deserialize<'de> for FontFeatures {
                     }
                 }
 
-                Ok(FontFeatures(Arc::new(feature_list)))
+                Ok(FontFeatures::new(feature_list))
             }
         }
 

@@ -730,6 +730,8 @@ pub trait Styled: Sized {
             fallbacks,
             weight,
             style,
+            variations,
+            palette,
         } = font;
 
         let text_style = self.text_style();
@@ -737,6 +739,8 @@ pub trait Styled: Sized {
         text_style.font_features = Some(features);
         text_style.font_weight = Some(weight);
         text_style.font_style = Some(style);
+        text_style.font_variations = Some(variations);
+        text_style.font_palette = palette;
         text_style.font_fallbacks = fallbacks;
 
         self
@@ -745,6 +749,14 @@ pub trait Styled: Sized {
     /// Sets the line height of this element and its children.
     fn line_height(mut self, line_height: impl Into<DefiniteLength>) -> Self {
         self.text_style().line_height = Some(line_height.into());
+        self.text_style().line_height_auto = Some(false);
+        self
+    }
+
+    /// Size text lines intrinsically, including fallback fonts and glyphs
+    /// extending beyond the font's nominal ascent or descent.
+    fn line_height_auto(mut self) -> Self {
+        self.text_style().line_height_auto = Some(true);
         self
     }
 

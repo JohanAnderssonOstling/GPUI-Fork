@@ -5,6 +5,8 @@ mod destination_list;
 mod direct_manipulation;
 mod direct_write;
 mod directx_atlas;
+#[cfg(feature = "snapshot")]
+mod directx_capture;
 mod directx_devices;
 mod directx_renderer;
 mod dispatcher;
@@ -12,6 +14,7 @@ mod display;
 mod events;
 mod keyboard;
 mod platform;
+#[cfg(feature = "system-notifications")]
 mod system_notifications;
 mod system_settings;
 mod util;
@@ -30,6 +33,7 @@ pub(crate) use display::*;
 pub(crate) use events::*;
 pub(crate) use keyboard::*;
 pub(crate) use platform::*;
+#[cfg(feature = "system-notifications")]
 pub(crate) use system_notifications::*;
 pub(crate) use system_settings::*;
 pub(crate) use util::*;

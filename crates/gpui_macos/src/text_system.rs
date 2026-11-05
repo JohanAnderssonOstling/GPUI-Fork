@@ -619,6 +619,7 @@ impl MacTextSystemState {
         let typographic_bounds = line.get_typographic_bounds();
         LineLayout {
             runs,
+            clusters: Vec::new(),
             font_size,
             width: typographic_bounds.width.into(),
             ascent: max_ascent.into(),

@@ -1250,6 +1250,7 @@ impl Element for TerminalElement {
                     color: Some(theme.colors().link_text_hover),
                     font_weight: Some(font_weight),
                     font_style: None,
+                    font_variations: None,
                     background_color: None,
                     underline: Some(UnderlineStyle {
                         thickness: px(1.0),

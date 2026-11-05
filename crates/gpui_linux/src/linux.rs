@@ -2,6 +2,7 @@ mod dispatcher;
 mod headless;
 mod keyboard;
 mod platform;
+#[cfg(feature = "system-notifications")]
 mod system_notifications;
 #[cfg(any(feature = "wayland", feature = "x11"))]
 mod text_system;

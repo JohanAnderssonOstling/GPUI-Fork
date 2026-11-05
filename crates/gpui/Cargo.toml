@@ -17,11 +17,11 @@ categories = ["gui"]
 workspace = true
 
 [features]
+snapshot = []
 default = ["font-kit", "image-formats", "wayland", "x11", "windows-manifest"]
 test-support = [
     "leak-detection",
     "collections/test-support",
-    "http_client/test-support",
     "wayland",
     "x11",
     "proptest",
@@ -61,7 +61,6 @@ futures.workspace = true
 futures-concurrency.workspace = true
 gpui_macros.workspace = true
 gpui_shared_string.workspace = true
-http_client.workspace = true
 image.workspace = true
 inventory.workspace = true
 itertools.workspace = true
@@ -83,6 +82,7 @@ usvg.workspace = true
 ttf-parser = "0.25"
 util_macros.workspace = true
 schemars.workspace = true
+sha2.workspace = true
 seahash = "4.1"
 serde.workspace = true
 serde_json.workspace = true
@@ -92,7 +92,7 @@ async-channel.workspace = true
 stacksafe.workspace = true
 strum.workspace = true
 sum_tree.workspace = true
-taffy = "=0.13.0"
+taffy = { version = "=0.13.0", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "block_layout", "float_layout", "calc", "content_size"] }
 thiserror.workspace = true
 tracing.workspace = true
 gpui_util.workspace = true
@@ -143,9 +143,7 @@ scheduler = { workspace = true, features = ["test-support"] }
 unicode-segmentation = { workspace = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-http_client = { workspace = true, features = ["test-support"] }
 proptest = { workspace = true }
-reqwest_client = { workspace = true, features = ["test-support"] }
 
 
 [build-dependencies]

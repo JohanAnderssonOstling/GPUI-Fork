@@ -20,9 +20,60 @@ use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
 pub(crate) const TEXT_MIME_TYPES: [&str; 3] =
     ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
 pub(crate) const FILE_LIST_MIME_TYPE: &str = "text/uri-list";
+// Match Spectacle so Klipper retains explicit image copies even when Save Images is off.
+const KDE_FORCE_IMAGE_COPY_MIME_TYPE: &str = "x-kde-force-image-copy";
 
 /// Text mime types that we'll accept from other programs.
 pub(crate) const ALLOWED_TEXT_MIME_TYPES: [&str; 2] = ["text/plain;charset=utf-8", "UTF8_STRING"];
+
+pub(crate) fn clipboard_mime_types(item: &ClipboardItem, explicit_copy: bool) -> Vec<&'static str> {
+    let mut mime_types = Vec::new();
+    for entry in item.entries() {
+        match entry {
+            ClipboardEntry::String(_) | ClipboardEntry::ExternalPaths(_) => {
+                for mime_type in TEXT_MIME_TYPES {
+                    if !mime_types.contains(&mime_type) {
+                        mime_types.push(mime_type);
+                    }
+                }
+            }
+            ClipboardEntry::Image(image) => {
+                let mime_type = image.format().mime_type();
+                if !mime_types.contains(&mime_type) {
+                    mime_types.push(mime_type);
+                }
+            }
+        }
+    }
+    if explicit_copy
+        && item
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, ClipboardEntry::Image(_)))
+    {
+        mime_types.push(KDE_FORCE_IMAGE_COPY_MIME_TYPE);
+    }
+    mime_types
+}
+
+fn clipboard_bytes(item: &ClipboardItem, mime_type: &str) -> Option<Vec<u8>> {
+    if mime_type == KDE_FORCE_IMAGE_COPY_MIME_TYPE {
+        return item
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, ClipboardEntry::Image(_)))
+            .then(Vec::new);
+    }
+    if TEXT_MIME_TYPES.contains(&mime_type) {
+        return item.text().map(String::into_bytes);
+    }
+    item.entries().iter().find_map(|entry| match entry {
+        ClipboardEntry::Image(image) if image.format().mime_type() == mime_type => {
+            Some(image.bytes().to_vec())
+        }
+        _ => None,
+    })
+}
 
 pub(crate) struct Clipboard {
     connection: Connection,
@@ -186,19 +237,23 @@ impl Clipboard {
         self.self_mime.clone()
     }
 
-    pub fn send(&self, _mime_type: String, fd: OwnedFd) {
-        if let Some(text) = self.contents.as_ref().and_then(|contents| contents.text()) {
-            self.send_bytes(fd, text.as_bytes().to_owned());
+    pub fn send(&self, mime_type: String, fd: OwnedFd) {
+        if let Some(bytes) = self
+            .contents
+            .as_ref()
+            .and_then(|contents| clipboard_bytes(contents, &mime_type))
+        {
+            self.send_bytes(fd, bytes);
         }
     }
 
-    pub fn send_primary(&self, _mime_type: String, fd: OwnedFd) {
-        if let Some(text) = self
+    pub fn send_primary(&self, mime_type: String, fd: OwnedFd) {
+        if let Some(bytes) = self
             .primary_contents
             .as_ref()
-            .and_then(|contents| contents.text())
+            .and_then(|contents| clipboard_bytes(contents, &mime_type))
         {
-            self.send_bytes(fd, text.as_bytes().to_owned());
+            self.send_bytes(fd, bytes);
         }
     }
 
@@ -265,5 +320,62 @@ impl Clipboard {
                 },
             )
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_entries_offer_and_send_their_encoded_format() {
+        for format in ImageFormat::iter() {
+            let bytes = vec![0, 10, 127, 255];
+            let image = Image::from_bytes(format, bytes.clone());
+            let item = ClipboardItem::new_image(&image);
+            assert_eq!(
+                clipboard_mime_types(&item, true),
+                vec![format.mime_type(), KDE_FORCE_IMAGE_COPY_MIME_TYPE]
+            );
+            assert_eq!(clipboard_mime_types(&item, false), vec![format.mime_type()]);
+            assert_eq!(clipboard_bytes(&item, format.mime_type()), Some(bytes));
+            assert_eq!(
+                clipboard_bytes(&item, KDE_FORCE_IMAGE_COPY_MIME_TYPE),
+                Some(Vec::new())
+            );
+            assert_eq!(clipboard_bytes(&item, "text/plain"), None);
+            assert_eq!(clipboard_bytes(&item, "application/octet-stream"), None);
+        }
+    }
+
+    #[test]
+    fn text_entries_keep_existing_mime_types_and_bytes() {
+        let item = ClipboardItem::new_string("copy text åäö".into());
+        assert_eq!(clipboard_mime_types(&item, true), TEXT_MIME_TYPES);
+        for mime_type in TEXT_MIME_TYPES {
+            assert_eq!(
+                clipboard_bytes(&item, mime_type),
+                Some("copy text åäö".as_bytes().to_vec())
+            );
+        }
+        assert_eq!(clipboard_bytes(&item, "image/png"), None);
+        assert_eq!(clipboard_bytes(&item, KDE_FORCE_IMAGE_COPY_MIME_TYPE), None);
+    }
+
+    #[test]
+    fn mixed_entries_keep_each_payload_under_its_mime_type() {
+        let image = Image::from_bytes(ImageFormat::Png, vec![1, 2, 3]);
+        let mut item = ClipboardItem::new_string("caption".into());
+        item.entries.push(ClipboardEntry::Image(image.clone()));
+        item.entries.push(ClipboardEntry::Image(image));
+        let mut expected = TEXT_MIME_TYPES.to_vec();
+        expected.push("image/png");
+        expected.push(KDE_FORCE_IMAGE_COPY_MIME_TYPE);
+        assert_eq!(clipboard_mime_types(&item, true), expected);
+        assert_eq!(
+            clipboard_bytes(&item, "text/plain"),
+            Some(b"caption".to_vec())
+        );
+        assert_eq!(clipboard_bytes(&item, "image/png"), Some(vec![1, 2, 3]));
     }
 }

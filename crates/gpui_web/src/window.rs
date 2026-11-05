@@ -255,7 +255,7 @@ impl WebWindow {
     fn create_resize_observer_closure(
         inner: Rc<WebWindowInner>,
     ) -> Closure<dyn FnMut(js_sys::Array)> {
-        Closure::new(move |entries: js_sys::Array| {
+        Closure::own_aborting(move |entries: js_sys::Array| {
             let entry: web_sys::ResizeObserverEntry = match entries.get(0).dyn_into().ok() {
                 Some(entry) => entry,
                 None => return,
@@ -378,7 +378,7 @@ impl WebWindowInner {
 
     fn create_raf_closure(self: &Rc<Self>) -> Closure<dyn FnMut()> {
         let this = Rc::clone(self);
-        let closure = Closure::new(move || {
+        let closure = Closure::own_aborting(move || {
             // The request that fired is no longer pending; clear it before
             // running the frame so wakeups issued while the frame executes
             // (e.g. views invalidated during draw) schedule the next request
@@ -412,7 +412,7 @@ impl WebWindowInner {
         // dispatching the input event that requested the frame, when `App` is
         // already mutably borrowed.
         let this = Rc::downgrade(self);
-        let callback = Closure::once_into_js(move || {
+        let callback = Closure::once_aborting(move || {
             let Some(this) = this.upgrade() else {
                 return;
             };
@@ -425,7 +425,7 @@ impl WebWindowInner {
                 this.raf_id
                     .set(this.browser_window.request_animation_frame(func).ok());
             }
-        });
+        }).into_js_value();
         if self
             .browser_window
             .set_timeout_with_callback_and_timeout_and_arguments_0(callback.unchecked_ref(), 0)
@@ -457,7 +457,7 @@ impl WebWindowInner {
         let this = Rc::clone(self);
         let observer = observer.clone();
 
-        let closure = Closure::<dyn FnMut(JsValue)>::new(move |_event: JsValue| {
+        let closure = Closure::<dyn FnMut(JsValue)>::own_aborting(move |_event: JsValue| {
             this.notify_scale.set(true);
             this.observe_canvas(&observer);
             this.watch_dpr_changes(&observer);

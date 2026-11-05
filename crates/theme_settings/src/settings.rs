@@ -714,6 +714,8 @@ impl settings::Settings for ThemeSettings {
                 fallbacks: font_fallbacks_from_settings(content.ui_font_fallbacks.clone()),
                 weight: content.ui_font_weight.unwrap().into_gpui(),
                 style: Default::default(),
+                variations: Default::default(),
+                palette: None,
             },
             buffer_font: Font {
                 family: content
@@ -727,6 +729,8 @@ impl settings::Settings for ThemeSettings {
                 fallbacks: font_fallbacks_from_settings(content.buffer_font_fallbacks.clone()),
                 weight: content.buffer_font_weight.unwrap().into_gpui(),
                 style: FontStyle::default(),
+                variations: Default::default(),
+                palette: None,
             },
             buffer_font_size: clamp_font_size(content.buffer_font_size.unwrap().into_gpui()),
             buffer_line_height: buffer_line_height_from_settings(

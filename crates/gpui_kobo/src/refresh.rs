@@ -16,6 +16,10 @@ pub enum RefreshMode {
     PartialGray,
     FullGray,
     FullMono,
+    /// Flash only the damaged region with GC16, keeping monochrome pixels.
+    CleanMono,
+    /// Flash a damaged region that contains grayscale artwork.
+    CleanGray,
 }
 
 impl RefreshMode {
@@ -23,7 +27,7 @@ impl RefreshMode {
         match self {
             Self::FastMono => "A2",
             Self::TextMono => "DU",
-            Self::PartialGray | Self::FullGray | Self::FullMono => "GC16",
+            Self::PartialGray | Self::FullGray | Self::FullMono | Self::CleanMono | Self::CleanGray => "GC16",
         }
     }
 
@@ -65,28 +69,6 @@ impl RefreshPolicy {
     }
 
     pub fn decide(&mut self, scrolling: bool, damage: PixelRect, screen_area: u64) -> RefreshMode {
-        self.decide_for_mode(
-            KoboRenderMode::QualityGrayscale,
-            scrolling,
-            damage,
-            screen_area,
-        )
-    }
-
-    pub fn decide_for_mode(
-        &mut self,
-        render_mode: KoboRenderMode,
-        scrolling: bool,
-        damage: PixelRect,
-        screen_area: u64,
-    ) -> RefreshMode {
-        if render_mode == KoboRenderMode::FastMonochrome {
-            // Library mode remains thresholded monochrome, but DU avoids the
-            // severe ghosting produced by repeated A2 navigation updates.
-            // Do not accumulate cleanup debt or schedule automatic GC16.
-            return RefreshMode::TextMono;
-        }
-
         if !scrolling {
             return RefreshMode::PartialGray;
         }
@@ -97,6 +79,21 @@ impl RefreshPolicy {
             RefreshMode::FullGray
         } else {
             RefreshMode::FastMono
+        }
+    }
+
+    pub fn decide_for_mode(
+        &mut self,
+        render_mode: KoboRenderMode,
+        _scrolling: bool,
+        _damage: PixelRect,
+        _screen_area: u64,
+    ) -> RefreshMode {
+        // Reader frames use their final grayscale waveform immediately, including
+        // page turns. Neither fixed mode accumulates fast-preview cleanup debt.
+        match render_mode {
+            KoboRenderMode::FastMonochrome => RefreshMode::TextMono,
+            KoboRenderMode::QualityGrayscale => RefreshMode::PartialGray,
         }
     }
 
@@ -181,6 +178,7 @@ pub struct RepaintScheduler {
     last_presented: Option<GrayFrame>,
     last_fast_update: Option<Instant>,
     fast_damage: Option<PixelRect>,
+    text_input_cleanup: Option<(PixelRect, Instant)>,
 }
 
 impl RepaintScheduler {
@@ -204,6 +202,7 @@ impl RepaintScheduler {
             last_presented: None,
             last_fast_update: None,
             fast_damage: None,
+            text_input_cleanup: None,
         }
     }
 
@@ -221,6 +220,7 @@ impl RepaintScheduler {
         self.last_presented = None;
         self.last_fast_update = None;
         self.fast_damage = None;
+        self.text_input_cleanup = None;
     }
 
     /// A completed full presentation supersedes any pending cleanup image.
@@ -228,22 +228,37 @@ impl RepaintScheduler {
         self.policy.mark_cleanup();
         self.last_fast_update = None;
         self.fast_damage = None;
+        self.text_input_cleanup = None;
         self.last_presented = Some(image.clone());
         self.pending = None;
         self.pending_scrolling = false;
     }
 
-    /// Records monochrome presentation performed outside the normal scheduler,
-    /// such as the reader's fast page-turn path.
+    /// Records explicit monochrome presentation outside the normal scheduler.
+    /// Reader quality mode never accrues delayed cleanup from these hints.
     pub fn record_fast_presentation(&mut self, update: &FrameUpdate, now: Instant) {
+        self.last_presented = Some(update.image.clone());
+        if self.render_mode == KoboRenderMode::QualityGrayscale {
+            return;
+        }
         self.policy.record_fast_update(update.damage);
         self.remember_fast_damage(update.damage, now);
-        self.last_presented = Some(update.image.clone());
     }
 
     fn remember_fast_damage(&mut self, damage: PixelRect, now: Instant) {
         self.last_fast_update = Some(now);
         self.fast_damage = Some(self.fast_damage.map_or(damage, |previous| union(previous, damage)));
+    }
+
+    /// Moving a solid caret repeatedly with DU can leave old caret marks on
+    /// the panel even though the framebuffer is correct. Clean the affected
+    /// area once typing pauses, using the latest frame rather than a snapshot.
+    pub(crate) fn record_text_input_presentation(&mut self, update: &FrameUpdate, now: Instant) {
+        if self.render_mode != KoboRenderMode::FastMonochrome {
+            return;
+        }
+        let damage = self.text_input_cleanup.map_or(update.damage, |(previous, _)| union(previous, update.damage));
+        self.text_input_cleanup = Some((damage, now));
     }
 
     pub fn enqueue(&mut self, update: FrameUpdate, scrolling: bool) {
@@ -261,18 +276,25 @@ impl RepaintScheduler {
     pub fn flush(&mut self, now: Instant) -> Option<ScheduledRefresh> {
         let update = self.pending.take()?;
         let scrolling = std::mem::take(&mut self.pending_scrolling);
-        let mode = self.policy.decide_for_mode(
-            self.render_mode,
-            scrolling,
-            update.damage,
-            u64::from(update.image.width()) * u64::from(update.image.height()),
-        );
+        let mode = if requires_grayscale(&update) {
+            // Use the final image waveform directly. This also clears old gray
+            // artwork when a cover moves or disappears, without a DU preview.
+            RefreshMode::PartialGray
+        } else {
+            self.policy.decide_for_mode(
+                self.render_mode,
+                scrolling,
+                update.damage,
+                u64::from(update.image.width()) * u64::from(update.image.height()),
+            )
+        };
         self.last_presented = Some(update.image.clone());
         if mode.is_fast_partial() {
             self.remember_fast_damage(update.damage, now);
         } else if mode.is_full() {
             self.last_fast_update = None;
             self.fast_damage = None;
+            self.text_input_cleanup = None;
         }
         // A small grayscale UI update must not cancel outstanding scroll cleanup.
         Some(ScheduledRefresh {
@@ -286,17 +308,35 @@ impl RepaintScheduler {
         })
     }
 
+    pub(crate) fn idle_cleanup_deadline(&self) -> Option<Instant> {
+        let fast = self.last_fast_update.filter(|_| self.policy.has_fast_updates());
+        let text = self.text_input_cleanup.map(|(_, last)| last);
+        fast.into_iter().chain(text).min().map(|last| last + self.profile.idle_cleanup_after)
+    }
+
     pub fn idle_cleanup(&mut self, now: Instant) -> Option<ScheduledRefresh> {
-        let last_fast_update = self.last_fast_update?;
-        if now.saturating_duration_since(last_fast_update) < self.profile.idle_cleanup_after
-            || !self.policy.has_fast_updates()
-        {
-            return None;
-        }
         let image = self.last_presented.clone()?;
-        self.last_fast_update = None;
-        self.policy.mark_cleanup();
-        let pending = self.fast_damage.take()?;
+        let (pending, mode) = if self.text_input_cleanup.is_some_and(|(_, last)| now.saturating_duration_since(last) >= self.profile.idle_cleanup_after) {
+            let (damage, _) = self.text_input_cleanup.take()?;
+            (damage, RefreshMode::CleanMono)
+        } else {
+            let last_fast_update = self.last_fast_update?;
+            if now.saturating_duration_since(last_fast_update) < self.profile.idle_cleanup_after
+                || !self.policy.has_fast_updates()
+            {
+                return None;
+            }
+            self.last_fast_update = None;
+            self.policy.mark_cleanup();
+            let damage = self.fast_damage.take()?;
+            let mode = if self.render_mode == KoboRenderMode::FastMonochrome {
+                self.text_input_cleanup = None;
+                RefreshMode::FullMono
+            } else {
+                RefreshMode::PartialGray
+            };
+            (damage, mode)
+        };
         let left = pending.x.min(image.width());
         let top = pending.y.min(image.height());
         let damage = PixelRect {
@@ -305,17 +345,11 @@ impl RepaintScheduler {
             height: pending.y.saturating_add(pending.height).min(image.height()).saturating_sub(top),
         };
         if damage.width == 0 || damage.height == 0 { return None; }
+        let update = FrameUpdate { image, previous_image: None, damage };
+        let mode = if mode == RefreshMode::CleanMono && requires_grayscale(&update) { RefreshMode::CleanGray } else { mode };
         Some(ScheduledRefresh {
-            update: FrameUpdate {
-                image,
-                previous_image: None,
-                damage,
-            },
-            mode: if self.render_mode == KoboRenderMode::FastMonochrome {
-                RefreshMode::FullMono
-            } else {
-                RefreshMode::PartialGray
-            },
+            update,
+            mode,
             reason: RefreshReason::IdleCleanup,
         })
     }
@@ -323,6 +357,22 @@ impl RepaintScheduler {
     pub fn fast_updates(&self) -> u32 {
         self.policy.fast_updates()
     }
+}
+
+pub(crate) fn requires_grayscale(update: &FrameUpdate) -> bool {
+    let damage = update.damage;
+    if damage.width == 0 || damage.height == 0 {
+        return false;
+    }
+    update.image.grayscale_regions().iter()
+        .chain(update.previous_image.iter().flat_map(|frame| frame.grayscale_regions()))
+        .any(|region| {
+            region.width > 0 && region.height > 0
+                && damage.x < region.x.saturating_add(region.width)
+                && region.x < damage.x.saturating_add(damage.width)
+                && damage.y < region.y.saturating_add(region.height)
+                && region.y < damage.y.saturating_add(damage.height)
+        })
 }
 
 fn union(left: PixelRect, right: PixelRect) -> PixelRect {
@@ -348,26 +398,31 @@ mod tests {
     }
 
     #[test]
-    fn scroll_cleanup_survives_small_ui_updates_and_uses_latest_grayscale_frame() {
+    fn reader_page_turns_and_late_ui_updates_use_gc16_without_cleanup() {
         let mut scheduler = RepaintScheduler::new(DeviceRefreshProfile::default());
         let now = Instant::now();
+        assert!(scheduler.idle_cleanup_deadline().is_none());
         let content = PixelRect { x: 10, y: 20, width: 70, height: 60 };
-        scheduler.enqueue(update(content, 120), true);
-        assert_eq!(scheduler.flush(now).unwrap().mode, RefreshMode::FastMono);
+        for page in 0..12 {
+            let time = now + Duration::from_secs(page);
+            scheduler.enqueue(update(content, 120), true);
+            let refresh = scheduler.flush(time).unwrap();
+            assert_eq!(refresh.mode, RefreshMode::PartialGray);
+            assert_eq!(refresh.mode.waveform(), "GC16");
+            assert_eq!(refresh.update.image.get_pixel(15, 25).0[0], 120);
+            assert!(scheduler.idle_cleanup_deadline().is_none());
+            assert!(scheduler.idle_cleanup(time + Duration::from_millis(800)).is_none());
+        }
         scheduler.enqueue(update(PixelRect { x: 0, y: 0, width: 5, height: 5 }, 160), false);
-        assert_eq!(scheduler.flush(now + Duration::from_millis(100)).unwrap().mode, RefreshMode::PartialGray);
-        assert!(scheduler.idle_cleanup(now + Duration::from_millis(799)).is_none());
-        let cleanup = scheduler.idle_cleanup(now + Duration::from_millis(800)).unwrap();
-        assert_eq!(cleanup.mode, RefreshMode::PartialGray);
-        assert_eq!(cleanup.update.damage, content);
-        assert_eq!(cleanup.update.image.get_pixel(15, 25).0[0], 160);
-        assert!(cleanup.update.previous_image.is_none());
-        assert!(scheduler.idle_cleanup(now + Duration::from_secs(2)).is_none());
+        assert_eq!(scheduler.flush(now + Duration::from_secs(12)).unwrap().mode, RefreshMode::PartialGray);
+        assert_eq!(scheduler.fast_updates(), 0);
+        assert!(scheduler.idle_cleanup(now + Duration::from_secs(20)).is_none());
+        assert!(scheduler.idle_cleanup_deadline().is_none());
     }
 
     #[test]
     fn full_presentation_cancels_old_scroll_cleanup() {
-        let mut scheduler = RepaintScheduler::new(DeviceRefreshProfile::default());
+        let mut scheduler = RepaintScheduler::new_with_render_mode(DeviceRefreshProfile::default(), KoboRenderMode::FastMonochrome);
         let now = Instant::now();
         let damage = PixelRect { x: 0, y: 0, width: 100, height: 100 };
         scheduler.record_fast_presentation(&update(damage, 128), now);
@@ -376,13 +431,135 @@ mod tests {
     }
 
     #[test]
-    fn fast_reader_page_turns_receive_grayscale_cleanup() {
+    fn reader_page_hints_cannot_schedule_a_second_grayscale_refresh() {
         let mut scheduler = RepaintScheduler::new(DeviceRefreshProfile::default());
         let now = Instant::now();
+        assert!(scheduler.idle_cleanup_deadline().is_none());
         let content = PixelRect { x: 0, y: 10, width: 100, height: 90 };
         scheduler.record_fast_presentation(&update(content, 128), now);
+        assert_eq!(scheduler.fast_updates(), 0);
+        assert!(scheduler.idle_cleanup_deadline().is_none());
+        assert!(scheduler.idle_cleanup(now + Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn library_updates_keep_du_without_reader_cleanup() {
+        let mut scheduler = RepaintScheduler::new_with_render_mode(DeviceRefreshProfile::default(), KoboRenderMode::FastMonochrome);
+        let now = Instant::now();
+        for scrolling in [false, true] {
+            scheduler.enqueue(update(PixelRect { x: 0, y: 0, width: 100, height: 100 }, 128), scrolling);
+            assert_eq!(scheduler.flush(now).unwrap().mode, RefreshMode::TextMono);
+        }
+        assert!(scheduler.idle_cleanup_deadline().is_none());
+        assert!(scheduler.idle_cleanup(now + Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn typing_cleans_all_old_caret_positions_once_after_the_last_key() {
+        let mut scheduler = RepaintScheduler::new_with_render_mode(DeviceRefreshProfile::default(), KoboRenderMode::FastMonochrome);
+        let now = Instant::now();
+        for (delay, x) in [(0, 10), (400, 20)] {
+            let time = now + Duration::from_millis(delay);
+            scheduler.enqueue(update(PixelRect { x, y: 10, width: 3, height: 10 }, 0), false);
+            let refresh = scheduler.flush(time).unwrap();
+            assert_eq!(refresh.mode, RefreshMode::TextMono);
+            scheduler.record_text_input_presentation(&refresh.update, time);
+        }
+        assert_eq!(scheduler.idle_cleanup_deadline(), Some(now + Duration::from_millis(1200)));
+        assert!(scheduler.idle_cleanup(now + Duration::from_millis(800)).is_none());
+        // An unrelated update must be retained, without extending the typing delay.
+        scheduler.enqueue(update(PixelRect { x: 80, y: 80, width: 5, height: 5 }, 77), false);
+        scheduler.flush(now + Duration::from_millis(900)).unwrap();
+        let cleanup = scheduler.idle_cleanup(now + Duration::from_millis(1200)).unwrap();
+        assert_eq!(cleanup.mode, RefreshMode::CleanMono);
+        assert_eq!(cleanup.mode.waveform(), "GC16");
+        assert!(!cleanup.mode.is_full());
+        assert_eq!(cleanup.update.damage, PixelRect { x: 10, y: 10, width: 13, height: 10 });
+        assert_eq!(cleanup.update.image.get_pixel(10, 10).0[0], 77);
+        assert!(cleanup.update.previous_image.is_none(), "cleanup must repaint even unchanged framebuffer pixels");
+        assert!(scheduler.idle_cleanup_deadline().is_none());
+        assert!(scheduler.idle_cleanup(now + Duration::from_secs(5)).is_none());
+    }
+
+    #[test]
+    fn full_refresh_or_mode_change_cancels_pending_typing_cleanup() {
+        let now = Instant::now();
+        let frame = update(PixelRect { x: 10, y: 10, width: 20, height: 10 }, 0);
+        for change_mode in [false, true] {
+            let mut scheduler = RepaintScheduler::new_with_render_mode(DeviceRefreshProfile::default(), KoboRenderMode::FastMonochrome);
+            scheduler.enqueue(update(frame.damage, 0), false);
+            scheduler.flush(now).unwrap();
+            scheduler.record_text_input_presentation(&frame, now);
+            if change_mode {
+                scheduler.set_render_mode(KoboRenderMode::QualityGrayscale);
+            } else {
+                scheduler.record_full_presentation(&frame.image);
+            }
+            assert!(scheduler.idle_cleanup_deadline().is_none());
+            assert!(scheduler.idle_cleanup(now + Duration::from_secs(1)).is_none());
+        }
+    }
+
+    #[test]
+    fn typing_cleanup_preserves_artwork_between_changed_regions() {
+        let mut scheduler = RepaintScheduler::new_with_render_mode(DeviceRefreshProfile::default(), KoboRenderMode::FastMonochrome);
+        let now = Instant::now();
+        let image = GrayFrame::unpooled_with_grayscale_regions(GrayImage::from_pixel(100, 100, Luma([120])), vec![PixelRect { x: 20, y: 20, width: 60, height: 60 }]);
+        for y in [5, 90] {
+            let frame = FrameUpdate { image: image.clone(), previous_image: None, damage: PixelRect { x: 30, y, width: 10, height: 5 } };
+            scheduler.enqueue(FrameUpdate { image: image.clone(), previous_image: None, damage: frame.damage }, false);
+            scheduler.flush(now).unwrap();
+            scheduler.record_text_input_presentation(&frame, now);
+        }
         let cleanup = scheduler.idle_cleanup(now + Duration::from_secs(1)).unwrap();
-        assert_eq!(cleanup.mode, RefreshMode::PartialGray);
-        assert_eq!(cleanup.update.damage, content);
+        assert_eq!(cleanup.mode, RefreshMode::CleanGray);
+        assert!(!cleanup.mode.is_full());
+    }
+
+    #[test]
+    fn library_covers_use_gc16_while_updates_outside_artwork_keep_du() {
+        let mut scheduler = RepaintScheduler::new_with_render_mode(DeviceRefreshProfile::default(), KoboRenderMode::FastMonochrome);
+        let now = Instant::now();
+        let cover = PixelRect { x: 20, y: 20, width: 60, height: 70 };
+        let image = GrayFrame::unpooled_with_grayscale_regions(GrayImage::from_pixel(100, 100, Luma([120])), vec![cover]);
+        for scrolling in [false, true] {
+            scheduler.enqueue(FrameUpdate { image: image.clone(), previous_image: None, damage: cover }, scrolling);
+            let refresh = scheduler.flush(now).unwrap();
+            assert_eq!(refresh.mode, RefreshMode::PartialGray);
+            assert_eq!(refresh.mode.waveform(), "GC16");
+            assert_eq!(refresh.update.image.get_pixel(30, 30).0[0], 120);
+        }
+        let header = PixelRect { x: 0, y: 0, width: 100, height: 20 };
+        scheduler.enqueue(FrameUpdate { image, previous_image: None, damage: header }, false);
+        assert_eq!(scheduler.flush(now).unwrap().mode, RefreshMode::TextMono);
+        assert_eq!(scheduler.fast_updates(), 0);
+        assert!(scheduler.idle_cleanup_deadline().is_none());
+        assert!(scheduler.idle_cleanup(now + Duration::from_secs(2)).is_none());
+    }
+
+    #[test]
+    fn grayscale_only_cover_changes_are_not_sent_through_monochrome_damage_filtering() {
+        let mut scheduler = RepaintScheduler::new_with_render_mode(DeviceRefreshProfile::default(), KoboRenderMode::FastMonochrome);
+        let cover = PixelRect { x: 20, y: 20, width: 60, height: 70 };
+        let before = GrayFrame::unpooled_with_grayscale_regions(GrayImage::from_pixel(100, 100, Luma([100])), vec![cover]);
+        let after = GrayFrame::unpooled_with_grayscale_regions(GrayImage::from_pixel(100, 100, Luma([120])), vec![cover]);
+        scheduler.enqueue(FrameUpdate { image: after, previous_image: Some(before), damage: cover }, false);
+        let refresh = scheduler.flush(Instant::now()).unwrap();
+        assert_eq!(refresh.mode, RefreshMode::PartialGray);
+        assert_eq!(refresh.update.previous_image.unwrap().get_pixel(30, 30).0[0], 100);
+        assert_eq!(refresh.update.image.get_pixel(30, 30).0[0], 120);
+    }
+
+    #[test]
+    fn coalesced_cover_removal_keeps_the_old_artwork_area_on_gc16() {
+        let mut scheduler = RepaintScheduler::new_with_render_mode(DeviceRefreshProfile::default(), KoboRenderMode::FastMonochrome);
+        let cover = PixelRect { x: 20, y: 20, width: 60, height: 70 };
+        let before = GrayFrame::unpooled_with_grayscale_regions(GrayImage::from_pixel(100, 100, Luma([120])), vec![cover]);
+        scheduler.enqueue(FrameUpdate { image: GrayFrame::unpooled(GrayImage::from_pixel(100, 100, Luma([255]))), previous_image: Some(before), damage: cover }, true);
+        scheduler.enqueue(update(PixelRect { x: 0, y: 0, width: 100, height: 10 }, 255), false);
+        let refresh = scheduler.flush(Instant::now()).unwrap();
+        assert!(refresh.update.image.grayscale_regions().is_empty());
+        assert_eq!(refresh.mode, RefreshMode::PartialGray);
+        assert!(scheduler.idle_cleanup_deadline().is_none());
     }
 }

@@ -633,16 +633,28 @@ impl TextLayout {
     ) -> LayoutId {
         let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
-        let line_height = window.pixel_snap(
-            text_style
-                .line_height
-                .to_pixels(font_size.into(), window.rem_size()),
-        );
+        let line_height = if text_style.line_height_auto {
+            window.line_height()
+        } else {
+            window.pixel_snap(
+                text_style
+                    .line_height
+                    .to_pixels(font_size.into(), window.rem_size()),
+            )
+        };
 
         let runs = if let Some(runs) = runs {
             runs
         } else {
             vec![text_style.to_run(text.len())]
+        };
+        let dilation = if text_style.line_height_auto {
+            runs.iter()
+                .map(|run| window.text_system().glyph_dilation_for_color(run.color))
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
         };
         window.request_measured_layout(Default::default(), {
             let element_state = self.clone();
@@ -756,6 +768,14 @@ impl TextLayout {
                         bounds: None,
                     });
                     return Size::default();
+                };
+
+                let line_height = if text_style.line_height_auto {
+                    lines.iter().fold(line_height, |height, line| {
+                        height.max(window.intrinsic_line_height(line, dilation))
+                    })
+                } else {
+                    line_height
                 };
 
                 let mut size: Size<Pixels> = Size::default();

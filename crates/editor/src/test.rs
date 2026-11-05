@@ -55,6 +55,8 @@ pub fn marked_display_snapshot(
         fallbacks: None,
         weight: FontWeight::default(),
         style: FontStyle::default(),
+        variations: Default::default(),
+        palette: None,
     };
     let font_size: Pixels = 14usize.into();
 

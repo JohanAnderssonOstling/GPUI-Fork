@@ -6,6 +6,8 @@ use cocoa::{
     foundation::{NSSize, NSUInteger},
     quartzcore::AutoresizingMask,
 };
+#[cfg(feature = "snapshot")]
+use gpui::{BackgroundExecutor, Task};
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
     PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
@@ -110,6 +112,8 @@ impl InstanceBufferPool {
 }
 
 pub struct MetalRenderer {
+    #[cfg(feature = "snapshot")]
+    captures: crate::metal_capture::MetalCaptures,
     device: metal::Device,
     layer: Option<metal::MetalLayer>,
     is_apple_gpu: bool,
@@ -160,8 +164,8 @@ impl MetalRenderer {
         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
         layer.set_opaque(!transparent);
         layer.set_maximum_drawable_count(3);
-        // Allow texture reading for visual tests (captures screenshots without ScreenCaptureKit)
-        #[cfg(any(test, feature = "test-support"))]
+        // Framebuffer-only drawables cannot be copied into readback buffers.
+        #[cfg(any(test, feature = "test-support", feature = "snapshot"))]
         layer.set_framebuffer_only(false);
         unsafe {
             let _: () = msg_send![&*layer, setAllowsNextDrawableTimeout: NO];
@@ -330,6 +334,8 @@ impl MetalRenderer {
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
 
         Self {
+            #[cfg(feature = "snapshot")]
+            captures: Default::default(),
             device,
             layer,
             presents_with_transaction: false,
@@ -444,10 +450,18 @@ impl MetalRenderer {
         // nothing to do
     }
 
+    /// Queues readback from the next drawable without changing presentation.
+    #[cfg(feature = "snapshot")]
+    pub fn capture_region(&mut self, bounds: Bounds<DevicePixels>, executor: &BackgroundExecutor) -> Task<Result<image::RgbaImage>> {
+        self.captures.request(bounds, executor)
+    }
+
     pub fn draw(&mut self, scene: &Scene) {
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
+                #[cfg(feature = "snapshot")]
+                self.captures.fail("Metal window is unavailable");
                 log::error!(
                     "draw() called on headless renderer - use render_scene_to_image() instead"
                 );
@@ -462,6 +476,8 @@ impl MetalRenderer {
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
+            #[cfg(feature = "snapshot")]
+            self.captures.fail("Metal drawable is unavailable");
             log::error!(
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
@@ -472,10 +488,15 @@ impl MetalRenderer {
         let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
+                #[cfg(feature = "snapshot")]
+                self.captures.fail(&format!("Could not draw captured frame: {error:#}"));
                 log::error!("failed to render: {error:#}");
                 return;
             }
         };
+
+        #[cfg(feature = "snapshot")]
+        let readbacks = self.captures.encode(&self.device, drawable.texture(), &command_buffer, viewport_size, self.is_unified_memory, self.opaque);
 
         if self.presents_with_transaction {
             command_buffer.commit();
@@ -484,6 +505,10 @@ impl MetalRenderer {
         } else {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
+        }
+        #[cfg(feature = "snapshot")]
+        for readback in readbacks {
+            readback.complete();
         }
     }
 

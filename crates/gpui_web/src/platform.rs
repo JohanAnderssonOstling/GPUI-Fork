@@ -1,7 +1,7 @@
+use crate::clipboard::clipboard_write_text;
 use crate::dispatcher::WebDispatcher;
 use crate::display::WebDisplay;
 use crate::events::EventListenerHandle;
-use crate::http_client::FetchHttpClient;
 use crate::keyboard::WebKeyboardLayout;
 use crate::window::WebWindow;
 use anyhow::Result;
@@ -322,18 +322,7 @@ impl WebPlatform {
         }
     }
 
-    /// Returns an HTTP client that runs browser Fetch operations on this platform's main thread.
-    pub fn fetch_http_client(&self) -> FetchHttpClient {
-        FetchHttpClient::new(self.dispatcher.clone())
-    }
 
-    /// Returns a browser Fetch HTTP client with the given reported user agent.
-    pub fn fetch_http_client_with_user_agent(
-        &self,
-        user_agent: &str,
-    ) -> anyhow::Result<FetchHttpClient> {
-        FetchHttpClient::with_user_agent(self.dispatcher.clone(), user_agent)
-    }
 }
 
 async fn initialize_graphics(
@@ -840,29 +829,13 @@ impl Platform for WebPlatform {
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
-        if let Some(text) = item.text()
+        if let Some(text) = clipboard_write_text(&item)
             && let Some(window) = web_sys::window()
         {
             // Fire-and-forget; called synchronously inside the user's input
             // event, which satisfies the browser's user-activation requirement.
             drop(window.navigator().clipboard().write_text(&text));
         }
-    }
-
-    fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {
-        Task::ready(Err(anyhow::anyhow!(
-            "credential storage is not available on the web"
-        )))
-    }
-
-    fn read_credentials(&self, _url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
-        Task::ready(Ok(None))
-    }
-
-    fn delete_credentials(&self, _url: &str) -> Task<Result<()>> {
-        Task::ready(Err(anyhow::anyhow!(
-            "credential storage is not available on the web"
-        )))
     }
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {

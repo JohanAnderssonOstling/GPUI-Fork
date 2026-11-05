@@ -587,18 +587,6 @@ impl Platform for TestPlatform {
         *self.current_find_pasteboard_item.lock() = Some(item);
     }
 
-    fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {
-        Task::ready(Ok(()))
-    }
-
-    fn read_credentials(&self, _url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
-        Task::ready(Ok(None))
-    }
-
-    fn delete_credentials(&self, _url: &str) -> Task<Result<()>> {
-        Task::ready(Ok(()))
-    }
-
     fn register_url_scheme(&self, _: &str) -> Task<anyhow::Result<()>> {
         unimplemented!()
     }

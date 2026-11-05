@@ -6,7 +6,6 @@ use settings_content::{
     FontFamilyName, FontFeaturesContent, FontSize, FontStyleContent, FontWeightContent,
     ModifiersContent, PixelSetting, WindowBackgroundContent,
 };
-use std::sync::Arc;
 
 /// A trait for converting settings content types into their GPUI equivalents.
 pub trait IntoGpui {
@@ -38,7 +37,7 @@ impl IntoGpui for FontFeaturesContent {
     type Output = FontFeatures;
 
     fn into_gpui(self) -> Self::Output {
-        FontFeatures(Arc::new(self.0.into_iter().collect()))
+        FontFeatures::new(self.0.into_iter().collect())
     }
 }
 

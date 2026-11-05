@@ -10,12 +10,16 @@ fn main() {
 
     let library_dir = env::var("FBINK_LIB_DIR")
         .expect("FBINK_LIB_DIR must point to the staged static FBInk libraries for Kobo builds");
+    for library in ["libgpui_fbink_shim.a", "libfbink.a"] {
+        println!("cargo:rerun-if-changed={}", Path::new(&library_dir).join(library).display());
+    }
     println!("cargo:rustc-link-search=native={library_dir}");
     let i2c_dir = Path::new(&library_dir)
         .parent()
         .expect("FBINK_LIB_DIR must have an FBInk source parent")
         .join("libi2c-staged/lib");
     println!("cargo:rustc-link-search=native={}", i2c_dir.display());
+    println!("cargo:rerun-if-changed={}", i2c_dir.join("libi2c.a").display());
     println!("cargo:rustc-link-lib=static=gpui_fbink_shim");
     println!("cargo:rustc-link-lib=static=fbink");
     println!("cargo:rustc-link-lib=static=i2c");

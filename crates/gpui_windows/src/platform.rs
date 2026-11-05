@@ -21,7 +21,6 @@ use windows::{
     Win32::{
         Foundation::*,
         Graphics::{Direct3D11::ID3D11Device, Gdi::*},
-        Security::Credentials::*,
         System::{Com::*, LibraryLoader::*, Ole::*, Power::*, SystemInformation::*},
         UI::{Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     },
@@ -49,7 +48,9 @@ pub struct WindowsPlatform {
     suspend_resume_notification: RefCell<Option<HPOWERNOTIFY>>,
     disable_direct_composition: bool,
     has_package_identity: bool,
+    #[cfg(feature = "system-notifications")]
     app_identity: RefCell<Option<(String, String)>>,
+    #[cfg(feature = "system-notifications")]
     system_notifications: RefCell<SystemNotificationState>,
 }
 
@@ -208,7 +209,9 @@ impl WindowsPlatform {
             has_package_identity: has_package_identity(),
             drop_target_helper,
             invalidate_devices: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "system-notifications")]
             app_identity: RefCell::new(None),
+            #[cfg(feature = "system-notifications")]
             system_notifications: RefCell::new(SystemNotificationState::new()),
         })
     }
@@ -692,7 +695,7 @@ impl Platform for WindowsPlatform {
         }
     }
 
-    fn set_app_identity(&self, identifier: &str, name: &str) {
+    fn set_app_identity(&self, identifier: &str, _name: &str) {
         // If the process has package identity, it's automatally granted an AUMID by the system.
         if self.has_package_identity {
             return;
@@ -707,9 +710,13 @@ impl Platform for WindowsPlatform {
         } {
             log::warn!("failed to set the process AppUserModelID: {error}");
         }
-        *self.app_identity.borrow_mut() = Some((identifier.to_string(), name.to_string()));
+        #[cfg(feature = "system-notifications")]
+        {
+            *self.app_identity.borrow_mut() = Some((identifier.to_string(), _name.to_string()));
+        }
     }
 
+    #[cfg(feature = "system-notifications")]
     fn show_system_notification(&self, notification: gpui::SystemNotification) {
         let app_identity = self.app_identity.borrow().clone();
         self.system_notifications
@@ -724,10 +731,12 @@ impl Platform for WindowsPlatform {
             .log_err();
     }
 
+    #[cfg(feature = "system-notifications")]
     fn dismiss_system_notification(&self, tag: &str) {
         self.system_notifications.borrow_mut().dismiss(tag);
     }
 
+    #[cfg(feature = "system-notifications")]
     fn on_system_notification_response(
         &self,
         callback: Box<dyn FnMut(gpui::SystemNotificationResponse)>,
@@ -829,105 +838,6 @@ impl Platform for WindowsPlatform {
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         read_from_clipboard()
-    }
-
-    fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>> {
-        // CredWriteW rejects larger blobs with the opaque RPC error
-        // 0x800706F7 "The stub received bad data", so fail with a clear
-        // message instead.
-        if password.len() > CRED_MAX_CREDENTIAL_BLOB_SIZE as usize {
-            return Task::ready(Err(anyhow!(
-                "credential for {url} is {} bytes, which exceeds the Windows Credential Manager limit of {CRED_MAX_CREDENTIAL_BLOB_SIZE} bytes",
-                password.len()
-            )));
-        }
-        let password = password.to_vec();
-        let mut username = username.encode_utf16().chain(Some(0)).collect_vec();
-        let mut target_name = windows_credentials_target_name(url)
-            .encode_utf16()
-            .chain(Some(0))
-            .collect_vec();
-        self.foreground_executor().spawn(async move {
-            let credentials = CREDENTIALW {
-                LastWritten: unsafe { GetSystemTimeAsFileTime() },
-                Flags: CRED_FLAGS(0),
-                Type: CRED_TYPE_GENERIC,
-                TargetName: PWSTR::from_raw(target_name.as_mut_ptr()),
-                CredentialBlobSize: password.len() as u32,
-                CredentialBlob: password.as_ptr() as *mut _,
-                Persist: CRED_PERSIST_LOCAL_MACHINE,
-                UserName: PWSTR::from_raw(username.as_mut_ptr()),
-                ..CREDENTIALW::default()
-            };
-            unsafe {
-                CredWriteW(&credentials, 0).map_err(|err| {
-                    anyhow!(
-                        "Failed to write credentials to Windows Credential Manager: {}",
-                        err,
-                    )
-                })?;
-            }
-            Ok(())
-        })
-    }
-
-    fn read_credentials(&self, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
-        let target_name = windows_credentials_target_name(url)
-            .encode_utf16()
-            .chain(Some(0))
-            .collect_vec();
-        self.foreground_executor().spawn(async move {
-            let mut credentials: *mut CREDENTIALW = std::ptr::null_mut();
-            let result = unsafe {
-                CredReadW(
-                    PCWSTR::from_raw(target_name.as_ptr()),
-                    CRED_TYPE_GENERIC,
-                    None,
-                    &mut credentials,
-                )
-            };
-
-            if let Err(err) = result {
-                // ERROR_NOT_FOUND means the credential doesn't exist.
-                // Return Ok(None) to match macOS and Linux behavior.
-                if err.code() == ERROR_NOT_FOUND.to_hresult() {
-                    return Ok(None);
-                }
-                return Err(err.into());
-            }
-
-            if credentials.is_null() {
-                Ok(None)
-            } else {
-                let username: String = unsafe { (*credentials).UserName.to_string()? };
-                let credential_blob = unsafe {
-                    std::slice::from_raw_parts(
-                        (*credentials).CredentialBlob,
-                        (*credentials).CredentialBlobSize as usize,
-                    )
-                };
-                let password = credential_blob.to_vec();
-                unsafe { CredFree(credentials as *const _ as _) };
-                Ok(Some((username, password)))
-            }
-        })
-    }
-
-    fn delete_credentials(&self, url: &str) -> Task<Result<()>> {
-        let target_name = windows_credentials_target_name(url)
-            .encode_utf16()
-            .chain(Some(0))
-            .collect_vec();
-        self.foreground_executor().spawn(async move {
-            unsafe {
-                CredDeleteW(
-                    PCWSTR::from_raw(target_name.as_ptr()),
-                    CRED_TYPE_GENERIC,
-                    None,
-                )?
-            };
-            Ok(())
-        })
     }
 
     fn register_url_scheme(&self, _: &str) -> Task<anyhow::Result<()>> {

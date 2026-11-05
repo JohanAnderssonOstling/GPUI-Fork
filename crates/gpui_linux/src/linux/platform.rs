@@ -39,10 +39,9 @@ pub(crate) const SCROLL_LINES: f32 = 3.0;
 // Values match the defaults on GTK.
 // Taken from https://github.com/GNOME/gtk/blob/main/gtk/gtksettings.c#L320
 #[cfg(any(feature = "wayland", feature = "x11"))]
-pub(crate) const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
+pub(crate) const DOUBLE_CLICK_INTERVAL: Duration = gpui::DEFAULT_DOUBLE_CLICK_INTERVAL;
 #[cfg(any(feature = "wayland", feature = "x11"))]
 pub(crate) const DOUBLE_CLICK_DISTANCE: Pixels = px(5.0);
-pub(crate) const KEYRING_LABEL: &str = "zed-github-account";
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
 const FILE_PICKER_PORTAL_MISSING: &str =
@@ -125,7 +124,9 @@ pub(crate) struct LinuxCommon {
     pub(crate) callbacks: PlatformHandlers,
     pub(crate) signal: LoopSignal,
     pub(crate) menus: Vec<OwnedMenu>,
+    #[cfg(feature = "system-notifications")]
     app_name: Option<String>,
+    #[cfg(feature = "system-notifications")]
     system_notifications: crate::linux::system_notifications::SystemNotificationState,
     #[cfg_attr(
         not(all(target_os = "linux", any(feature = "wayland", feature = "x11"))),
@@ -167,7 +168,9 @@ impl LinuxCommon {
             callbacks,
             signal,
             menus: Vec::new(),
+            #[cfg(feature = "system-notifications")]
             app_name: None,
+            #[cfg(feature = "system-notifications")]
             system_notifications: crate::linux::system_notifications::SystemNotificationState::new(
             ),
             wake_sender,
@@ -585,11 +588,13 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
         });
     }
 
+    #[cfg(feature = "system-notifications")]
     fn set_app_identity(&self, _identifier: &str, name: &str) {
         self.inner
             .with_common(|common| common.app_name = Some(name.to_string()));
     }
 
+    #[cfg(feature = "system-notifications")]
     fn show_system_notification(&self, notification: gpui::SystemNotification) {
         self.inner.with_common(|common| {
             common
@@ -598,11 +603,13 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
         });
     }
 
+    #[cfg(feature = "system-notifications")]
     fn dismiss_system_notification(&self, tag: &str) {
         self.inner
             .with_common(|common| common.system_notifications.dismiss(tag));
     }
 
+    #[cfg(feature = "system-notifications")]
     fn on_system_notification_response(
         &self,
         callback: Box<dyn FnMut(gpui::SystemNotificationResponse)>,
@@ -671,72 +678,6 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
 
     fn should_auto_hide_scrollbars(&self) -> bool {
         self.inner.with_common(|common| common.auto_hide_scrollbars)
-    }
-
-    fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>> {
-        let url = url.to_string();
-        let username = username.to_string();
-        let password = password.to_vec();
-        self.background_executor().spawn(async move {
-            let keyring = oo7::Keyring::new().await?;
-            keyring.unlock().await?;
-            keyring
-                .create_item(
-                    KEYRING_LABEL,
-                    &vec![("url", &url), ("username", &username)],
-                    password,
-                    true,
-                )
-                .await?;
-            Ok(())
-        })
-    }
-
-    fn read_credentials(&self, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
-        let url = url.to_string();
-        self.background_executor().spawn(async move {
-            let keyring = oo7::Keyring::new().await?;
-            keyring.unlock().await?;
-
-            let items = keyring.search_items(&vec![("url", &url)]).await?;
-
-            for item in items.into_iter() {
-                if item.label().await.is_ok_and(|label| label == KEYRING_LABEL) {
-                    let attributes = item.attributes().await?;
-                    let username = attributes
-                        .get("username")
-                        .context("Cannot find username in stored credentials")?;
-                    item.unlock().await?;
-                    let secret = item.secret().await?;
-
-                    // we lose the zeroizing capabilities at this boundary,
-                    // a current limitation GPUI's credentials api
-                    return Ok(Some((username.to_string(), secret.to_vec())));
-                } else {
-                    continue;
-                }
-            }
-            Ok(None)
-        })
-    }
-
-    fn delete_credentials(&self, url: &str) -> Task<Result<()>> {
-        let url = url.to_string();
-        self.background_executor().spawn(async move {
-            let keyring = oo7::Keyring::new().await?;
-            keyring.unlock().await?;
-
-            let items = keyring.search_items(&vec![("url", &url)]).await?;
-
-            for item in items.into_iter() {
-                if item.label().await.is_ok_and(|label| label == KEYRING_LABEL) {
-                    item.delete().await?;
-                    return Ok(());
-                }
-            }
-
-            Ok(())
-        })
     }
 
     fn window_appearance(&self) -> WindowAppearance {

@@ -7,11 +7,29 @@ use gpui::{
     RetainAllImageCache, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
     actions, div, hash, image_cache, img, prelude::*, px, rgb, size,
 };
-#[cfg(not(target_family = "wasm"))]
-use reqwest_client::ReqwestClient;
-use std::{collections::HashMap, sync::Arc};
+use anyhow::Result;
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 const IMAGES_IN_GALLERY: usize = 30;
+
+struct GalleryAssets;
+
+impl gpui::AssetSource for GalleryAssets {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if !path.starts_with("gallery/") {
+            return Ok(None);
+        }
+        let color = hash(&path) & 0xffffff;
+        let svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"400\" height=\"200\"><rect width=\"400\" height=\"200\" fill=\"#{color:06x}\"/></svg>"
+        );
+        Ok(Some(Cow::Owned(svg.into_bytes())))
+    }
+
+    fn list(&self, _path: &str) -> Result<Vec<SharedString>> {
+        Ok(Vec::new())
+    }
+}
 
 struct ImageGallery {
     image_key: String,
@@ -38,8 +56,8 @@ impl ImageGallery {
 
 impl Render for ImageGallery {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let image_url: SharedString =
-            format!("https://picsum.photos/400/200?t={}", self.image_key).into();
+        let asset_prefix: SharedString =
+            format!("gallery/{}", self.image_key).into();
 
         div()
             .flex()
@@ -79,7 +97,7 @@ impl Render for ImageGallery {
                                     .text_color(gpui::white())
                                     .text_center()
                                     .w_40()
-                                    .child("Next Photos")
+                                    .child("Next Images")
                                     .on_click(cx.listener(Self::on_next_image)),
                             ),
                     )
@@ -94,7 +112,7 @@ impl Render for ImageGallery {
                             .justify_around()
                             .children(
                                 (0..self.items_count)
-                                    .map(|ix| img(format!("{}-{}", image_url, ix)).size_20()),
+                                    .map(|ix| img(format!("{}-{}.svg", asset_prefix, ix)).size_20()),
                             ),
                     ),
             )
@@ -124,7 +142,7 @@ impl Render for ImageGallery {
                             .justify_around()
                             .children(
                                 (0..self.items_count)
-                                    .map(|ix| img(format!("{}-{}", image_url, ix)).size_20()),
+                                    .map(|ix| img(format!("{}-{}.svg", asset_prefix, ix)).size_20()),
                             ),
                     )
             ))
@@ -253,13 +271,7 @@ fn run_example() {
     #[cfg(target_family = "wasm")]
     let app = gpui_platform::single_threaded_web();
 
-    app.run(move |cx: &mut App| {
-        #[cfg(not(target_family = "wasm"))]
-        {
-            let http_client = ReqwestClient::user_agent("gpui example").unwrap();
-            cx.set_http_client(Arc::new(http_client));
-        }
-
+    app.with_assets(GalleryAssets).run(move |cx: &mut App| {
         cx.activate(true);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);

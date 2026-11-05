@@ -24,8 +24,24 @@ pub struct LineLayout {
     pub descent: Pixels,
     /// The shaped runs that make up this line
     pub runs: Vec<ShapedRun>,
+    /// Native cluster advances and direction, when provided by the backend.
+    /// An empty vector means this backend only exposes drawing positions.
+    pub clusters: Vec<ShapedCluster>,
     /// The length of the line in utf-8 bytes
     pub len: usize,
+}
+
+/// Logical source cluster geometry supplied directly by the text shaper.
+#[derive(Debug, Clone)]
+pub struct ShapedCluster {
+    /// UTF-8 source range; several glyphs can belong to one cluster.
+    pub bytes: Range<usize>,
+    /// Left edge of the cluster's advance box, excluding glyph ink offsets.
+    pub x: Pixels,
+    /// Typographic advance, independent of drawing order and ink bounds.
+    pub advance: Pixels,
+    /// Whether logical caret progression within this cluster goes right to left.
+    pub is_rtl: bool,
 }
 
 /// A run of text that has been shaped .
@@ -172,6 +188,17 @@ impl LineLayout {
             ascent: self.ascent,
             descent: self.descent,
             runs: left_runs,
+            clusters: if self.clusters.iter().any(|cluster| {
+                cluster.bytes.contains(&byte_index) && cluster.bytes.start != byte_index
+            }) {
+                Vec::new()
+            } else {
+                self.clusters
+                    .iter()
+                    .filter(|cluster| cluster.bytes.end <= byte_index)
+                    .cloned()
+                    .collect()
+            },
             len: byte_index,
         };
 
@@ -181,6 +208,23 @@ impl LineLayout {
             ascent: self.ascent,
             descent: self.descent,
             runs: right_runs,
+            clusters: if self.clusters.iter().any(|cluster| {
+                cluster.bytes.contains(&byte_index) && cluster.bytes.start != byte_index
+            }) {
+                Vec::new()
+            } else {
+                self.clusters
+                    .iter()
+                    .filter(|cluster| cluster.bytes.start >= byte_index)
+                    .cloned()
+                    .map(|mut cluster| {
+                        cluster.bytes =
+                            cluster.bytes.start - byte_index..cluster.bytes.end - byte_index;
+                        cluster.x -= x_offset;
+                        cluster
+                    })
+                    .collect()
+            },
             len: self.len - byte_index,
         };
 
@@ -1043,6 +1087,7 @@ mod tests {
                 font_id: FontId(0),
                 glyphs,
             }],
+            clusters: Vec::new(),
             len: 0,
         }
     }

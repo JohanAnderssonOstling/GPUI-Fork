@@ -35,6 +35,10 @@ mod key_dispatch;
 mod keymap;
 mod path_builder;
 mod platform;
+#[cfg(feature = "snapshot")]
+mod region_capture;
+#[cfg(feature = "snapshot")]
+pub use region_capture::*;
 pub mod prelude;
 /// Profiling utilities for task, frame, and thread performance tracking.
 pub mod profiler;
@@ -49,7 +53,6 @@ pub mod profiler;
 #[expect(missing_docs)]
 pub mod queue;
 mod scene;
-mod shared_uri;
 mod spring;
 mod style;
 mod styled;
@@ -137,7 +140,6 @@ macro_rules! bench_main {
 }
 pub use gpui_shared_string::*;
 pub use gpui_util::arc_cow::ArcCow;
-pub use http_client;
 pub use input::*;
 pub use inspector::*;
 pub use interactive::*;
@@ -156,7 +158,6 @@ pub use profiler::*;
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use refineable::*;
 pub use scene::*;
-pub use shared_uri::*;
 use std::{any::Any, future::Future};
 pub use style::*;
 pub use styled::*;

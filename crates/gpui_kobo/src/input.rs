@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::mem::{self, MaybeUninit};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -53,6 +53,29 @@ struct RawInputEvent {
 }
 
 const INPUT_BATCH_SIZE: usize = 32;
+
+/// Also waits when there are no descriptors, and never hides a broken device
+/// behind an immediately-ready poll that would spin the event loop.
+pub(crate) fn poll_input(descriptors: &mut [libc::pollfd], timeout: Duration) -> Result<usize> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout_ms = remaining.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32;
+        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, timeout_ms) };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                if Instant::now() >= deadline { return Ok(0); }
+                continue;
+            }
+            return Err(error).context("waiting for Kobo input");
+        }
+        if descriptors.iter().any(|descriptor| descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0) {
+            bail!("Kobo input or wake descriptor disconnected");
+        }
+        return Ok(result as usize);
+    }
+}
 
 fn read_event_batch(file: &File, operation: &'static str) -> Result<Vec<RawInputEvent>> {
     let mut events = [MaybeUninit::<RawInputEvent>::uninit(); INPUT_BATCH_SIZE];
@@ -323,6 +346,7 @@ pub struct TouchDevice {
     reported_active: bool,
     moved: bool,
     lifecycle_source: Option<TouchLifecycleSource>,
+    decoder: Option<crate::touch_decoder::TouchDecoder>,
     pending_events: VecDeque<RawInputEvent>,
 }
 
@@ -378,8 +402,13 @@ impl TouchDevice {
             reported_active: false,
             moved: false,
             lifecycle_source: None,
+            decoder: None,
             pending_events: VecDeque::new(),
         }))
+    }
+
+    pub fn set_protocol(&mut self, protocol: crate::KoboTouchProtocol) {
+        self.decoder = (protocol != crate::KoboTouchProtocol::Auto).then(|| crate::touch_decoder::TouchDecoder::new(protocol));
     }
 
     pub fn description(&self) -> String {
@@ -484,8 +513,12 @@ impl TouchDevice {
         }
     }
 
+    pub(crate) fn raw_fd(&self) -> RawFd { self.file.as_raw_fd() }
+
     pub fn next_event(&mut self, timeout: Duration) -> Result<Option<TouchEvent>> {
+        if let Some(event) = self.decoder.as_mut().and_then(|decoder| decoder.pop()) { return Ok(Some(event)); }
         let deadline = Instant::now() + timeout;
+        let mut polled = false;
         loop {
             while let Some(event) = self.pending_events.pop_front() {
                 if let Some(event) = self.process_raw_event(event) {
@@ -493,7 +526,7 @@ impl TouchDevice {
                 }
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            if remaining.is_zero() && polled {
                 return Ok(None);
             }
             let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
@@ -503,6 +536,7 @@ impl TouchDevice {
                 revents: 0,
             };
             let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+            polled = true;
             if result == 0 {
                 return Ok(None);
             }
@@ -532,10 +566,15 @@ impl TouchDevice {
         self.reported_active = false;
         self.moved = false;
         self.lifecycle_source = None;
+        if let Some(decoder) = &mut self.decoder { decoder.reset(); }
         Ok(discarded)
     }
 
     fn process_raw_event(&mut self, event: RawInputEvent) -> Option<TouchEvent> {
+        if let Some(decoder) = &mut self.decoder {
+            decoder.feed(event.kind, event.code, event.value);
+            return decoder.pop();
+        }
         match (event.kind, event.code) {
             (EV_SYN, SYN_DROPPED) => {
                 self.active = false;
@@ -653,10 +692,11 @@ impl ButtonDevice {
             .join(", ")
     }
 
+    pub(crate) fn raw_fds(&self) -> impl Iterator<Item = RawFd> + '_ {
+        self.sources.iter().map(|source| source.file.as_raw_fd())
+    }
+
     pub fn next_event(&mut self, timeout: Duration) -> Result<Option<ButtonEvent>> {
-        if self.sources.is_empty() {
-            return Ok(None);
-        }
         for source in &mut self.sources {
             while let Some(event) = source.pending_events.pop_front() {
                 if let Some(event) = button_event_from_raw(event.kind, event.code, event.value) {
@@ -673,10 +713,7 @@ impl ButtonDevice {
                 revents: 0,
             })
             .collect();
-        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-        let result =
-            unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, timeout_ms) };
-        if result <= 0 {
+        if poll_input(&mut descriptors, timeout)? == 0 {
             return Ok(None);
         }
         for (index, descriptor) in descriptors.iter().enumerate() {
@@ -791,4 +828,55 @@ fn ioctl_read_request(kind: u8, number: u8, size: usize) -> libc::c_ulong {
         | ((kind as libc::c_ulong) << IOC_TYPESHIFT)
         | ((number as libc::c_ulong) << IOC_NRSHIFT)
         | ((size as libc::c_ulong) << IOC_SIZESHIFT)
+}
+
+#[cfg(test)]
+mod battery_input_tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn missing_button_devices_honor_the_sleep_wait() {
+        let mut buttons = ButtonDevice { sources: Vec::new() };
+        let started = Instant::now();
+        assert!(buttons.next_event(Duration::from_millis(30)).unwrap().is_none());
+        assert!(started.elapsed() >= Duration::from_millis(30));
+        assert!(buttons.next_event(Duration::ZERO).unwrap().is_none());
+    }
+
+    #[test]
+    fn disconnected_button_device_cannot_spin_the_event_loop() {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        let mut buttons = ButtonDevice { sources: vec![ButtonSource {
+            file: File::from(OwnedFd::from(reader)), path: PathBuf::new(), pending_events: VecDeque::new(),
+        }] };
+        drop(writer);
+        assert!(buttons.next_event(Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn zero_timeout_reads_ready_touch_input() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let mut touch = TouchDevice {
+            file: File::from(OwnedFd::from(reader)), path: PathBuf::new(),
+            x_axis: AxisInfo { code: ABS_X, minimum: 0, maximum: 100 },
+            y_axis: AxisInfo { code: ABS_Y, minimum: 0, maximum: 100 },
+            raw_x: 0, raw_y: 0, active: false, reported_active: false, moved: false,
+            lifecycle_source: None, decoder: None, pending_events: VecDeque::new(),
+        };
+        assert!(touch.next_event(Duration::ZERO).unwrap().is_none());
+        let events = [
+            RawInputEvent { time: unsafe { mem::zeroed() }, kind: EV_ABS, code: ABS_X, value: 20 },
+            RawInputEvent { time: unsafe { mem::zeroed() }, kind: EV_ABS, code: ABS_Y, value: 30 },
+            RawInputEvent { time: unsafe { mem::zeroed() }, kind: EV_KEY, code: BTN_TOUCH, value: 1 },
+            RawInputEvent { time: unsafe { mem::zeroed() }, kind: EV_SYN, code: SYN_REPORT, value: 0 },
+        ];
+        let bytes = unsafe { std::slice::from_raw_parts(events.as_ptr().cast::<u8>(), mem::size_of_val(&events)) };
+        writer.write_all(bytes).unwrap();
+        let event = touch.next_event(Duration::ZERO).unwrap().expect("ready evdev data must be read before blocking");
+        assert_eq!(event.phase, TouchPhase::Down);
+        assert!(touch.next_event(Duration::ZERO).unwrap().is_none());
+    }
 }
