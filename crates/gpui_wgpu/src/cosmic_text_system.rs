@@ -25,6 +25,7 @@ use std::{
     sync::Arc,
 };
 use swash::{
+    Action,
     scale::{Render, ScaleContext, Source, StrikeWith},
     zeno::{Format, Transform, Vector},
 };
@@ -235,6 +236,14 @@ impl PlatformTextSystem for CosmicTextSystem {
         let font_id = state.font_instance(base_id, font);
         state.font(font_id)?;
         Ok(font_id)
+    }
+
+    fn font_has_substitution_feature(&self, font_id: FontId, tag: [u8; 4]) -> bool {
+        self.0.write().font(font_id).is_ok_and(|font| {
+            font.as_swash().features().any(|feature| {
+                feature.tag() == u32::from_be_bytes(tag) && feature.action() == Action::Substitution
+            })
+        })
     }
 
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {

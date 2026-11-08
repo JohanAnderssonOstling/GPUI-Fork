@@ -34,10 +34,10 @@ use font_kit::{
     sources::mem::MemSource,
 };
 use gpui::{
-    Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun,
-    FontStyle, FontWeight, GlyphId, Hsla, LineLayout, Pixels, PlatformTextSystem,
-    RenderGlyphParams, Result, Rgba, SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun, SharedString,
-    Size, TextRenderingMode, point, px, size, swap_rgba_pa_to_bgra,
+    font_layout_table_has_feature, Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId,
+    FontMetrics, FontRun, FontStyle, FontWeight, GlyphId, Hsla, LineLayout, Pixels,
+    PlatformTextSystem, RenderGlyphParams, Result, Rgba, SUBPIXEL_VARIANTS_X, ShapedGlyph,
+    ShapedRun, SharedString, Size, TextRenderingMode, point, px, size, swap_rgba_pa_to_bgra,
 };
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use pathfinder_geometry::{
@@ -171,6 +171,18 @@ impl PlatformTextSystem for MacTextSystem {
             lock.font_selections.insert(font.clone(), font_id);
             Ok(font_id)
         }
+    }
+
+    fn font_has_substitution_feature(&self, font_id: FontId, tag: [u8; 4]) -> bool {
+        self.0
+            .read()
+            .fonts
+            .get(font_id.0)
+            .and_then(|font| {
+                font.native_font()
+                    .get_font_table(u32::from_be_bytes(*b"GSUB"))
+            })
+            .is_some_and(|table| font_layout_table_has_feature(table.bytes(), tag))
     }
 
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {

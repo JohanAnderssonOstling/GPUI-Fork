@@ -207,6 +207,13 @@ impl TextSystem {
         );
     }
 
+    /// Whether a font defines the given OpenType substitution feature.
+    /// This queries the font's feature list, not a sample glyph's appearance.
+    pub fn font_has_substitution_feature(&self, font_id: FontId, tag: [u8; 4]) -> bool {
+        self.platform_text_system
+            .font_has_substitution_feature(font_id, tag)
+    }
+
     /// Get the bounding box for the given font and font size.
     /// A font's bounding box is the smallest rectangle that could enclose all glyphs
     /// in the font. superimposed over one another.

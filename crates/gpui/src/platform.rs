@@ -1221,6 +1221,11 @@ pub trait PlatformTextSystem: Send + Sync {
     }
     /// Get the font ID for a font descriptor.
     fn font_id(&self, descriptor: &Font) -> Result<FontId>;
+    /// Whether the font defines a substitution feature, independently of its
+    /// effect on any particular character or the current feature settings.
+    fn font_has_substitution_feature(&self, _font_id: FontId, _tag: [u8; 4]) -> bool {
+        false
+    }
     /// Get metrics for a font.
     fn font_metrics(&self, font_id: FontId) -> FontMetrics;
     /// Get typographic bounds for a glyph.
