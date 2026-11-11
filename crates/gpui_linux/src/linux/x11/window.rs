@@ -2,7 +2,6 @@ use anyhow::{Context as _, anyhow};
 use x11rb::connection::RequestConnection;
 
 use crate::linux::X11ClientStatePtr;
-#[cfg(feature = "snapshot")]
 use gpui::{BackgroundExecutor, Task};
 use gpui::{
     AnyWindowHandle, Bounds, Decorations, DevicePixels, ExternalDragPayload, ForegroundExecutor,
@@ -1717,15 +1716,12 @@ impl PlatformWindow for X11Window {
         self.0.callbacks.borrow_mut().button_layout_changed = Some(callback);
     }
 
-    #[cfg(feature = "snapshot")]
     fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
         self.0.state.borrow_mut().renderer.snapshot(scene)
     }
 
-    #[cfg(feature = "snapshot")]
     fn supports_region_capture(&self) -> bool { true }
 
-    #[cfg(feature = "snapshot")]
     fn capture_region(&self, bounds: Bounds<DevicePixels>, executor: &BackgroundExecutor) -> Task<anyhow::Result<image::RgbaImage>> {
         self.0.state.borrow_mut().renderer.capture_region(bounds, executor)
     }

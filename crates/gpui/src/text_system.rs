@@ -59,6 +59,7 @@ pub struct TextSystem {
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
     font_runs_pool: Mutex<Vec<Vec<FontRun>>>,
     fallback_font_stack: SmallVec<[Font; 2]>,
+    glyph_fallback: RwLock<Option<FontFallbacks>>,
 }
 
 impl TextSystem {
@@ -72,6 +73,7 @@ impl TextSystem {
             font_ids_by_font: RwLock::default(),
             wrapper_pool: Mutex::default(),
             font_runs_pool: Mutex::default(),
+            glyph_fallback: RwLock::default(),
             fallback_font_stack: smallvec![
                 // TODO: Remove this when Linux have implemented setting fallbacks.
                 font(".ZedMono"),
@@ -115,6 +117,11 @@ impl TextSystem {
         self.platform_text_system.release_font_data();
     }
 
+    /// Reuse temporary shaped runs across a batch of layout requests.
+    pub fn begin_shaping_batch(&self) {
+        self.platform_text_system.begin_shaping_batch();
+    }
+
     /// Release completed shaping scratch after a batch of layout requests.
     pub fn release_shaping_scratch(&self) {
         self.platform_text_system.release_shaping_scratch();
@@ -142,6 +149,17 @@ impl TextSystem {
         })
     }
 
+    /// Select the single glyph fallback for all subsequent font resolutions.
+    /// The family must already be loaded. This replaces per-font fallback lists;
+    /// existing font IDs and shaped output remain valid until resolved again.
+    pub fn set_fallback_font(&self, family: impl Into<SharedString>) -> Result<()> {
+        let family = family.into();
+        self.platform_text_system.font_id(&font(family.clone()))?;
+        *self.glyph_fallback.write() =
+            Some(FontFallbacks::from_fonts(vec![family.to_string()]));
+        Ok(())
+    }
+
     /// Resolve the requested family and style without using the default font stack.
     pub fn font_id(&self, font: &Font) -> Result<FontId> {
         fn clone_font_id_result(font_id: &Result<FontId>) -> Result<FontId> {
@@ -150,6 +168,19 @@ impl TextSystem {
                 Err(err) => Err(anyhow!("{err}")),
             }
         }
+
+        let fallback = self.glyph_fallback.read().clone();
+        let mut resolved_font = Cow::Borrowed(font);
+        if let Some(fallback) = fallback {
+            let fallback = (!fallback.fallback_list().iter().any(|family| family == font.family.as_ref()))
+                .then_some(fallback);
+            if font.fallbacks != fallback {
+                resolved_font.to_mut().fallbacks = fallback;
+            }
+        }
+        // Key by the effective descriptor so changing the central fallback
+        // cannot reuse a font ID resolved with the previous fallback.
+        let font = resolved_font.as_ref();
 
         let font_id = self
             .font_ids_by_font
@@ -205,6 +236,13 @@ impl TextSystem {
                 .map(|fallback| &fallback.family)
                 .join(", ")
         );
+    }
+
+    /// Whether a font defines the given OpenType substitution feature.
+    /// This queries the font's feature list, not a sample glyph's appearance.
+    pub fn font_has_substitution_feature(&self, font_id: FontId, tag: [u8; 4]) -> bool {
+        self.platform_text_system
+            .font_has_substitution_feature(font_id, tag)
     }
 
     /// Get the bounding box for the given font and font size.

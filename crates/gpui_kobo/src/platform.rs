@@ -12,7 +12,7 @@ use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context as _, Result, anyhow, ensure};
 use futures::channel::oneshot;
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, ClipboardItem, CursorStyle,
@@ -104,7 +104,7 @@ fn is_sleep_wake(event: ButtonEvent, cover_closed: &mut bool, suppress_release: 
 
 fn suspend_until_confirmed(mut suspend: impl FnMut() -> std::result::Result<(), String>, mut confirm: impl FnMut() -> Result<bool>) -> Result<()> {
     loop {
-        suspend().map_err(|error| anyhow!("Kobo application suspend failed: {error}"))?;
+        suspend().context("Kobo application suspend failed")?;
         if confirm()? { return Ok(()); }
         println!("Unconfirmed Kobo wake; suspending again with peripherals off");
     }
@@ -222,7 +222,7 @@ pub fn request_full_repaint() -> Result<()> {
 thread_local! {
     static POWER_MENU_PENDING: Cell<bool> = const { Cell::new(false) };
     static SLEEP_PENDING: Cell<bool> = const { Cell::new(false) };
-    static POWER_MESSAGE: RefCell<Option<String>> = const { RefCell::new(None) };
+    static POWER_MESSAGE: RefCell<Option<KoboPowerMessage>> = const { RefCell::new(None) };
     static PREPARE_SLEEP_HANDLER: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
     static IDLE_SLEEP_CHECK: RefCell<Option<Box<dyn Fn() -> bool>>> = RefCell::new(None);
     static POWER_EVENT_HANDLER: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
@@ -258,10 +258,9 @@ fn notify_power_event() {
 
 pub fn take_power_menu_request() -> bool { POWER_MENU_PENDING.with(|pending| pending.replace(false)) }
 pub fn request_sleep() { SLEEP_PENDING.with(|pending| pending.set(true)); }
-pub fn take_power_message() -> Option<String> { POWER_MESSAGE.with(|message| message.borrow_mut().take()) }
+pub fn take_power_message() -> Option<KoboPowerMessage> { POWER_MESSAGE.with(|message| message.borrow_mut().take()) }
 
-fn report_power_message(message: String) {
-    eprintln!("Kobo power: {message}");
+fn report_power_message(message: KoboPowerMessage) {
     POWER_MESSAGE.with(|pending| *pending.borrow_mut() = Some(message));
     notify_power_event();
 }
@@ -397,7 +396,7 @@ pub struct KoboPlatformOptions {
     /// How physical page buttons are exposed to the shared GPUI application.
     pub page_buttons: PageButtonBehavior,
     /// Application-owned Kobo suspend operation invoked on power-button release.
-    pub power_button_handler: Option<fn() -> std::result::Result<(), String>>,
+    pub power_button_handler: Option<fn() -> std::io::Result<()>>,
     pub power_button_opens_menu: bool,
     pub power: KoboPowerOptions,
     /// Called after the restored application frame is presented following suspend.
@@ -415,10 +414,10 @@ pub struct KoboPlatformOptions {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KoboPowerOptions {
-    pub prepare_sleep: Option<fn(Option<Duration>) -> std::result::Result<(), String>>,
-    pub finish_sleep: Option<fn() -> std::result::Result<(), String>>,
+    pub prepare_sleep: Option<fn(Option<Duration>) -> std::io::Result<()>>,
+    pub finish_sleep: Option<fn() -> std::io::Result<()>>,
     pub poll: Option<fn() -> KoboPowerEvent>,
-    pub power_off: Option<fn() -> std::result::Result<(), String>>,
+    pub power_off: Option<fn() -> std::io::Result<()>>,
     pub prepare_delay: Duration,
     pub settle_delay: Duration,
     pub wake_confirmation_timeout: Duration,
@@ -432,8 +431,14 @@ pub struct KoboPowerOptions {
 
 pub enum KoboPowerEvent {
     None,
-    Warning(String),
+    LowBattery(u8),
     PowerOff,
+}
+
+#[derive(Debug)]
+pub enum KoboPowerMessage {
+    LowBattery(u8),
+    Failed(anyhow::Error),
 }
 
 /// Input behavior for Kobo's physical page-turn buttons.
@@ -1481,7 +1486,7 @@ impl KoboPlatform {
 
     fn present_pending_full_repaint(&self, state: &mut KoboRunState) -> Result<bool> {
         if SLEEP_PENDING.with(|pending| pending.replace(false)) {
-            if let Err(error) = self.request_suspend(state) { report_power_message(format!("Sleep failed: {error}")); }
+            if let Err(error) = self.request_suspend(state) { report_power_message(KoboPowerMessage::Failed(error.context("Sleep failed"))); }
         }
         if self.quit.get() { return Ok(false); }
         if !self.full_repaint_requested.replace(false) {
@@ -1638,7 +1643,7 @@ impl KoboPlatform {
             if self.wait_for_sleep_input(state, self.options.power.prepare_delay)? { return Ok(()); }
             if let Some(prepare) = self.options.power.prepare_sleep {
                 let auto_power_off = self.options.power.idle_power_off_timeout_provider.and_then(|provider| provider()).map(|timeout| timeout.saturating_sub(state.last_user_activity.elapsed()));
-                prepare(auto_power_off).map_err(|error| anyhow!("sleep preparation failed: {error}"))?;
+                prepare(auto_power_off).context("sleep preparation failed")?;
                 prepared = true;
             }
             if self.wait_for_sleep_input(state, self.options.power.settle_delay)? { return Ok(()); }
@@ -1651,7 +1656,7 @@ impl KoboPlatform {
         })();
         if self.quit.get() { return suspend_result; }
         let finish_result = if prepared {
-            self.options.power.finish_sleep.map_or(Ok(()), |finish| finish().map_err(|error| anyhow!("sleep recovery failed: {error}")))
+            self.options.power.finish_sleep.map_or(Ok(()), |finish| finish().context("sleep recovery failed"))
         } else { Ok(()) };
         for window in &windows { window.set_active(true); }
         state.wake_frame_pending = true;
@@ -1705,7 +1710,7 @@ impl KoboPlatform {
         state.next_power_check = now + Duration::from_secs(if sleeping { 1 } else { 60 });
         match self.options.power.poll.map_or(KoboPowerEvent::None, |poll| poll()) {
             KoboPowerEvent::None => {}
-            KoboPowerEvent::Warning(message) => report_power_message(message),
+            KoboPowerEvent::LowBattery(percent) => report_power_message(KoboPowerMessage::LowBattery(percent)),
             KoboPowerEvent::PowerOff => return self.request_power_off(state).map(|()| true),
         }
         Ok(false)
@@ -1723,7 +1728,7 @@ impl KoboPlatform {
             draw_bitmap_text(&mut frame, "POWER OFF", dot, top, 0, width);
             if let Some(presenter) = state.presenter.as_mut() { presenter.present_full_gc16(&frame)?; }
         }
-        power_off().map_err(|error| anyhow!("Kobo power-off failed: {error}"))?;
+        power_off().context("Kobo power-off failed")?;
         self.quit.set(true);
         self.return_screen_requested.set(false);
         self.full_repaint_requested.set(false);
@@ -2164,7 +2169,7 @@ impl KoboPlatform {
                 let changed = state.cover_closed != event.pressed;
                 state.cover_closed = event.pressed;
                 if changed && event.pressed {
-                    if let Err(error) = self.request_suspend(state) { report_power_message(format!("Sleep failed: {error}")); }
+                    if let Err(error) = self.request_suspend(state) { report_power_message(KoboPowerMessage::Failed(error.context("Sleep failed"))); }
                 }
             }
             return Ok(());
@@ -2188,7 +2193,7 @@ impl KoboPlatform {
             }
             println!("hardware power button requested Kobo suspend");
             if let Err(error) = self.request_suspend(state) {
-                report_power_message(format!("Sleep failed: {error}"));
+                report_power_message(KoboPowerMessage::Failed(error.context("Sleep failed")));
             }
             return Ok(());
         }
@@ -2363,7 +2368,7 @@ impl KoboPlatform {
         };
         while !self.quit.get() {
             if let Err(error) = self.poll_power(state, false) {
-                report_power_message(error.to_string());
+                report_power_message(KoboPowerMessage::Failed(error));
             }
             if self.quit.get() { break; }
             let idle_timeout = self.options.power.idle_timeout_provider.map_or(self.options.power.idle_timeout, |provider| provider());
@@ -2372,12 +2377,12 @@ impl KoboPlatform {
             let power_off_deadline = self.options.power.idle_power_off_timeout_provider.and_then(|provider| provider()).filter(|_| allowed).map(|timeout| state.last_user_activity + timeout);
             if power_off_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 state.last_user_activity = Instant::now();
-                if let Err(error) = self.request_power_off(state) { report_power_message(format!("Power off failed: {error}")); }
+                if let Err(error) = self.request_power_off(state) { report_power_message(KoboPowerMessage::Failed(error.context("Power off failed"))); }
                 if self.quit.get() { break; }
             } else if idle_deadline.is_some_and(|deadline| Instant::now() >= deadline)
                 || state.sleep_retry_at.is_some_and(|retry| Instant::now() >= retry)
             {
-                if let Err(error) = self.request_suspend(state) { report_power_message(format!("Sleep failed: {error}")); }
+                if let Err(error) = self.request_suspend(state) { report_power_message(KoboPowerMessage::Failed(error.context("Sleep failed"))); }
                 if self.quit.get() { break; }
             }
             self.dispatcher.run_pending();
@@ -2432,6 +2437,14 @@ impl KoboPlatform {
 }
 
 impl Platform for KoboPlatform {
+    fn supports_scroll_momentum(&self) -> bool {
+        false
+    }
+
+    fn supports_pinch_gestures(&self) -> bool {
+        false
+    }
+
     fn supports_animations(&self) -> bool {
         false
     }
@@ -2655,7 +2668,7 @@ mod sleep_tests {
     #[test]
     fn suspend_restores_application_on_success_and_failure() {
         for handler in [
-            (|| Ok(())) as fn() -> std::result::Result<(), String>,
+            (|| Ok(())) as fn() -> std::io::Result<()>,
             || Err("suspend unavailable".to_owned()),
         ] {
             let platform = KoboPlatform::new(KoboPlatformOptions {
@@ -2882,9 +2895,9 @@ mod power_policy_tests {
         let count = received.clone();
         on_power_event(move || count.set(count.get() + 1));
         let initial = received.get();
-        report_power_message("battery warning".into());
+        report_power_message(KoboPowerMessage::LowBattery(9));
         assert_eq!(received.get(), initial + 1);
-        assert_eq!(take_power_message().as_deref(), Some("battery warning"));
+        assert!(matches!(take_power_message(), Some(KoboPowerMessage::LowBattery(9))));
         POWER_EVENT_HANDLER.with(|handler| handler.borrow_mut().take());
     }
 

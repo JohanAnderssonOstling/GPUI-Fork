@@ -1046,10 +1046,8 @@ impl PlatformWindow for WindowsWindow {
             .set(Some(callback));
     }
 
-    #[cfg(feature = "snapshot")]
     fn supports_region_capture(&self) -> bool { true }
 
-    #[cfg(feature = "snapshot")]
     fn capture_region(&self, bounds: Bounds<DevicePixels>, executor: &BackgroundExecutor) -> Task<Result<image::RgbaImage>> {
         let task = self.state.renderer.borrow_mut().capture_region(bounds, executor);
         let window = Rc::downgrade(&self.0);

@@ -34,6 +34,22 @@ does not require a GPU or system fonts.
 
 ## Application integration
 
+Wrap application content in `KoboKeyboardRoot` to reserve space above the virtual
+keyboard. The root also sets GPUI's input viewport. Text inputs report their caret
+with `Window::request_input_autoscroll` during prepaint; GPUI scrolls enclosing
+containers on focus, selection, text revision, or viewport changes and rebuilds
+layout before painting until offsets settle, with a bounded retry budget. A
+reveal is acknowledged only when the caret is visible through its enclosing
+clips. Nested containers pass the adjusted caret position outward, and lists
+reserve the keyboard-covered area when laying out and scrolling their items.
+Offscreen containers resolve their internal scroll before their ancestors move
+them onscreen. The standard input component re-shapes newly visible text locally;
+scrolling inside an editor does not rebuild the whole window. Whole-window
+retries remain a bounded fallback when enclosing scroll offsets change.
+Ordinary redraws and manual scrolling do not trigger another completed reveal.
+Custom input widgets need to report their caret through the same API, and content
+that can exceed the available space must have a scrollable ancestor.
+
 Create the platform before the GPUI application and pass it to the normal
 production constructor:
 
@@ -69,6 +85,7 @@ Kobo-specific behavior is explicit backend policy:
 - touch coordinates support inferred axis swapping and a `GPUI_KOBO_TOUCH_TRANSFORM=swap,invert-x,invert-y` override;
 - calibration ranges can be overridden with `GPUI_KOBO_TOUCH_CALIBRATION=x_min,x_max,y_min,y_max`;
 - gestures include tap, swipe, long press, and cancellation and are classified only at finger release, preserving the no-render-during-drag guard;
+- platform capabilities disable scroll momentum and suppress pinch events before application views receive them;
 - a Kobo runtime polls touch and hardware buttons, handles page-button scrolling, and reinitializes FBInk after rotation or wake;
 - scroll releases use one A2 damage update, other changes use partial GC16, and cleanup uses full GC16 after six fast updates or three accumulated screen areas;
 - queued invalidations are coalesced and an idle GC16 cleanup runs after a fast-update sequence;

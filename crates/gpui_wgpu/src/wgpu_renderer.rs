@@ -1,24 +1,18 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
-#[cfg(all(
-    not(target_family = "wasm"),
-    any(feature = "test-support", feature = "snapshot")
-))]
+#[cfg(not(target_family = "wasm"))]
 use bytemuck::allocation::cast_vec;
 use gpui::profiler::startup::StartupProfile;
 #[cfg(not(target_family = "wasm"))]
 use crate::pipeline_cache::PersistentPipelineCache;
-#[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+#[cfg(not(target_family = "wasm"))]
 use gpui::{BackgroundExecutor, Task};
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
     ScaledPixels, Scene, Size, get_gamma_correction_ratios,
 };
-#[cfg(all(
-    not(target_family = "wasm"),
-    any(feature = "test-support", feature = "snapshot")
-))]
+#[cfg(not(target_family = "wasm"))]
 use image::RgbaImage;
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -37,10 +31,7 @@ const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
 const INSTANCE_TEXTURE_TEXEL_SIZE: u64 = 16;
 
-#[cfg(all(
-    not(target_family = "wasm"),
-    any(feature = "test-support", feature = "snapshot")
-))]
+#[cfg(not(target_family = "wasm"))]
 fn snapshot_rgba_bytes(
     bytes: &[u8],
     width: u32,
@@ -296,10 +287,7 @@ enum WgpuTarget {
     Headless(HeadlessTarget),
 }
 
-#[cfg(all(
-    not(target_family = "wasm"),
-    any(feature = "test-support", feature = "snapshot")
-))]
+#[cfg(not(target_family = "wasm"))]
 struct HeadlessTarget {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -348,7 +336,7 @@ pub struct WgpuRenderer {
     failed_frame_count: u32,
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     needs_redraw: bool,
-    #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+    #[cfg(not(target_family = "wasm"))]
     region_captures: crate::region_capture::RegionCaptures,
     #[cfg(not(target_family = "wasm"))]
     recovery_not_before: Option<Instant>,
@@ -563,7 +551,7 @@ impl WgpuRenderer {
         let surface_config = wgpu::SurfaceConfiguration {
             usage: {
                 let usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
-                #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+                #[cfg(not(target_family = "wasm"))]
                 let usage = usage | (surface_caps.usages & wgpu::TextureUsages::COPY_SRC);
                 usage
             },
@@ -789,7 +777,7 @@ impl WgpuRenderer {
             failed_frame_count: 0,
             device_lost: context.device_lost_flag(),
             needs_redraw: false,
-            #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+            #[cfg(not(target_family = "wasm"))]
             region_captures: Default::default(),
             #[cfg(not(target_family = "wasm"))]
             recovery_not_before: None,
@@ -974,17 +962,14 @@ impl WgpuRenderer {
             failed_frame_count: 0,
             device_lost: context.device_lost_flag(),
             needs_redraw: false,
-            #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+            #[cfg(not(target_family = "wasm"))]
             region_captures: Default::default(),
             #[cfg(not(target_family = "wasm"))]
             recovery_not_before: None,
         })
     }
 
-    #[cfg(all(
-        not(target_family = "wasm"),
-        any(feature = "test-support", feature = "snapshot")
-    ))]
+    #[cfg(not(target_family = "wasm"))]
     fn create_headless_target(
         device: &wgpu::Device,
         width: u32,
@@ -1649,10 +1634,7 @@ impl WgpuRenderer {
         Ok(self.render_scene_to_view(scene, &view))
     }
 
-    #[cfg(all(
-        not(target_family = "wasm"),
-        any(feature = "test-support", feature = "snapshot")
-    ))]
+    #[cfg(not(target_family = "wasm"))]
     fn render_scene_to_view(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> bool {
         let last_error = self.last_error.lock().unwrap().take();
         if let Some(error) = last_error {
@@ -1726,10 +1708,7 @@ impl WgpuRenderer {
         self.read_snapshot(target)
     }
 
-    #[cfg(all(
-        not(target_family = "wasm"),
-        any(feature = "test-support", feature = "snapshot")
-    ))]
+    #[cfg(not(target_family = "wasm"))]
     fn read_snapshot(&self, target: &HeadlessTarget) -> anyhow::Result<RgbaImage> {
         let width = self.surface_config.width;
         let height = self.surface_config.height;
@@ -1794,7 +1773,7 @@ impl WgpuRenderer {
     }
 
     /// Captures a window scene using its existing GPU context and sprite atlas.
-    #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+    #[cfg(not(target_family = "wasm"))]
     pub fn snapshot(&mut self, scene: &Scene) -> anyhow::Result<RgbaImage> {
         anyhow::ensure!(!self.device_lost(), "snapshot requested after GPU device loss");
         let target = Self::create_headless_target(
@@ -1875,7 +1854,7 @@ impl WgpuRenderer {
     }
 
     /// Requests a region from the next frame; readback runs on the supplied executor.
-    #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+    #[cfg(not(target_family = "wasm"))]
     pub fn capture_region(
         &mut self,
         bounds: Bounds<DevicePixels>,
@@ -1886,7 +1865,7 @@ impl WgpuRenderer {
 
     pub fn draw(&mut self, scene: &Scene) -> bool {
         let drawn = self.draw_frame(scene);
-        #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+        #[cfg(not(target_family = "wasm"))]
         if !drawn {
             self.region_captures.fail("Could not render the frame for capture");
         }
@@ -2032,7 +2011,7 @@ impl WgpuRenderer {
             return false;
         }
 
-        #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
+        #[cfg(not(target_family = "wasm"))]
         if !self.region_captures.is_empty() {
             // Most native surfaces can be copied directly. Render a temporary target
             // only on backends whose presentation textures do not allow COPY_SRC.

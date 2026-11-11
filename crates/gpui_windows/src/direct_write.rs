@@ -243,6 +243,42 @@ impl PlatformTextSystem for DirectWriteTextSystem {
         }
     }
 
+    fn font_has_substitution_feature(&self, font_id: FontId, tag: [u8; 4]) -> bool {
+        let state = self.state.read();
+        let Some(font) = state.fonts.get(font_id.0) else {
+            return false;
+        };
+        let mut data = std::ptr::null_mut();
+        let mut size = 0;
+        let mut context = std::ptr::null_mut();
+        let mut exists = Default::default();
+        // DirectWrite uses little-endian table tags, unlike the table bytes.
+        if unsafe {
+            font.font_face.TryGetFontTable(
+                u32::from_le_bytes(*b"GSUB"),
+                &mut data,
+                &mut size,
+                &mut context,
+                &mut exists,
+            )
+        }
+        .is_err()
+        {
+            return false;
+        }
+        if !exists.as_bool() {
+            return false;
+        }
+        let supported = !data.is_null()
+            && font_layout_table_has_feature(
+                unsafe { std::slice::from_raw_parts(data.cast::<u8>(), size as usize) },
+                tag,
+            );
+        // The borrowed table is valid until its native context is released.
+        unsafe { font.font_face.ReleaseFontTable(context) };
+        supported
+    }
+
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {
         self.state.read().font_metrics(font_id)
     }

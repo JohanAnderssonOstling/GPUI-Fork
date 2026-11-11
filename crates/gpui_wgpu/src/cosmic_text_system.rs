@@ -25,6 +25,7 @@ use std::{
     sync::Arc,
 };
 use swash::{
+    Action,
     scale::{Render, ScaleContext, Source, StrikeWith},
     zeno::{Format, Transform, Vector},
 };
@@ -54,6 +55,7 @@ impl FontKey {
 
 struct CosmicTextSystemState {
     font_system: FontSystem,
+    shaping_batch_active: bool,
     scratch: ShapeBuffer,
     layout_lines: Vec<CosmicLayoutLine>,
     cluster_scratch: Vec<ShapedCluster>,
@@ -109,6 +111,7 @@ impl CosmicTextSystem {
 
         Self(RwLock::new(CosmicTextSystemState {
             font_system,
+            shaping_batch_active: false,
             scratch: ShapeBuffer::default(),
             layout_lines: Vec::new(),
             cluster_scratch: Vec::new(),
@@ -164,6 +167,12 @@ impl PlatformTextSystem for CosmicTextSystem {
 
     fn release_font_data(&self) {
         self.0.write().release_font_data();
+    }
+
+    fn begin_shaping_batch(&self) {
+        let mut state = self.0.write();
+        state.font_system.shape_run_cache = Default::default();
+        state.shaping_batch_active = true;
     }
 
     fn release_shaping_scratch(&self) {
@@ -235,6 +244,14 @@ impl PlatformTextSystem for CosmicTextSystem {
         let font_id = state.font_instance(base_id, font);
         state.font(font_id)?;
         Ok(font_id)
+    }
+
+    fn font_has_substitution_feature(&self, font_id: FontId, tag: [u8; 4]) -> bool {
+        self.0.write().font(font_id).is_ok_and(|font| {
+            font.as_swash().features().any(|feature| {
+                feature.tag() == u32::from_be_bytes(tag) && feature.action() == Action::Substitution
+            })
+        })
     }
 
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {
@@ -765,6 +782,10 @@ impl CosmicTextSystemState {
                 self.layout_line_no_separators(text, font_size, font_runs, clusters)
             };
         }
+        // Ordinary UI text has no document batch to release its cached runs.
+        if !self.shaping_batch_active {
+            self.font_system.shape_run_cache = Default::default();
+        }
         layout
     }
 
@@ -929,6 +950,7 @@ impl CosmicTextSystemState {
             // Borrow features while constructing spans; AttrsList owns the copy
             // it needs after these temporary views and font borrows expire.
             let primary_attrs = Attrs {
+                font_id: Some(loaded_font.database_id),
                 font_features: Cow::Borrowed(&loaded_font.features),
                 ..Attrs::new()
                     .metadata(run.font_id.0)
@@ -940,7 +962,8 @@ impl CosmicTextSystemState {
             };
             let fallback_attrs: SmallVec<[Attrs<'_>; 4]> = fallback_chain
                 .iter()
-                .map(|(_, fb_name)| Attrs {
+                .map(|(id, fb_name)| Attrs {
+                    font_id: Some(self.loaded_font(*id).database_id),
                     font_features: Cow::Borrowed(&loaded_font.features),
                     ..Attrs::new()
                         .metadata(run.font_id.0)
@@ -1119,6 +1142,9 @@ impl CosmicTextSystemState {
     }
 
     fn release_shaping_scratch(&mut self) {
+        self.shaping_batch_active = false;
+        // Returned layouts own their glyphs; the lookup copies are batch-local.
+        self.font_system.shape_run_cache = Default::default();
         self.font_system.release_shaping_scratch();
         discard_spare_pages_at_least(&mut self.cluster_scratch, 16 * 1024);
         // These values are rebuilt before reuse. Discard their pages only at

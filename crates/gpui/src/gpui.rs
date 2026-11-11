@@ -35,9 +35,7 @@ mod key_dispatch;
 mod keymap;
 mod path_builder;
 mod platform;
-#[cfg(feature = "snapshot")]
 mod region_capture;
-#[cfg(feature = "snapshot")]
 pub use region_capture::*;
 pub mod prelude;
 /// Profiling utilities for task, frame, and thread performance tracking.

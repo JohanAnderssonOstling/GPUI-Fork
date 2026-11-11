@@ -309,6 +309,16 @@ pub trait Platform: 'static {
         false
     }
 
+    /// Whether touch scroll containers may continue moving after a flick.
+    fn supports_scroll_momentum(&self) -> bool {
+        true
+    }
+
+    /// Whether pinch gestures may be dispatched to application views.
+    fn supports_pinch_gestures(&self) -> bool {
+        true
+    }
+
     /// Shows or hides the mobile operating system's status and navigation
     /// bars. Desktop platforms ignore this.
     fn set_system_bars_visible(&self, _visible: bool) {}
@@ -971,12 +981,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
     /// Whether this window can copy pixels from its renderer.
-    #[cfg(feature = "snapshot")]
     fn supports_region_capture(&self) -> bool {
         false
     }
     /// Copies a region of the next rendered frame into an image.
-    #[cfg(feature = "snapshot")]
     fn capture_region(
         &self,
         _bounds: Bounds<DevicePixels>,
@@ -1105,7 +1113,6 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Renders the given scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
-    #[cfg(any(test, feature = "test-support", feature = "snapshot"))]
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
     }
@@ -1207,6 +1214,8 @@ pub trait PlatformTextSystem: Send + Sync {
     }
     /// Drop reloadable font data without invalidating font IDs or existing layouts.
     fn release_font_data(&self) {}
+    /// Reuse temporary shaped runs until `release_shaping_scratch` ends the batch.
+    fn begin_shaping_batch(&self) {}
     /// Release completed shaping scratch pages while preserving reusable capacity.
     fn release_shaping_scratch(&self) {}
     /// Return consumed cluster storage for reuse. Existing contents are discarded.
@@ -1221,6 +1230,11 @@ pub trait PlatformTextSystem: Send + Sync {
     }
     /// Get the font ID for a font descriptor.
     fn font_id(&self, descriptor: &Font) -> Result<FontId>;
+    /// Whether the font defines a substitution feature, independently of its
+    /// effect on any particular character or the current feature settings.
+    fn font_has_substitution_feature(&self, _font_id: FontId, _tag: [u8; 4]) -> bool {
+        false
+    }
     /// Get metrics for a font.
     fn font_metrics(&self, font_id: FontId) -> FontMetrics;
     /// Get typographic bounds for a glyph.

@@ -12,7 +12,6 @@ workspace = true
 path = "src/gpui_linux.rs"
 
 [features]
-snapshot = ["gpui/snapshot", "gpui_wgpu?/snapshot", "dep:image"]
 default = ["wayland", "x11"]
 test-support = ["gpui/test-support"]
 system-notifications = ["dep:notify-rust"]
@@ -62,7 +61,7 @@ futures.workspace = true
 gpui.workspace = true
 gpui_util.workspace = true
 gpui_wgpu = { workspace = true, optional = true, features = ["font-kit"] }
-image = { workspace = true, optional = true }
+image.workspace = true
 libc.workspace = true
 log.workspace = true
 parking_lot.workspace = true

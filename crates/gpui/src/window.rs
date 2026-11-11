@@ -9,23 +9,25 @@ use crate::{
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect,
-    ElementTransform, Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global,
+    ElementTransform, Entity, EntityId, EventEmitter, FileDropEvent, FontId, GestureTuning, Global,
     GlobalElementId, GlyphId, GpuSpecs, Hsla, InputEvent, InputHandler, IsZero, KeyBinding,
     KeyContext, KeyDownEvent, KeyEvent, KeyLocation, Keystroke, KeystrokeEvent, LayoutId,
     LineLayoutIndex, LongPressEvent, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PageScrollGesture, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TouchEvent, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, WrappedLine, point, prelude::*, px, rems, size,
+    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PageScrollGesture, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, ScrollDelta, ScrollWheelEvent,
+    Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet,
+    Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TouchEvent, TouchId,
+    TouchPhase, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowInsets,
+    WindowOptions, WindowParams, WindowTextSystem, WrappedLine, point, prelude::*, px, rems, size,
     transparent_black,
 };
 
+use crate::profiler::input_frame::InputFrameProfile;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 #[cfg(target_os = "macos")]
@@ -41,7 +43,6 @@ use parking_lot::RwLock;
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
 use refineable::Refineable;
 use scheduler::Instant;
-use crate::profiler::input_frame::InputFrameProfile;
 use slotmap::SlotMap;
 use smallvec::SmallVec;
 use std::{
@@ -1273,6 +1274,21 @@ enum InputModality {
     Touch,
 }
 
+#[derive(PartialEq)]
+struct InputAutoscrollState {
+    focus: FocusId,
+    focus_generation: u64,
+    viewport: Bounds<Pixels>,
+    input_size: Size<Pixels>,
+    selection: Range<usize>,
+    text_revision: u64,
+}
+
+// Nested scroll surfaces can become visible only after an outer surface moves.
+// Bound the convergence work for pathological layouts; do not acknowledge an
+// unresolved input reveal when this budget is exhausted.
+const MAX_AUTOSCROLL_RELAYOUTS: usize = 8;
+
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
@@ -1302,6 +1318,12 @@ pub struct Window {
     pub(crate) transform_stack: Vec<TransformationMatrix>,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
+    input_viewport: Option<Bounds<Pixels>>,
+    input_autoscroll_state: Option<InputAutoscrollState>,
+    pending_input_autoscroll_state: Option<InputAutoscrollState>,
+    input_autoscroll_visible: bool,
+    pub(crate) allow_autoscroll: bool,
+    pub(crate) autoscroll_relayout_requested: bool,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
@@ -1334,6 +1356,11 @@ pub struct Window {
     last_input_modality: InputModality,
     page_scroll_on_swipe: bool,
     page_scroll_gesture: PageScrollGesture,
+    touch_contacts: FxHashSet<TouchId>,
+    touch_scroll_origin: Option<Point<Pixels>>,
+    touch_scroll_event: Option<ScrollWheelEvent>,
+    touch_scroll_owner: Option<usize>,
+    pub(crate) scroll_interruption: u64,
     input_frame_profile: InputFrameProfile,
     pub(crate) refreshing: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
@@ -2019,6 +2046,12 @@ impl Window {
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
+            input_viewport: None,
+            input_autoscroll_state: None,
+            pending_input_autoscroll_state: None,
+            input_autoscroll_visible: false,
+            allow_autoscroll: true,
+            autoscroll_relayout_requested: false,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
@@ -2052,6 +2085,11 @@ impl Window {
             },
             page_scroll_on_swipe: false,
             page_scroll_gesture: PageScrollGesture::default(),
+            touch_contacts: FxHashSet::default(),
+            touch_scroll_origin: None,
+            touch_scroll_event: None,
+            touch_scroll_owner: None,
+            scroll_interruption: 0,
             input_frame_profile: Default::default(),
             refreshing: false,
             activation_observers: SubscriberSet::new(),
@@ -2632,14 +2670,12 @@ impl Window {
     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
-    #[cfg(any(test, feature = "test-support", feature = "snapshot"))]
     pub fn render_to_image(&self) -> anyhow::Result<image::RgbaImage> {
         self.platform_window
             .render_to_image(&self.rendered_frame.scene)
     }
 
     /// Whether the active renderer supports frame-region readback.
-    #[cfg(feature = "snapshot")]
     pub fn supports_region_capture(&self) -> bool {
         self.platform_window.supports_region_capture()
     }
@@ -2647,7 +2683,6 @@ impl Window {
     /// Captures a region in window-local logical coordinates from the next frame.
     /// Remove any selection overlay before requesting capture. The task resolves
     /// after native GPU readback, without requiring desktop capture permission.
-    #[cfg(feature = "snapshot")]
     pub fn capture_region(&mut self, bounds: Bounds<Pixels>, cx: &App) -> Task<anyhow::Result<image::RgbaImage>> {
         let scale = self.scale_factor();
         let left = (f32::from(bounds.left()) * scale).floor();
@@ -3134,6 +3169,7 @@ impl Window {
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
         self.requested_autoscroll = None;
+        self.pending_input_autoscroll_state = None;
 
         // Restore the previously-used input handler.
         // Place it back into a None slot (left by a previous .take()) so that
@@ -3153,7 +3189,7 @@ impl Window {
             }
         }
         if !cx.mode.skip_drawing() {
-            self.draw_roots(cx);
+            self.draw_roots(cx, MAX_AUTOSCROLL_RELAYOUTS);
             #[cfg(feature = "profiler")]
             {
                 let viewport_size = self.viewport_size;
@@ -3166,6 +3202,12 @@ impl Window {
             }
         }
         self.dirty_views.clear();
+        if let Some(state) = self.pending_input_autoscroll_state.take()
+            && self.input_autoscroll_visible
+            && !self.autoscroll_relayout_requested
+        {
+            self.input_autoscroll_state = Some(state);
+        }
         self.next_frame.window_active = self.active.get();
 
         // Register requested input handler with the platform window.
@@ -3351,8 +3393,12 @@ impl Window {
         self.refresh();
     }
 
-    fn draw_roots(&mut self, cx: &mut App) {
+    fn draw_roots(&mut self, cx: &mut App, remaining_relayouts: usize) {
         self.invalidator.set_phase(DrawPhase::Prepaint);
+        self.allow_autoscroll = remaining_relayouts > 0;
+        self.input_autoscroll_visible = false;
+        self.autoscroll_relayout_requested = false;
+        let line_layout_start = self.prepaint_index().line_layout_index;
         self.tooltip_bounds.take();
 
         self.a11y.sync_active_flag();
@@ -3422,6 +3468,24 @@ impl Window {
             cx.active_drag = Some(active_drag);
         } else {
             tooltip_element = self.prepaint_tooltip(cx);
+        }
+
+        if self.autoscroll_relayout_requested && remaining_relayouts > 0 {
+            // Elements can own FnOnce prepaint callbacks, so rebuild the tree
+            // instead of prepainting the same element twice. Keep element state
+            // (including the corrected scroll offsets), but discard all geometry
+            // and hitboxes from the first pass. Neither pass is presented early.
+            let states = mem::take(&mut self.next_frame.element_states);
+            self.next_frame.clear();
+            self.next_frame.element_states = states;
+            self.requested_autoscroll = None;
+            self.text_system.truncate_layouts(line_layout_start);
+            self.layout_engine.as_mut().unwrap().clear();
+            let refreshing = mem::replace(&mut self.refreshing, true);
+            self.input_frame_profile.end_layout();
+            self.draw_roots(cx, remaining_relayouts - 1);
+            self.refreshing = refreshing;
+            return;
         }
 
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
@@ -4012,6 +4076,74 @@ impl Window {
             self.text_system.truncate_layouts(index.line_layout_index);
         }
         result
+    }
+
+    /// Set the area available to text inputs while an on-screen keyboard is open.
+    /// Pass `None` when it closes. This opts inputs into focus/edit/resize reveal;
+    /// ordinary repaints and manual scrolling do not request another reveal.
+    pub fn set_input_viewport(&mut self, viewport: Option<Bounds<Pixels>>) {
+        self.input_viewport = viewport;
+        if viewport.is_none() {
+            self.input_autoscroll_state = None;
+            self.pending_input_autoscroll_state = None;
+        }
+    }
+
+    pub(crate) fn autoscroll_viewport(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        self.input_viewport.map_or(bounds, |viewport| bounds.intersect(&viewport))
+    }
+
+    /// Whether the focused input needs revealing. `selection` is anchor..head
+    /// in document offsets (it may be reversed), independent of scroll position.
+    /// Increment `text_revision` on accepted edits, even if the selection stays put.
+    /// Inputs can also use this to reveal the caret inside their own editor.
+    pub fn should_autoscroll_input(
+        &self,
+        focus: &FocusHandle,
+        input_size: Size<Pixels>,
+        selection: Range<usize>,
+        text_revision: u64,
+    ) -> bool {
+        let Some(viewport) = self.input_viewport else { return false };
+        focus.is_focused(self)
+            && self.input_autoscroll_state.as_ref() != Some(&InputAutoscrollState {
+                focus: focus.id,
+                focus_generation: self.focus_generation,
+                viewport,
+                input_size,
+                selection,
+                text_revision,
+            })
+    }
+
+    /// Report the focused caret during prepaint. Scrollable ancestors reveal it
+    /// before painting when the input, selection, or available space changes.
+    pub fn request_input_autoscroll(
+        &mut self,
+        focus: &FocusHandle,
+        caret: Bounds<Pixels>,
+        input_size: Size<Pixels>,
+        selection: Range<usize>,
+        text_revision: u64,
+    ) {
+        self.invalidator.debug_assert_prepaint();
+        if !self.should_autoscroll_input(focus, input_size, selection.clone(), text_revision) {
+            return;
+        }
+        let visible = self.autoscroll_viewport(self.content_mask().bounds);
+        self.input_autoscroll_visible = visible.size.width > Pixels::ZERO
+            && visible.size.height > Pixels::ZERO
+            && caret.left() >= visible.left() && caret.right() <= visible.right()
+            && caret.top() >= visible.top() && caret.bottom() <= visible.bottom();
+        self.pending_input_autoscroll_state = Some(InputAutoscrollState {
+            focus: focus.id,
+            focus_generation: self.focus_generation,
+            viewport: self.input_viewport.unwrap(),
+            input_size,
+            selection,
+            text_revision,
+        });
+        self.request_autoscroll(caret.dilate(px(12.0)));
     }
 
     /// When you call this method during [`Element::prepaint`], containing elements will attempt to
@@ -5699,8 +5831,8 @@ impl Window {
             .unwrap_or_else(|| action.name().to_string())
     }
 
-    /// Lets touch scrolls track the finger and settle to a full page on release.
-    /// Wheel events without a touch start retain their ordinary pixel or line distance.
+    /// Enables page conversion for legacy scroll sources without raw touch events.
+    /// Native touch drags always retain their pixel movement through release.
     pub fn set_page_scroll_on_swipe(&mut self, enabled: bool) {
         if self.page_scroll_on_swipe != enabled {
             self.page_scroll_on_swipe = enabled;
@@ -5708,11 +5840,37 @@ impl Window {
         }
     }
 
-    /// Whether the current scroll event belongs to a live touch page gesture.
-    /// Pixel movement is delivered during the drag; a terminal Pages event
-    /// settles the receiving surface, including a zero page delta to cancel.
+    /// Whether the current scroll event belongs to a touch drag, including
+    /// its release or cancellation. Views decide whether to scroll or paginate.
+    pub fn is_touch_scroll(&self) -> bool {
+        self.touch_scroll_event.is_some()
+            || (self.page_scroll_on_swipe && self.page_scroll_gesture.active())
+    }
+
+    /// Whether the current scroll event belongs to a touch drag.
+    /// Prefer [`Self::is_touch_scroll`]; touch drags do not imply page navigation.
     pub fn is_page_scroll_swipe(&self) -> bool {
-        self.page_scroll_on_swipe && self.page_scroll_gesture.active()
+        self.is_touch_scroll()
+    }
+
+    /// The current touch scroll, including its pixel release, for scroll
+    /// containers to track velocity and retain gesture ownership.
+    pub(crate) fn touch_scroll_event(&self) -> Option<&ScrollWheelEvent> {
+        self.touch_scroll_event.as_ref()
+    }
+
+    pub(crate) fn can_handle_touch_scroll(&self, target: usize) -> bool {
+        self.touch_scroll_owner.is_none_or(|owner| owner == target)
+    }
+
+    pub(crate) fn claim_touch_scroll(&mut self, target: usize) {
+        self.touch_scroll_owner.get_or_insert(target);
+    }
+
+    pub(crate) fn scroll_gesture_tuning(&self, cx: &App) -> GestureTuning {
+        cx.platform
+            .gestures()
+            .map_or_else(GestureTuning::default, |gestures| gestures.tuning())
     }
 
     /// Dispatch a mouse or keyboard event on the window.
@@ -5721,13 +5879,75 @@ impl Window {
     /// When synthesizing input inside a listener or entity update, schedule it
     /// with [`Self::defer`] so the current listeners and entity leases finish first.
     #[profiling::function]
-    pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+    pub fn dispatch_event(&mut self, mut event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+        if matches!(event, PlatformInput::Pinch(_)) && !cx.platform.supports_pinch_gestures() {
+            return DispatchEventResult { propagate: false, default_prevented: true };
+        }
+        self.touch_scroll_event = None;
+        match &event {
+            PlatformInput::Touch(touch) => match touch.phase {
+                TouchPhase::Started => {
+                    self.touch_contacts.insert(touch.id);
+                    self.touch_scroll_owner = None;
+                    self.scroll_interruption = self.scroll_interruption.wrapping_add(1);
+                }
+                TouchPhase::Ended | TouchPhase::Cancelled => {
+                    self.touch_contacts.remove(&touch.id);
+                    if touch.phase == TouchPhase::Cancelled {
+                        self.scroll_interruption = self.scroll_interruption.wrapping_add(1);
+                    }
+                }
+                TouchPhase::Moved => {}
+            },
+            PlatformInput::ScrollWheel(scroll) => {
+                if scroll.touch_phase == TouchPhase::Started {
+                    self.touch_scroll_owner = None;
+                    self.scroll_interruption = self.scroll_interruption.wrapping_add(1);
+                    self.touch_scroll_origin = (!self.touch_contacts.is_empty()
+                        && matches!(scroll.delta, ScrollDelta::Pixels(_)))
+                    .then_some(scroll.position);
+                }
+                if let Some(origin) = self.touch_scroll_origin
+                    && matches!(scroll.delta, ScrollDelta::Pixels(_))
+                {
+                    let mut original = scroll.clone();
+                    original.position = origin;
+                    if let ScrollDelta::Pixels(delta) = original.delta
+                        && (!f32::from(delta.x).is_finite() || !f32::from(delta.y).is_finite())
+                    {
+                        original.delta = ScrollDelta::Pixels(Point::default());
+                        original.touch_phase = TouchPhase::Cancelled;
+                    }
+                    self.touch_scroll_event = Some(original);
+                    if matches!(
+                        scroll.touch_phase,
+                        TouchPhase::Ended | TouchPhase::Cancelled
+                    ) {
+                        self.touch_scroll_origin = None;
+                    }
+                } else {
+                    self.touch_scroll_origin = None;
+                    // Wheel/trackpad input already carries the platform's own
+                    // inertia. It also interrupts any preceding touch fling.
+                    self.scroll_interruption = self.scroll_interruption.wrapping_add(1);
+                }
+            }
+            PlatformInput::MouseDown(_) | PlatformInput::KeyDown(_) | PlatformInput::Pinch(_) => {
+                self.scroll_interruption = self.scroll_interruption.wrapping_add(1);
+            }
+            _ => {}
+        }
+        if let (PlatformInput::ScrollWheel(scroll), Some(original)) =
+            (&mut event, &self.touch_scroll_event)
+        {
+            *scroll = original.clone();
+        }
         let input_started = self.input_frame_profile.begin_input();
         let input_kind = match &event {
             PlatformInput::ScrollWheel(_) => "scroll", PlatformInput::Touch(_) => "touch",
             PlatformInput::MouseDown(_) | PlatformInput::MouseUp(_) => "tap", _ => "other",
         };
-        let event = if self.page_scroll_on_swipe {
+        let event = if self.page_scroll_on_swipe && self.touch_scroll_event.is_none() {
             match event {
                 PlatformInput::ScrollWheel(scroll) => {
                     let viewport = self.viewport_size();
@@ -5906,6 +6126,12 @@ impl Window {
         self.window_profiler.end_input(caused_invalidation);
         self.input_frame_profile.end_input(input_started, input_kind, caused_invalidation || self.page_scroll_gesture.active());
 
+        if self.touch_scroll_event.as_ref().is_some_and(|event| {
+            matches!(event.touch_phase, TouchPhase::Ended | TouchPhase::Cancelled)
+        }) {
+            self.touch_scroll_owner = None;
+        }
+        self.touch_scroll_event = None;
         DispatchEventResult {
             propagate: cx.propagate_event,
             default_prevented: self.default_prevented,

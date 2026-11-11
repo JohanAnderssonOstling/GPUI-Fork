@@ -335,6 +335,13 @@ impl<V: Render + 'static> KoboKeyboardRoot<V> {
 impl<V: Render + 'static> Render for KoboKeyboardRoot<V> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let input_active = window.is_text_input_active();
+        let viewport = window.viewport_size();
+        window.set_input_viewport(input_active.then(|| {
+            gpui::Bounds::new(
+                gpui::Point::default(),
+                gpui::size(viewport.width, (viewport.height - keyboard_height(window)).max(px(0.0))),
+            )
+        }));
         if !input_active {
             self.shifted = false;
             self.symbols = false;

@@ -16,7 +16,7 @@
 //! constructed by combining these two systems into an all-in-one element.
 
 use crate::{
-    Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, DispatchPhase,
+    Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Axis, Bounds, ClickEvent, DispatchPhase,
     Display, Element, ElementId, Entity, EntityId, ExternalDragPayload, ExternalDragPayloadSource,
     FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId,
     IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent,
@@ -1981,6 +1981,12 @@ impl Element for Div {
             scroll_handle.scroll_to_active_item();
         }
 
+        let scroll_position = self.interactivity.scroll_offset.clone();
+        let scroll_animation = self.interactivity.page_scroll_animation.clone();
+        let ongoing_scroll = self.interactivity.ongoing_scroll.clone();
+        // Only descendants of this div may move it. Keep requests from earlier
+        // siblings intact while walking this subtree.
+        let previous_autoscroll = window.take_autoscroll();
         self.interactivity.prepaint(
             global_id,
             inspector_id,
@@ -1991,6 +1997,9 @@ impl Element for Div {
             |style, scroll_offset, hitbox, window, cx| {
                 // skip children
                 if style.display == Display::None {
+                    if let Some(target) = previous_autoscroll {
+                        window.request_autoscroll(target);
+                    }
                     return hitbox;
                 }
 
@@ -2009,6 +2018,61 @@ impl Element for Div {
                             }
                         }
                     });
+
+                    let mut autoscroll = window.take_autoscroll();
+                    if window.allow_autoscroll
+                        && let Some(target) = autoscroll.as_mut()
+                        && let Some(position) = &scroll_position
+                    {
+                        let padding = style.padding.to_pixels(bounds.size.into(), window.rem_size());
+                        let padded_size = content_size
+                            + size(padding.left + padding.right, padding.top + padding.bottom);
+                        let max = Point::from(padded_size - bounds.size)
+                            .map(|value| (value * 100.0).round() / 100.0)
+                            .max(&Point::default());
+                        let correction = |start: Pixels, end: Pixels, visible_start: Pixels, visible_end: Pixels| {
+                            if start < visible_start {
+                                visible_start - start
+                            } else if end > visible_end {
+                                -(end - visible_end).min(start - visible_start)
+                            } else {
+                                Pixels::ZERO
+                            }
+                        };
+                        let old = *position.borrow();
+                        let mut new = old;
+                        let viewport = window.autoscroll_viewport(bounds);
+                        // An outer surface may bring this container onscreen.
+                        // Reveal within its own bounds now instead of waiting
+                        // for another whole-window layout to discover it.
+                        let viewport = if viewport.size.width <= Pixels::ZERO || viewport.size.height <= Pixels::ZERO {
+                            bounds
+                        } else {
+                            viewport
+                        };
+                        if style.overflow.x == Overflow::Scroll && viewport.size.width > Pixels::ZERO {
+                            new.x = (old.x + correction(target.left(), target.right(), viewport.left(), viewport.right()))
+                                .clamp(-max.x, Pixels::ZERO);
+                        }
+                        if style.overflow.y == Overflow::Scroll && viewport.size.height > Pixels::ZERO {
+                            new.y = (old.y + correction(target.top(), target.bottom(), viewport.top(), viewport.bottom()))
+                                .clamp(-max.y, Pixels::ZERO);
+                        }
+                        if new != old {
+                            *position.borrow_mut() = new;
+                            if let Some(animation) = &scroll_animation {
+                                *animation.borrow_mut() = None;
+                            }
+                            if let Some(ongoing) = &ongoing_scroll {
+                                ongoing.borrow_mut().touch.cancel();
+                            }
+                            target.origin += new - old;
+                            window.autoscroll_relayout_requested = true;
+                        }
+                    }
+                    if let Some(target) = autoscroll.or(previous_autoscroll) {
+                        window.request_autoscroll(target);
+                    }
 
                     if let Some(listener) = self.prepaint_listener.as_ref() {
                         listener(children_bounds, window, cx);
@@ -2437,6 +2501,27 @@ impl Interactivity {
             // Clamp scroll offset in case scroll max is smaller now (e.g., if children
             // were removed or the bounds became larger).
             let mut scroll_offset = scroll_offset.borrow_mut();
+            if let Some(ongoing) = &self.ongoing_scroll {
+                let mut ongoing = ongoing.borrow_mut();
+                if scroll_to_bottom {
+                    ongoing.touch.cancel();
+                }
+                if let Some(delta) = ongoing.touch.advance(
+                    *scroll_offset,
+                    window.scroll_interruption,
+                    window.scroll_gesture_tuning(cx),
+                    cx.reduce_motion() || !cx.platform.supports_scroll_momentum(),
+                ) {
+                    *scroll_offset = point(
+                        (scroll_offset.x + delta.x).clamp(-scroll_max.x, Pixels::ZERO),
+                        (scroll_offset.y + delta.y).clamp(-scroll_max.y, Pixels::ZERO),
+                    );
+                    ongoing.touch.constrain(*scroll_offset);
+                    if ongoing.touch.is_animating() {
+                        window.request_animation_frame();
+                    }
+                }
+            }
             if let Some(animation) = self.page_scroll_animation.as_ref() {
                 let mut animation = animation.borrow_mut();
                 if let Some(active) = animation.as_mut() {
@@ -3330,6 +3415,11 @@ impl Interactivity {
             let current_view = window.current_view();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                    let touch = window.touch_scroll_event().is_some();
+                    let target_id = Rc::as_ptr(&scroll_offset) as usize;
+                    if touch && !window.can_handle_touch_scroll(target_id) {
+                        return;
+                    }
                     let mut scroll_offset = scroll_offset.borrow_mut();
                     let paging = matches!(event.delta, ScrollDelta::Pages(_));
                     if paging {
@@ -3344,7 +3434,7 @@ impl Interactivity {
                             .filter(|active| active.last_offset == old_scroll_offset)
                             .map(|active| active.target)
                     });
-                    let swipe = window.is_page_scroll_swipe();
+                    let swipe = !touch && window.is_page_scroll_swipe();
                     let page_origin = ongoing_scroll.as_ref().and_then(|ongoing| {
                         let mut ongoing = ongoing.borrow_mut();
                         if event.touch_phase == TouchPhase::Started {
@@ -3413,7 +3503,7 @@ impl Interactivity {
                     }
                     scroll_offset.y += delta_y;
                     scroll_offset.x += delta_x;
-                    if paging {
+                    if paging || touch {
                         scroll_offset.x = scroll_offset.x.clamp(-scroll_max.x, Pixels::ZERO);
                         scroll_offset.y = scroll_offset.y.clamp(-scroll_max.y, Pixels::ZERO);
                     }
@@ -3432,24 +3522,57 @@ impl Interactivity {
                         }
                     }
                     let target = *scroll_offset;
+                    let touch_owned = ongoing_scroll.as_ref().is_some_and(|ongoing| {
+                        let mut ongoing = ongoing.borrow_mut();
+                        if touch {
+                            ongoing.page_origin = None;
+                            ongoing.touch.observe(
+                                event.touch_phase,
+                                target - old_scroll_offset,
+                                target,
+                                window.scroll_interruption,
+                                window.scroll_gesture_tuning(cx),
+                                cx.reduce_motion() || !cx.platform.supports_scroll_momentum(),
+                            )
+                        } else {
+                            ongoing.touch.cancel();
+                            false
+                        }
+                    });
+                    if touch_owned {
+                        window.claim_touch_scroll(target_id);
+                    }
                     if paging
                         && !cx.reduce_motion()
                         && let Some(animation) = page_scroll_animation.as_ref()
                     {
                         if pending_target != Some(target) {
-                            *animation.borrow_mut() = (target != old_scroll_offset)
-                                .then(|| if page_origin.is_some() { PageScrollAnimation::touch(old_scroll_offset, target, hitbox.bounds.size) } else { PageScrollAnimation::new(old_scroll_offset, target) });
+                            *animation.borrow_mut() = (target != old_scroll_offset).then(|| {
+                                if page_origin.is_some() {
+                                    PageScrollAnimation::touch(
+                                        old_scroll_offset,
+                                        target,
+                                        hitbox.bounds.size,
+                                    )
+                                } else {
+                                    PageScrollAnimation::new(old_scroll_offset, target)
+                                }
+                            });
                         }
                         *scroll_offset = old_scroll_offset;
                     }
-                    if target != old_scroll_offset
+                    if touch_owned
+                        || target != old_scroll_offset
                         || (paging && pending_target.is_some_and(|pending| pending != target))
                     {
                         cx.notify(current_view);
                     }
                     // Keep an owned drag on the same surface, including a
                     // release which settles exactly where the preview ended.
-                    if page_origin.is_some() || ((paging || swipe) && target != old_scroll_offset) {
+                    if touch_owned
+                        || page_origin.is_some()
+                        || ((paging || swipe) && target != old_scroll_offset)
+                    {
                         cx.stop_propagation();
                     }
                 }
@@ -4413,7 +4536,55 @@ impl ScrollHandle {
     pub fn set_offset(&self, mut position: Point<Pixels>) {
         let state = self.0.borrow();
         *state.page_scroll_animation.borrow_mut() = None;
+        state.ongoing_scroll.borrow_mut().touch.cancel();
         *state.offset.borrow_mut() = position;
+    }
+
+    /// Scroll one axis from the current raw touch gesture, including fling
+    /// momentum. Custom scroll masks can use this before consuming the event.
+    /// Returns `None` for mouse wheels and trackpads, and otherwise whether
+    /// this handle owns the touch gesture.
+    pub fn scroll_by_touch(&self, axis: Axis, window: &mut Window, cx: &mut App) -> Option<bool> {
+        let event = window.touch_scroll_event()?.clone();
+        let state = self.0.borrow();
+        let target_id = Rc::as_ptr(&state.offset) as usize;
+        if !window.can_handle_touch_scroll(target_id) {
+            return Some(false);
+        }
+        let mut delta = event
+            .delta
+            .pixel_delta_for_viewport(window.line_height(), state.bounds.size);
+        if delta.x.abs() > delta.y.abs() {
+            delta.y = Pixels::ZERO;
+        } else {
+            delta.x = Pixels::ZERO;
+        }
+        match axis {
+            Axis::Horizontal => delta.y = Pixels::ZERO,
+            Axis::Vertical => delta.x = Pixels::ZERO,
+        }
+        *state.page_scroll_animation.borrow_mut() = None;
+        let mut offset = state.offset.borrow_mut();
+        let previous = *offset;
+        *offset = point(
+            (offset.x + delta.x).clamp(-state.max_offset.x, Pixels::ZERO),
+            (offset.y + delta.y).clamp(-state.max_offset.y, Pixels::ZERO),
+        );
+        let owned = state.ongoing_scroll.borrow_mut().touch.observe(
+            event.touch_phase,
+            *offset - previous,
+            *offset,
+            window.scroll_interruption,
+            window.scroll_gesture_tuning(cx),
+            cx.reduce_motion() || !cx.platform.supports_scroll_momentum(),
+        );
+        if owned {
+            window.claim_touch_scroll(target_id);
+        }
+        if owned || *offset != previous {
+            cx.notify(window.current_view());
+        }
+        Some(owned)
     }
 
     /// Pan by complete viewports with a 140 ms ease-in-out transition.
@@ -4424,6 +4595,7 @@ impl ScrollHandle {
             return false;
         }
         let state = self.0.borrow();
+        state.ongoing_scroll.borrow_mut().touch.cancel();
         let current = *state.offset.borrow();
         let mut animation = state.page_scroll_animation.borrow_mut();
         if animation

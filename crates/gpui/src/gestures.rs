@@ -26,6 +26,134 @@ pub struct OngoingScroll {
     last_event: Option<Instant>,
     axis: Option<Axis>,
     pub(crate) page_origin: Option<Point<Pixels>>,
+    pub(crate) touch: TouchScroll,
+}
+
+/// Per-surface touch velocity and inertia. Offsets use content coordinates,
+/// so scrolling down moves the offset in the negative direction.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TouchScroll {
+    last_sample: Option<Instant>,
+    last_motion: Option<Instant>,
+    velocity: Point<f32>,
+    last_offset: Point<Pixels>,
+    interruption: u64,
+    owned: bool,
+    momentum: bool,
+}
+
+impl TouchScroll {
+    pub(crate) fn cancel(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Returns whether this surface owns the gesture, including its release.
+    pub(crate) fn observe(
+        &mut self,
+        phase: TouchPhase,
+        delta: Point<Pixels>,
+        offset: Point<Pixels>,
+        interruption: u64,
+        tuning: GestureTuning,
+        reduce_motion: bool,
+    ) -> bool {
+        let now = Instant::now();
+        if phase == TouchPhase::Started {
+            *self = Self {
+                last_sample: Some(now),
+                interruption,
+                ..Self::default()
+            };
+        }
+        if self.interruption != interruption {
+            self.cancel();
+            return false;
+        }
+        let Some(last_sample) = self.last_sample else {
+            return false;
+        };
+        let owned = self.owned;
+        if phase == TouchPhase::Cancelled {
+            self.cancel();
+            return owned;
+        }
+        // The first delta includes movement through the platform's touch slop.
+        let seconds = if phase == TouchPhase::Started {
+            1.0 / 60.0
+        } else {
+            now.duration_since(last_sample).as_secs_f32().max(0.001)
+        };
+        if !delta.x.is_zero() || !delta.y.is_zero() {
+            let sample = delta.map(|value| (f32::from(value) / seconds).clamp(-12_000.0, 12_000.0));
+            let weight = if self.last_motion.is_none() || seconds > 0.08 {
+                1.0
+            } else {
+                1.0 - (-seconds / 0.04).exp()
+            };
+            self.velocity = self.velocity + (sample - self.velocity) * weight;
+            self.last_motion = Some(now);
+            self.owned = true;
+        }
+        self.last_sample = Some(now);
+        self.last_offset = offset;
+        if phase == TouchPhase::Ended {
+            self.momentum = self.owned
+                && !reduce_motion
+                && self
+                    .last_motion
+                    .is_some_and(|last| now.duration_since(last) <= Duration::from_millis(80))
+                && self.velocity.x.abs().max(self.velocity.y.abs()) >= tuning.min_fling_velocity;
+            self.owned = false;
+            if !self.momentum {
+                self.last_sample = None;
+            }
+        }
+        owned || self.owned || self.momentum
+    }
+
+    pub(crate) fn is_animating(&self) -> bool {
+        self.momentum
+    }
+
+    pub(crate) fn advance(
+        &mut self,
+        offset: Point<Pixels>,
+        interruption: u64,
+        tuning: GestureTuning,
+        reduce_motion: bool,
+    ) -> Option<Point<Pixels>> {
+        if !self.momentum {
+            return None;
+        }
+        if interruption != self.interruption || offset != self.last_offset || reduce_motion {
+            self.cancel();
+            return None;
+        }
+        let now = Instant::now();
+        let seconds = now.duration_since(self.last_sample?).as_secs_f32();
+        let rate = -tuning.momentum_decay_per_ms.clamp(0.001, 0.9999).ln() * 1000.0;
+        let decay = (-rate * seconds).exp();
+        let delta = self
+            .velocity
+            .map(|velocity| px(velocity * (1.0 - decay) / rate));
+        self.velocity = self.velocity * decay;
+        self.last_sample = Some(now);
+        self.last_offset = offset + delta;
+        self.momentum = self.velocity.x.abs().max(self.velocity.y.abs()) >= 10.0;
+        Some(delta)
+    }
+
+    /// Stop each axis as soon as it reaches an edge. Retain the other axis.
+    pub(crate) fn constrain(&mut self, offset: Point<Pixels>) {
+        if (offset.x - self.last_offset.x).abs() > px(0.01) {
+            self.velocity.x = 0.0;
+        }
+        if (offset.y - self.last_offset.y).abs() > px(0.01) {
+            self.velocity.y = 0.0;
+        }
+        self.last_offset = offset;
+        self.momentum &= self.velocity.x.abs().max(self.velocity.y.abs()) >= 10.0;
+    }
 }
 
 impl OngoingScroll {

@@ -4,6 +4,31 @@ use std::sync::{Arc, OnceLock};
 
 use schemars::{JsonSchema, json_schema};
 
+/// Whether an OpenType GSUB/GPOS table defines a feature tag. Platform text
+/// backends use this on borrowed table data, without copying the font or shaping.
+pub fn font_layout_table_has_feature(table: &[u8], tag: [u8; 4]) -> bool {
+    if table.get(..2) != Some(&[0, 1][..]) {
+        return false;
+    }
+    let Some(offset) = table.get(6..8) else {
+        return false;
+    };
+    let offset = usize::from(u16::from_be_bytes([offset[0], offset[1]]));
+    if offset == 0 {
+        return false;
+    }
+    let Some(features) = table.get(offset..) else {
+        return false;
+    };
+    let Some(count) = features.get(..2) else {
+        return false;
+    };
+    let count = usize::from(u16::from_be_bytes([count[0], count[1]]));
+    features
+        .get(2..2 + count * 6)
+        .is_some_and(|records| records.chunks_exact(6).any(|record| record[..4] == tag))
+}
+
 /// The OpenType features that can be configured for a given font.
 #[derive(Clone)]
 pub struct FontFeatures(Arc<FeatureSettings>);

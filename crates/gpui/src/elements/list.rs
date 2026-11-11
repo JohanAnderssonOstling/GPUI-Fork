@@ -11,7 +11,7 @@ use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
     Overflow, PageScrollAnimation, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style,
-    StyleRefinement, Styled, Window, point, px, size,
+    StyleRefinement, Styled, TouchScroll, Window, point, px, size,
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
@@ -42,6 +42,19 @@ pub struct List {
 }
 
 impl List {
+    // Reserve the occluded bottom area in both layout and scroll handling. Keep
+    // the origin fixed so clipping at the top never repositions list items.
+    fn keyboard_layout_bounds(bounds: Bounds<Pixels>, window: &Window) -> Bounds<Pixels> {
+        let visible = window.autoscroll_viewport(bounds);
+        if visible.size.height > Pixels::ZERO && visible.size.width > Pixels::ZERO {
+            Bounds::new(bounds.origin, size(bounds.size.width, visible.bottom() - bounds.top()))
+        } else {
+            // Still lay out a fully hidden list's focused item so an enclosing
+            // scroll surface can bring the list into view on the next pass.
+            bounds
+        }
+    }
+
     /// Set the sizing behavior for the list.
     pub fn with_sizing_behavior(mut self, behavior: ListSizingBehavior) -> Self {
         self.sizing_behavior = behavior;
@@ -65,6 +78,7 @@ struct StateInner {
     items: SumTree<ListItem>,
     logical_scroll_top: Option<ListOffset>,
     page_scroll_animation: Option<PageScrollAnimation>,
+    touch_scroll: TouchScroll,
     alignment: ListAlignment,
     overdraw: Pixels,
     reset: bool,
@@ -319,6 +333,7 @@ impl ListState {
             items: SumTree::default(),
             logical_scroll_top: None,
             page_scroll_animation: None,
+            touch_scroll: TouchScroll::default(),
             alignment,
             overdraw,
             scroll_handler: None,
@@ -776,6 +791,7 @@ impl ListState {
     /// as items in the overdraw get measured, and help offset scroll position changes accordingly.
     pub fn scrollbar_drag_started(&self) {
         let mut state = self.0.borrow_mut();
+        state.touch_scroll.cancel();
         state.scrollbar_drag_start_height = Some(state.items.summary().height);
     }
 
@@ -1303,7 +1319,16 @@ impl StateInner {
         window: &mut Window,
         cx: &mut App,
     ) -> Result<LayoutItemsResponse, ListOffset> {
-        window.transact(|window| {
+        let previous_autoscroll = window.take_autoscroll();
+        let viewport = window.autoscroll_viewport(bounds);
+        // Resolve the list's internal scroll even while it is offscreen; an
+        // enclosing surface can then reveal the already-adjusted caret.
+        let viewport = if viewport.size.width <= Pixels::ZERO || viewport.size.height <= Pixels::ZERO {
+            bounds
+        } else {
+            viewport
+        };
+        let result = window.transact(|window| {
             match self.measuring_behavior {
                 ListMeasuringBehavior::Measure(has_measured) if !has_measured => {
                     self.layout_all_items(bounds.size.width, render_item, window, cx);
@@ -1320,8 +1345,8 @@ impl StateInner {
                 cx,
             );
 
-            // Avoid honoring autoscroll requests from elements other than our children.
-            window.take_autoscroll();
+            // Preserve the descendant's final position for outer scroll surfaces.
+            let mut descendant_autoscroll = None;
 
             // Only paint the visible items, if there is actually any space for them (taking padding into account)
             if bounds.size.height > padding.top + padding.bottom {
@@ -1332,12 +1357,15 @@ impl StateInner {
                         item.element.prepaint_at(item_origin, window, cx);
                     });
 
-                    if let Some(autoscroll_bounds) = window.take_autoscroll()
+                    let request = window.take_autoscroll();
+                    if let Some(autoscroll_bounds) = request
                         && autoscroll
+                        && viewport.size.height > Pixels::ZERO
                     {
-                        if autoscroll_bounds.top() < bounds.top() {
+                        if autoscroll_bounds.top() < viewport.top() {
                             let mut item_ix = item.index;
-                            let mut offset_in_item = autoscroll_bounds.top() - item_origin.y;
+                            let mut offset_in_item = autoscroll_bounds.top() - item_origin.y
+                                - (viewport.top() - bounds.top());
 
                             // The requested top can sit above this item's own
                             // top. Walk into earlier items so the offset stays
@@ -1369,10 +1397,10 @@ impl StateInner {
                                 item_ix,
                                 offset_in_item,
                             });
-                        } else if autoscroll_bounds.bottom() > bounds.bottom() {
+                        } else if autoscroll_bounds.bottom() > viewport.bottom() {
                             let mut cursor = self.items.cursor::<Count>(());
                             cursor.seek(&Count(item.index), Bias::Right);
-                            let mut height = bounds.size.height - padding.top - padding.bottom;
+                            let mut height = viewport.bottom() - bounds.top() - padding.top - padding.bottom;
 
                             // Account for the height of the element down until the autoscroll bottom.
                             height -= autoscroll_bounds.bottom() - item_origin.y;
@@ -1402,20 +1430,29 @@ impl StateInner {
                         }
                     }
 
+                    descendant_autoscroll = request.or(descendant_autoscroll);
                     item_origin.y += item.size.height;
                 }
             } else {
                 layout_response.item_layouts.clear();
             }
 
+            if let Some(target) = descendant_autoscroll.or(previous_autoscroll) {
+                window.request_autoscroll(target);
+            }
             Ok(layout_response)
-        })
+        });
+        if result.is_err() && let Some(target) = previous_autoscroll {
+            window.request_autoscroll(target);
+        }
+        result
     }
 
     // Scrollbar support
 
     fn set_offset_from_scrollbar(&mut self, point: Point<Pixels>) {
         self.page_scroll_animation = None;
+        self.touch_scroll.cancel();
         let Some(bounds) = self.last_layout_bounds else {
             return;
         };
@@ -1579,6 +1616,7 @@ impl Element for List {
         window: &mut Window,
         cx: &mut App,
     ) -> ListPrepaintState {
+        let bounds = Self::keyboard_layout_bounds(bounds, window);
         let state = &mut *self.state.0.borrow_mut();
         state.reset = false;
 
@@ -1607,6 +1645,39 @@ impl Element for List {
         let padding = style
             .padding
             .to_pixels(bounds.size.into(), window.rem_size());
+        let scroll_top = state.logical_scroll_top();
+        let current = point(Pixels::ZERO, -state.scroll_top(&scroll_top));
+        if let Some(delta) = state.touch_scroll.advance(
+            current,
+            window.scroll_interruption,
+            window.scroll_gesture_tuning(cx),
+            cx.reduce_motion() || !cx.platform.supports_scroll_momentum(),
+        ) {
+            let moved = state.scroll_position(&scroll_top, bounds.size.height, delta);
+            let next_top = state.logical_scroll_top();
+            let offset = point(Pixels::ZERO, -state.scroll_top(&next_top));
+            state.touch_scroll.constrain(offset);
+            if state.touch_scroll.is_animating() {
+                window.request_animation_frame();
+            }
+            if moved && state.scroll_handler.is_some() {
+                let event = state.scroll_event(&next_top, bounds.size.height);
+                let list_state = Rc::downgrade(&self.state.0);
+                window.defer(cx, move |window, cx| {
+                    let Some(list_state) = list_state.upgrade() else {
+                        return;
+                    };
+                    let handler = list_state.borrow_mut().scroll_handler.take();
+                    if let Some(mut handler) = handler {
+                        handler(&event, window, cx);
+                        let mut state = list_state.borrow_mut();
+                        if state.scroll_handler.is_none() {
+                            state.scroll_handler = Some(handler);
+                        }
+                    }
+                });
+            }
+        }
         if let Some(mut animation) = state.page_scroll_animation.take() {
             let scroll_top = state.logical_scroll_top();
             let current = state.scroll_top(&scroll_top);
@@ -1646,7 +1717,7 @@ impl Element for List {
             }
         }
         let layout =
-            match state.prepaint_items(bounds, padding, true, &mut self.render_item, window, cx) {
+            match state.prepaint_items(bounds, padding, window.allow_autoscroll, &mut self.render_item, window, cx) {
                 Ok(layout) => layout,
                 Err(autoscroll_request) => {
                     state.logical_scroll_top = Some(autoscroll_request);
@@ -1672,6 +1743,7 @@ impl Element for List {
         cx: &mut App,
     ) {
         let current_view = window.current_view();
+        let bounds = Self::keyboard_layout_bounds(bounds, window);
 
         // Register the scroll listener before painting children so that, in
         // the bubble phase (which runs in reverse registration order),
@@ -1685,6 +1757,34 @@ impl Element for List {
         let mut accumulated_scroll_delta = ScrollDelta::default();
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
+                if window.touch_scroll_event().is_some() {
+                    let target_id = Rc::as_ptr(&list_state.0) as usize;
+                    if !window.can_handle_touch_scroll(target_id) {
+                        return;
+                    }
+                    let mut state = list_state.0.borrow_mut();
+                    state.page_scroll_animation = None;
+                    let logical_top = state.logical_scroll_top();
+                    let previous = point(Pixels::ZERO, -state.scroll_top(&logical_top));
+                    let delta = event.delta.pixel_delta_for_viewport(px(20.), bounds.size);
+                    state.scroll(&logical_top, height, delta, current_view, window, cx);
+                    let logical_top = state.logical_scroll_top();
+                    let offset = point(Pixels::ZERO, -state.scroll_top(&logical_top));
+                    let owned = state.touch_scroll.observe(
+                        event.touch_phase,
+                        offset - previous,
+                        offset,
+                        window.scroll_interruption,
+                        window.scroll_gesture_tuning(cx),
+                        cx.reduce_motion() || !cx.platform.supports_scroll_momentum(),
+                    );
+                    if owned {
+                        window.claim_touch_scroll(target_id);
+                        cx.notify(current_view);
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
                 accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
                 let pixel_delta = match accumulated_scroll_delta {
                     ScrollDelta::Pages(pages) if pages.y == 0.0 => {
@@ -1693,6 +1793,7 @@ impl Element for List {
                     _ => accumulated_scroll_delta.pixel_delta_for_viewport(px(20.), bounds.size),
                 };
                 let mut state = list_state.0.borrow_mut();
+                state.touch_scroll.cancel();
                 if matches!(event.delta, ScrollDelta::Pages(_))
                     && !cx.reduce_motion()
                     && !state.reset
