@@ -104,7 +104,7 @@ fn is_sleep_wake(event: ButtonEvent, cover_closed: &mut bool, suppress_release: 
 
 fn suspend_until_confirmed(mut suspend: impl FnMut() -> std::result::Result<(), String>, mut confirm: impl FnMut() -> Result<bool>) -> Result<()> {
     loop {
-        suspend().context("Kobo application suspend failed")?;
+        suspend().map_err(|error| anyhow!(error)).context("Kobo application suspend failed")?;
         if confirm()? { return Ok(()); }
         println!("Unconfirmed Kobo wake; suspending again with peripherals off");
     }
@@ -1648,7 +1648,7 @@ impl KoboPlatform {
             }
             if self.wait_for_sleep_input(state, self.options.power.settle_delay)? { return Ok(()); }
             if self.quit.get() { return Ok(()); }
-            suspend_until_confirmed(handler, || {
+            suspend_until_confirmed(|| handler().map_err(|error| error.to_string()), || {
                 state.next_power_check = Instant::now();
                 let confirmation = self.options.power.wake_confirmation_timeout;
                 Ok(confirmation.is_zero() || state.runtime.is_none() || self.wait_for_sleep_input(state, confirmation)?)
