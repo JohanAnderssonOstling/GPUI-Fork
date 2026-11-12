@@ -23,7 +23,7 @@ use cocoa::{
     },
 };
 use dispatch2::DispatchQueue;
-use gpui::{BackgroundExecutor, DevicePixels, Task};
+use gpui::{DevicePixels, Task};
 use gpui::{
     AnyWindowHandle, ApplicationDrag, BackgroundExecutor, Bounds, Capslock, CursorStyle,
     ExternalDragPayload, ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent,
