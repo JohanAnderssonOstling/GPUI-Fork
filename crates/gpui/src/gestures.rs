@@ -32,7 +32,7 @@ pub struct OngoingScroll {
 /// Per-surface touch velocity and inertia. Offsets use content coordinates,
 /// so scrolling down moves the offset in the negative direction.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct TouchScroll {
+pub struct TouchScroll {
     last_sample: Option<Instant>,
     last_motion: Option<Instant>,
     velocity: Point<f32>,
@@ -43,7 +43,17 @@ pub(crate) struct TouchScroll {
 }
 
 impl TouchScroll {
-    pub(crate) fn cancel(&mut self) {
+    /// Feed applied content movement from a custom scroll surface.
+    pub fn observe_surface(&mut self, phase: TouchPhase, delta: Point<Pixels>, offset: Point<Pixels>, window: &crate::Window, cx: &crate::App) -> bool {
+        self.observe(phase, delta, offset, window.scroll_interruption, window.scroll_gesture_tuning(cx), cx.reduce_motion() || !cx.platform.supports_scroll_momentum())
+    }
+
+    /// Advance custom-surface momentum using the platform's scroll settings.
+    pub fn advance_surface(&mut self, offset: Point<Pixels>, window: &crate::Window, cx: &crate::App) -> Option<Point<Pixels>> {
+        self.advance(offset, window.scroll_interruption, window.scroll_gesture_tuning(cx), cx.reduce_motion() || !cx.platform.supports_scroll_momentum())
+    }
+
+    pub fn cancel(&mut self) {
         *self = Self::default();
     }
 
@@ -111,7 +121,7 @@ impl TouchScroll {
         owned || self.owned || self.momentum
     }
 
-    pub(crate) fn is_animating(&self) -> bool {
+    pub fn is_animating(&self) -> bool {
         self.momentum
     }
 
@@ -144,7 +154,7 @@ impl TouchScroll {
     }
 
     /// Stop each axis as soon as it reaches an edge. Retain the other axis.
-    pub(crate) fn constrain(&mut self, offset: Point<Pixels>) {
+    pub fn constrain(&mut self, offset: Point<Pixels>) {
         if (offset.x - self.last_offset.x).abs() > px(0.01) {
             self.velocity.x = 0.0;
         }

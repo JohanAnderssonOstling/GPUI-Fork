@@ -2233,7 +2233,9 @@ impl Window {
     }
 
     /// Mark the window as dirty, scheduling it to be redrawn on the next frame.
+    #[track_caller]
     pub fn refresh(&mut self) {
+        crate::profiler::record_redraw_source("refresh", "window");
         if self.invalidator.not_drawing() {
             self.refreshing = true;
             self.invalidator.set_dirty(true);
@@ -2588,7 +2590,9 @@ impl Window {
     /// which automatically respects [`App::reduce_motion`]. When using this
     /// method directly for decorative motion, check [`App::reduce_motion`]
     /// and skip the frame request when it is set.
+    #[track_caller]
     pub fn request_animation_frame(&self) {
+        crate::profiler::record_redraw_source("animation", "window");
         let entity = self.current_view();
         self.on_next_frame(move |_, cx| cx.notify(entity));
     }

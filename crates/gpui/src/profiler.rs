@@ -1551,3 +1551,34 @@ mod tests {
         });
     }
 }
+
+#[track_caller]
+pub(crate) fn record_redraw_source(kind: &'static str, entity: &'static str) {
+    use std::cell::RefCell;
+    use std::panic::Location;
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("BOKHEIM_CPU_PROFILE").is_some()) { return; }
+    struct Counts {
+        since: Instant,
+        entries: HashMap<(&'static str, &'static str, &'static Location<'static>), u64>,
+    }
+    thread_local! {
+        static COUNTS: RefCell<Counts> = RefCell::new(Counts { since: Instant::now(), entries: HashMap::new() });
+    }
+    let caller = Location::caller();
+    COUNTS.with(|counts| {
+        let mut counts = counts.borrow_mut();
+        *counts.entries.entry((kind, entity, caller)).or_default() += 1;
+        if counts.since.elapsed() >= Duration::from_secs(10) {
+            let seconds = counts.since.elapsed().as_secs_f64();
+            let mut entries: Vec<_> = counts.entries.drain().collect();
+            entries.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+            for ((kind, entity, caller), count) in entries.into_iter().take(30) {
+                eprintln!("CPU_REDRAW window_s={seconds:.2} count={count} kind={kind} entity={entity} caller={caller}");
+            }
+            counts.since = Instant::now();
+        }
+    });
+}
