@@ -28,7 +28,7 @@ use wasm_bindgen::prelude::*;
 const gpuiDirectoryFiles = new Map();
 let gpuiDirectoryFileSequence = 0;
 
-function retainDirectoryFile(file) {
+export function retainDirectoryFile(file) {
     const token = `gpui-directory-${Date.now()}-${gpuiDirectoryFileSequence++}`;
     gpuiDirectoryFiles.set(token, { file, createdAt: Date.now() });
     return token;
@@ -168,6 +168,8 @@ extern "C" {
     fn read_browser_directory_file(token: &str, offset: f64, length: u32) -> js_sys::Promise;
     #[wasm_bindgen(js_name = gpuiTakeDirectoryFile)]
     fn take_browser_directory_file(token: &str) -> JsValue;
+    #[wasm_bindgen(js_name = retainDirectoryFile)]
+    fn retain_browser_directory_file(file: &web_sys::File) -> String;
     #[wasm_bindgen(js_name = gpuiReleaseDirectoryFile)]
     fn release_browser_directory_file(token: &str);
 }
@@ -915,6 +917,16 @@ struct SelectedBrowserToken(String);
 impl Drop for SelectedBrowserToken {
     fn drop(&mut self) {
         release_browser_directory_file(&self.0);
+    }
+}
+
+pub(crate) fn dropped_browser_file(file: web_sys::File) -> SelectedFile {
+    let name = file.name();
+    let size = file.size() as u64;
+    let token = retain_browser_directory_file(&file);
+    SelectedFile {
+        source: selected_browser_file(vec![name.clone()], token).with_size_bytes(Some(size)),
+        name,
     }
 }
 

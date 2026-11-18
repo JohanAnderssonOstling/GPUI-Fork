@@ -6033,6 +6033,23 @@ impl Window {
             // Translate dragging and dropping of external files from the operating system
             // to internal drag and drop events.
             PlatformInput::FileDrop(file_drop) => match file_drop {
+                #[cfg(target_arch = "wasm32")]
+                FileDropEvent::FilesEntered { position, files } => {
+                    self.mouse_position = position;
+                    cx.active_drag = Some(AnyDrag {
+                        window: self.handle.window_id(),
+                        value: Arc::new(files.clone()),
+                        view: cx.new(|_| files).into(),
+                        cursor_offset: position,
+                        cursor_style: None,
+                        external_payload_source: None,
+                    });
+                    PlatformInput::MouseMove(MouseMoveEvent {
+                        position,
+                        pressed_button: Some(MouseButton::Left),
+                        modifiers: Modifiers::default(),
+                    })
+                }
                 FileDropEvent::Entered { position, paths } => {
                     self.mouse_position = position;
                     let source_window = self.handle.window_id();

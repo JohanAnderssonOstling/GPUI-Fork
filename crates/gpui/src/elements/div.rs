@@ -646,10 +646,32 @@ impl Interactivity {
             self.drag_listener.is_none(),
             "calling on_drag more than once on the same element is not supported"
         );
+        let value = Arc::new(value);
         self.drag_listener = Some(DragListener {
-            value: Arc::new(value),
-            render: Box::new(move |value, offset, window, cx| {
-                constructor(value.downcast_ref().unwrap(), offset, window, cx).into()
+            value_type: TypeId::of::<T>(),
+            start: Box::new(move |offset, window, cx| {
+                let view = constructor(value.as_ref(), offset, window, cx).into();
+                Some((value.clone(), view))
+            }),
+            external_payload: None,
+        });
+    }
+
+    /// Resolves the payload and preview only when the drag begins.
+    /// Returning `None` declines the drag.
+    pub fn on_drag_with<T: 'static, W: 'static + Render>(
+        &mut self,
+        constructor: impl Fn(Point<Pixels>, &mut Window, &mut App) -> Option<(T, Entity<W>)> + 'static,
+    ) {
+        debug_assert!(
+            self.drag_listener.is_none(),
+            "only one drag handler is supported"
+        );
+        self.drag_listener = Some(DragListener {
+            value_type: TypeId::of::<T>(),
+            start: Box::new(move |offset, window, cx| {
+                let (value, view) = constructor(offset, window, cx)?;
+                Some((Arc::new(value), view.into()))
             }),
             external_payload: None,
         });
@@ -657,7 +679,7 @@ impl Interactivity {
 
     /// Registers a callback resolving a payload to offer the platform if a drag started by this
     /// element leaves the window. It is invoked at most once per drag gesture, when the pointer
-    /// exits the viewport. Must be called after [`Self::on_drag`], with the same dragged value
+    /// exits the viewport. Must follow [`Self::on_drag`] or [`Self::on_drag_with`], with the same dragged value
     /// type `T`.
     pub fn external_drag_payload<T>(
         &mut self,
@@ -671,7 +693,7 @@ impl Interactivity {
             return;
         };
         debug_assert!(
-            drag_listener.value.as_ref().type_id() == TypeId::of::<T>(),
+            drag_listener.value_type == TypeId::of::<T>(),
             "external_drag_payload must use the same dragged value type as on_drag"
         );
         debug_assert!(
@@ -1638,6 +1660,19 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Resolves the payload and preview when dragging starts; `None` declines it.
+    /// The fluent API equivalent to [`Interactivity::on_drag_with`].
+    fn on_drag_with<T: 'static, W: 'static + Render>(
+        mut self,
+        constructor: impl Fn(Point<Pixels>, &mut Window, &mut App) -> Option<(T, Entity<W>)> + 'static,
+    ) -> Self
+    where
+        Self: Sized,
+    {
+        self.interactivity().on_drag_with(constructor);
+        self
+    }
+
     /// Registers a callback resolving a payload to offer the platform if a drag started by this
     /// element leaves the window. It is invoked at most once per drag gesture, when the pointer
     /// exits the viewport. Must be called after [`Self::on_drag`], with the same dragged value
@@ -1728,8 +1763,10 @@ pub(crate) type PinchListener =
 pub(crate) type ClickListener = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
 pub(crate) struct DragListener {
-    value: Arc<dyn Any>,
-    render: Box<dyn Fn(&dyn Any, Point<Pixels>, &mut Window, &mut App) -> AnyView + 'static>,
+    value_type: TypeId,
+    start: Box<
+        dyn Fn(Point<Pixels>, &mut Window, &mut App) -> Option<(Arc<dyn Any>, AnyView)> + 'static,
+    >,
     external_payload: Option<ExternalDragPayloadResolver>,
 }
 
@@ -3066,15 +3103,14 @@ impl Interactivity {
                         {
                             *clicked_state.borrow_mut() = ElementClickedState::default();
                             let cursor_offset = event.position - hitbox.origin;
-                            let drag = (listener.render)(
-                                listener.value.as_ref(),
-                                cursor_offset,
-                                window,
-                                cx,
-                            );
+                            let Some((value, drag)) = (listener.start)(cursor_offset, window, cx)
+                            else {
+                                pending_mouse_down.take();
+                                return;
+                            };
                             let external_payload_source =
                                 listener.external_payload.map(|external_payload| {
-                                    let value = listener.value.clone();
+                                    let value = value.clone();
                                     Box::new(move |window: &mut Window, cx: &mut App| {
                                         external_payload(value.as_ref(), window, cx)
                                     })
@@ -3083,7 +3119,7 @@ impl Interactivity {
                             cx.active_drag = Some(AnyDrag {
                                 window: window.window_handle().window_id(),
                                 view: drag,
-                                value: listener.value,
+                                value,
                                 cursor_offset,
                                 cursor_style: drag_cursor_style,
                                 external_payload_source,
