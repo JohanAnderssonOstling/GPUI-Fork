@@ -7,6 +7,8 @@ use crate::{FrameUpdate, KoboRenderMode, PixelRect, RefreshMode, ScreenGeometry}
 mod native {
     use std::ffi::c_char;
 
+    pub const NEEDS_PACKED_ROWS: i32 = 1;
+
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
     pub struct State {
@@ -32,9 +34,10 @@ mod native {
         pub fn gpui_fbink_set_rotation(fd: i32, rotation: u8) -> i32;
         pub fn gpui_fbink_present_gray(
             fd: i32,
-            data: *mut u8,
+            data: *const u8,
             source_width: i32,
             source_height: i32,
+            source_stride: usize,
             length: usize,
             target_x: i32,
             target_y: i32,
@@ -263,31 +266,77 @@ impl FbInkPresenter {
     fn present_pixels(
         &mut self,
         image: &GrayImage,
-        damage: PixelRect,
+        mut damage: PixelRect,
         mode: RefreshMode,
     ) -> Result<()> {
+        if damage.width == 0
+            || damage.height == 0
+            || damage
+                .x
+                .checked_add(damage.width)
+                .is_none_or(|right| right > image.width())
+            || damage
+                .y
+                .checked_add(damage.height)
+                .is_none_or(|bottom| bottom > image.height())
+        {
+            bail!("FBInk damage rectangle is outside the source image");
+        }
+        if self.geometry.view_width < 2 || self.geometry.view_height < 2 {
+            bail!("FBInk requires a viewport of at least 2x2 pixels");
+        }
         let target = self
             .geometry
             .scale_damage(damage, image.width(), image.height());
-        let capacity = usize::try_from(damage.width.saturating_mul(damage.height))?;
-        self.scratch_pixels.clear();
-        self.scratch_pixels.reserve(capacity);
-        let source_width = usize::try_from(image.width())?;
+        let target = if target.width < 2 || target.height < 2 {
+            // FBInk rejects one-pixel refresh dimensions. Expand the source too,
+            // so the extra physical pixels receive current frame contents.
+            if target.width < 2 {
+                let minimum_width = u32::try_from(
+                    (2 * u64::from(image.width())).div_ceil(u64::from(self.geometry.view_width)),
+                )?;
+                damage.width = damage.width.max(minimum_width);
+                damage.x = damage.x.min(image.width() - damage.width);
+            }
+            if target.height < 2 {
+                let minimum_height = u32::try_from(
+                    (2 * u64::from(image.height())).div_ceil(u64::from(self.geometry.view_height)),
+                )?;
+                damage.height = damage.height.max(minimum_height);
+                damage.y = damage.y.min(image.height() - damage.height);
+            }
+            self.geometry
+                .scale_damage(damage, image.width(), image.height())
+        } else {
+            target
+        };
+        let source_stride = usize::try_from(image.width())?;
         let left = usize::try_from(damage.x)?;
         let width = usize::try_from(damage.width)?;
-        for y in damage.y..damage.y + damage.height {
-            let row_start = usize::try_from(y)?
-                .saturating_mul(source_width)
-                .saturating_add(left);
-            let row_end = row_start.saturating_add(width);
-            self.scratch_pixels
-                .extend_from_slice(&image.as_raw()[row_start..row_end]);
-        }
-        if matches!(mode, RefreshMode::FastMono | RefreshMode::TextMono | RefreshMode::FullMono | RefreshMode::CleanMono) {
-            for pixel in &mut self.scratch_pixels {
-                *pixel = monochrome_value(*pixel, self.monochrome_threshold);
+        let height = usize::try_from(damage.height)?;
+        let capacity = width
+            .checked_mul(height)
+            .context("FBInk damage size overflow")?;
+        let start = usize::try_from(damage.y)? * source_stride + left;
+        let end = start + (height - 1) * source_stride + width;
+        let source = image
+            .as_raw()
+            .get(start..end)
+            .context("FBInk source image is too short")?;
+        let is_monochrome = matches!(mode, RefreshMode::FastMono | RefreshMode::TextMono | RefreshMode::FullMono | RefreshMode::CleanMono);
+        let (pixels, stride) = if is_monochrome {
+            self.scratch_pixels.clear();
+            self.scratch_pixels.reserve(capacity);
+            let threshold = self.monochrome_threshold;
+            for row in source.chunks(source_stride) {
+                self.scratch_pixels.extend(
+                    row[..width].iter().map(|&pixel| monochrome_value(pixel, threshold)),
+                );
             }
-        }
+            (&self.scratch_pixels[..], width)
+        } else {
+            (source, source_stride)
+        };
         let mode_number = match mode {
             RefreshMode::FastMono => 0,
             RefreshMode::PartialGray => 1,
@@ -297,22 +346,38 @@ impl FbInkPresenter {
             RefreshMode::CleanMono => 5,
             RefreshMode::CleanGray => 6,
         };
-        let result = unsafe {
+        let source_width = i32::try_from(damage.width)?;
+        let source_height = i32::try_from(damage.height)?;
+        let target_x = i32::try_from(target.x)?;
+        let target_y = i32::try_from(target.y)?;
+        let target_width = i32::try_from(target.width)?;
+        let target_height = i32::try_from(target.height)?;
+        let present = |pixels: &[u8], stride| unsafe {
             native::gpui_fbink_present_gray(
                 self.fd,
-                self.scratch_pixels.as_mut_ptr(),
-                i32::try_from(damage.width)?,
-                i32::try_from(damage.height)?,
-                self.scratch_pixels.len(),
-                i32::try_from(target.x)?,
-                i32::try_from(target.y)?,
-                i32::try_from(target.width)?,
-                i32::try_from(target.height)?,
+                pixels.as_ptr(),
+                source_width,
+                source_height,
+                stride,
+                pixels.len(),
+                target_x,
+                target_y,
+                target_width,
+                target_height,
                 mode_number,
             )
         };
+        let mut result = present(pixels, stride);
+        if result == native::NEEDS_PACKED_ROWS {
+            self.scratch_pixels.clear();
+            self.scratch_pixels.reserve(capacity);
+            for row in source.chunks(source_stride) {
+                self.scratch_pixels.extend_from_slice(&row[..width]);
+            }
+            result = present(&self.scratch_pixels, width);
+        }
         if result < 0 {
-            bail!("fbink_print_raw_data failed with {result}");
+            bail!("FBInk presentation failed with {result}");
         }
         self.presentations = self.presentations.saturating_add(1);
         Ok(())
@@ -380,17 +445,17 @@ fn tiled_damage_regions(
         }
     }
 
-    let mut visited = vec![false; dirty.len()];
+    let mut stack = Vec::new();
     let mut regions = Vec::new();
     for row in 0..rows {
         for column in 0..columns {
             let index = (row * columns + column) as usize;
-            if !dirty[index] || visited[index] {
+            if !dirty[index] {
                 continue;
             }
 
-            let mut stack = vec![(column, row)];
-            visited[index] = true;
+            stack.push((column, row));
+            dirty[index] = false;
             let mut min_column = column;
             let mut max_column = column;
             let mut min_row = row;
@@ -412,8 +477,8 @@ fn tiled_damage_regions(
                 ];
                 for (neighbor_column, neighbor_row) in neighbors.into_iter().flatten() {
                     let neighbor_index = (neighbor_row * columns + neighbor_column) as usize;
-                    if dirty[neighbor_index] && !visited[neighbor_index] {
-                        visited[neighbor_index] = true;
+                    if dirty[neighbor_index] {
+                        dirty[neighbor_index] = false;
                         stack.push((neighbor_column, neighbor_row));
                     }
                 }

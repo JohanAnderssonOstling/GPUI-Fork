@@ -17,6 +17,7 @@ categories = ["gui"]
 workspace = true
 
 [features]
+infinite-canvas = []
 default = ["font-kit", "image-formats", "wayland", "x11", "windows-manifest"]
 test-support = [
     "leak-detection",

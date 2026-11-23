@@ -10,6 +10,12 @@
 //! [`PinchEvent`](crate::PinchEvent)s — so components written against
 //! `on_click` and scroll containers work untouched on mobile.
 
+mod swipe;
+mod touchpad;
+
+pub use swipe::{PageTurn, PageTurnFrame, SwipePreview};
+pub use touchpad::{PAGE_WHEEL_REPEAT_INTERVAL, TouchpadNavigation, page_wheel_ready};
+
 use std::time::Duration;
 use web_time::Instant;
 

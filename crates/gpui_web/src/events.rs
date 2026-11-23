@@ -1,11 +1,11 @@
-use std::rc::Rc;
+use std::{cell::Cell, rc::Rc};
 
 use gpui::{
-    Bounds, Capslock, ClipboardEntry, ClipboardItem, ClipboardString, DispatchEventResult, Image,
-    ImageFormat, KeyDownEvent, KeyLocation, KeyUpEvent, Keystroke, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
-    MouseUpEvent, NavigationDirection, Pixels, PlatformInput, Point, RequestFrameOptions,
-    ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId, TouchPhase, point, px,
+    Bounds, Capslock, ClipboardEntry, ClipboardItem, ClipboardString, DispatchEventResult,
+    ExternalFiles, FileDropEvent, Image, ImageFormat, KeyDownEvent, KeyLocation, KeyUpEvent,
+    Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent,
+    MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformInput, Point,
+    RequestFrameOptions, ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId, TouchPhase, point, px,
 };
 use wasm_bindgen::prelude::*;
 
@@ -124,6 +124,7 @@ impl ClickState {
 
 impl WebWindowInner {
     pub fn register_event_listeners(self: &Rc<Self>) -> WebEventListeners {
+        let file_drag = Rc::new(Cell::new(false));
         let mut handles = vec![
             self.register_pointer_down(),
             self.register_pointer_up(),
@@ -133,8 +134,9 @@ impl WebWindowInner {
             self.register_pointer_leave(),
             self.register_wheel(),
             self.register_context_menu(),
-            self.register_dragover(),
-            self.register_drop(),
+            self.register_dragover(file_drag.clone()),
+            self.register_drop(file_drag.clone()),
+            self.register_dragleave(file_drag),
             self.register_key_down(),
             self.register_key_up(),
             self.register_paste(),
@@ -571,23 +573,77 @@ impl WebWindowInner {
         })
     }
 
-    /// Browsers only expose dropped files as `File` objects, never as
-    /// filesystem paths, so no `FileDrop` input can be synthesized: GPUI's
-    /// `ExternalPaths` consumers would try to read paths that don't exist.
-    /// The events are still intercepted so the browser doesn't navigate to
-    /// the dropped file. Delivering actual file drops would require plumbing
-    /// `File` contents through a web-specific channel.
-    fn register_dragover(self: &Rc<Self>) -> EventListenerHandle {
+    fn register_dragover(
+        self: &Rc<Self>,
+        active: Rc<Cell<bool>>,
+    ) -> EventListenerHandle {
+        let this = self.clone();
         self.listen("dragover", move |event: JsValue| {
             let event: web_sys::DragEvent = event.unchecked_into();
             event.prevent_default();
+            let Some(data) = event.data_transfer() else {
+                return;
+            };
+            if !data
+                .types()
+                .iter()
+                .any(|kind| kind.as_string().as_deref() == Some("Files"))
+            {
+                return;
+            }
+            data.set_drop_effect("copy");
+            let position = mouse_position_in_element(event.unchecked_ref());
+            let input = if active.replace(true) {
+                FileDropEvent::Pending { position }
+            } else {
+                // File contents are protected until the browser's drop event.
+                FileDropEvent::FilesEntered {
+                    position,
+                    files: ExternalFiles::default(),
+                }
+            };
+            this.dispatch_input(PlatformInput::FileDrop(input));
         })
     }
 
-    fn register_drop(self: &Rc<Self>) -> EventListenerHandle {
+    fn register_dragleave(
+        self: &Rc<Self>,
+        active: Rc<Cell<bool>>,
+    ) -> EventListenerHandle {
+        let this = self.clone();
+        self.listen("dragleave", move |_| {
+            if active.replace(false) {
+                this.dispatch_input(PlatformInput::FileDrop(FileDropEvent::Exited));
+            }
+        })
+    }
+
+    fn register_drop(self: &Rc<Self>, active: Rc<Cell<bool>>) -> EventListenerHandle {
+        let this = self.clone();
         self.listen("drop", move |event: JsValue| {
             let event: web_sys::DragEvent = event.unchecked_into();
             event.prevent_default();
+            let files = event.data_transfer().and_then(|data| data.files());
+            let files = files
+                .map(|files| {
+                    (0..files.length())
+                        .filter_map(|index| files.get(index))
+                        .map(crate::platform::dropped_browser_file)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !files.is_empty() {
+                let position = mouse_position_in_element(event.unchecked_ref());
+                this.dispatch_input(PlatformInput::FileDrop(FileDropEvent::FilesEntered {
+                    position,
+                    files: ExternalFiles::new(files),
+                }));
+                this.dispatch_input(PlatformInput::FileDrop(FileDropEvent::Submit { position }));
+                this.dispatch_input(PlatformInput::FileDrop(FileDropEvent::Exited));
+            } else if active.get() {
+                this.dispatch_input(PlatformInput::FileDrop(FileDropEvent::Exited));
+            }
+            active.set(false);
         })
     }
 

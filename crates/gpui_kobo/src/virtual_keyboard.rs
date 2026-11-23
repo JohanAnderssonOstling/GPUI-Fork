@@ -1,6 +1,6 @@
 use gpui::{
     App, Context, Div, ElementId, Entity, FontWeight, Global, IntoElement, Keystroke, MouseButton,
-    Pixels, Render, SharedString, Stateful, Window, div, prelude::*, px, rems, rgb,
+    Pixels, Render, SharedString, Stateful, Window, deferred, div, prelude::*, px, rems, rgb,
 };
 
 /// Letter rows for a language where every letter has its own key. Columns
@@ -93,13 +93,14 @@ const ACTION_FILL: u32 = 0xbdbdbd;
 
 /// Root-level Kobo view that adds a virtual keyboard below the application
 /// without changing its individual text-input components. The content
-/// shrinks above the keyboard so the focused field stays visible.
+/// normally shrinks above the keyboard so the focused field stays visible.
 pub struct KoboKeyboardRoot<V: Render + 'static> {
     content: Entity<V>,
     font_family: fn(&App) -> SharedString,
     shifted: bool,
     symbols: bool,
     choosing_layout: bool,
+    overlay_keyboard_when: fn(&Window, &App) -> bool,
 }
 
 impl<V: Render + 'static> KoboKeyboardRoot<V> {
@@ -112,7 +113,14 @@ impl<V: Render + 'static> KoboKeyboardRoot<V> {
             shifted: false,
             symbols: false,
             choosing_layout: false,
+            overlay_keyboard_when: |_, _| false,
         }
+    }
+
+    /// Preserve the underlying page layout while an overlay owns text input.
+    pub fn overlay_keyboard_when(mut self, predicate: fn(&Window, &App) -> bool) -> Self {
+        self.overlay_keyboard_when = predicate;
+        self
     }
 
     fn dispatch_key(key: &str, window: &mut Window, cx: &mut App) {
@@ -269,11 +277,12 @@ impl<V: Render + 'static> KoboKeyboardRoot<V> {
         keyboard
     }
 
-    fn keyboard(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn keyboard(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let layout = current_layout(cx);
         // Heights here must stay in step with `keyboard_height`.
         let keyboard = div()
             .id("kobo-virtual-keyboard")
+            .occlude()
             .flex_shrink_0()
             .w_full()
             .pt(px(PADDING_TOP))
@@ -336,6 +345,7 @@ impl<V: Render + 'static> Render for KoboKeyboardRoot<V> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let input_active = window.is_text_input_active();
         let viewport = window.viewport_size();
+        let overlay_keyboard = input_active && (self.overlay_keyboard_when)(window, cx);
         window.set_input_viewport(input_active.then(|| {
             gpui::Bounds::new(
                 gpui::Point::default(),
@@ -360,8 +370,16 @@ impl<V: Render + 'static> Render for KoboKeyboardRoot<V> {
                     .flex_1()
                     .min_h_0()
                     .w_full()
+                    .when(overlay_keyboard, |content| content.flex_none().h(viewport.height))
                     .child(self.content.clone()),
             )
-            .children(input_active.then(|| self.keyboard(cx)))
+            // Paint and hit-test above deferred overlays even when the keyboard
+            // stays in normal layout to reveal a field in the application.
+            .children(input_active.then(|| {
+                let keyboard = self.keyboard(cx).when(overlay_keyboard, |keyboard| {
+                    keyboard.absolute().bottom_0().left_0()
+                });
+                deferred(keyboard).with_priority(usize::MAX)
+            }))
     }
 }

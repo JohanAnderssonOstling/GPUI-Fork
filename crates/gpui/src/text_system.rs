@@ -1,3 +1,4 @@
+mod font_discovery;
 mod font_fallbacks;
 mod font_features;
 mod font_registrations;
@@ -5,6 +6,7 @@ mod line;
 mod line_layout;
 mod line_wrapper;
 
+pub use font_discovery::*;
 pub use font_fallbacks::*;
 pub use font_features::*;
 use font_registrations::FontRegistrations;
@@ -88,6 +90,15 @@ impl TextSystem {
                 font("Arial"), // macOS, Windows
             ],
         }
+    }
+
+    /// Return actual available font families without synthetic fallback aliases.
+    /// This may discover operating-system fonts when the backend loads them lazily.
+    pub fn font_family_names(&self) -> Vec<String> {
+        let mut names = self.platform_text_system.all_font_names();
+        names.sort_unstable();
+        names.dedup();
+        names
     }
 
     /// Get a list of all available font names from the operating system.

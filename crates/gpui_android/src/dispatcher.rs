@@ -5,7 +5,7 @@ use gpui::{
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::mem::MaybeUninit;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,7 @@ pub(crate) struct AndroidDispatcher {
     main_sender: PriorityQueueSender<RunnableVariant>,
     waker: AndroidAppWaker,
     background_sender: parking_lot::Mutex<Option<PriorityQueueSender<RunnableVariant>>>,
+    cancellation_sender: mpsc::Sender<RunnableVariant>,
     timers: Arc<TimerQueue>,
     main_thread_id: thread::ThreadId,
     _background_threads: Vec<thread::JoinHandle<()>>,
@@ -56,10 +57,21 @@ impl AndroidDispatcher {
             .unwrap();
         background_threads.push(timer_thread);
 
+        let (cancellation_sender, cancellation_receiver) = mpsc::channel::<RunnableVariant>();
+        match thread::Builder::new().name("Task cleanup".to_owned()).spawn(move || {
+            for runnable in cancellation_receiver {
+                drop(runnable);
+            }
+        }) {
+            Ok(thread) => background_threads.push(thread),
+            Err(error) => log::error!("Could not start Android task cleanup: {error}"),
+        }
+
         Self {
             main_sender,
             waker,
             background_sender: parking_lot::Mutex::new(Some(background_sender)),
+            cancellation_sender,
             timers,
             main_thread_id: thread::current().id(),
             _background_threads: background_threads,
@@ -98,7 +110,14 @@ impl PlatformDispatcher for AndroidDispatcher {
                 None => Some(runnable),
             }
         };
-        drop(rejected);
+        if let Some(runnable) = rejected {
+            // Scheduling can run inside an event-listener wake while its lock
+            // is held. Cancelling here could re-enter that lock through Drop.
+            if let Err(error) = self.cancellation_sender.send(runnable) {
+                log::error!("Android task cleanup disconnected; retaining cancelled task");
+                std::mem::forget(error.0);
+            }
+        }
     }
 
     fn dispatch_on_main_thread(&self, runnable: RunnableVariant, priority: Priority) {

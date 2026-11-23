@@ -11,6 +11,8 @@ mod display;
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 mod events;
 mod frame;
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+mod fonts;
 #[cfg(target_os = "android")]
 mod keyboard;
 mod lifecycle;
@@ -21,6 +23,8 @@ mod window;
 
 #[cfg(target_os = "android")]
 pub use android_activity::AndroidApp;
+#[cfg(target_os = "android")]
+pub use fonts::load_system_fonts;
 #[cfg(target_os = "android")]
 pub use wgpu;
 #[cfg(target_os = "android")]

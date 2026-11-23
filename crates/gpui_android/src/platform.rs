@@ -751,6 +751,11 @@ impl Platform for AndroidPlatform {
                     PollEvent::Main(main_event) => self.handle_main_event(main_event),
                     _ => {}
                 }
+                // Let Android finish destroying the Activity before running
+                // queued work that can call back into its Java window.
+                if self.quit_requested.get() {
+                    return;
+                }
                 self.drain_main_runnables();
                 self.drain_volume_buttons();
                 self.drain_reader_chrome_reveals();

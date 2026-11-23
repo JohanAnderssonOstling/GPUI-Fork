@@ -17,7 +17,7 @@ use futures::channel::oneshot;
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, ClipboardItem, CursorStyle,
     DevicePixels, DispatchEventResult, DisplayId, DummyKeyboardMapper, FileDialogFilter,
-    ForegroundExecutor, GpuSpecs, KeyDownEvent, KeyLocation, Keymap, Keystroke, Menu, MenuItem,
+    ForegroundExecutor, GpuSpecs, KeyDownEvent, KeyLocation, Keymap, Keystroke, LongPressEvent, Menu, MenuItem,
     Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, PathPromptOptions, Pixels, Platform,
     PlatformAtlas, PlatformDispatcher, PlatformDisplay, PlatformInput, PlatformInputHandler,
     PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, Point,
@@ -26,6 +26,7 @@ use gpui::{
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams, point, px, size,
 };
 use gpui_wgpu::CosmicTextSystem;
+use crate::input::LONG_PRESS_DELAY;
 use crate::refresh::requires_grayscale;
 use image::{GrayImage, Luma};
 use parking_lot::{Condvar, Mutex};
@@ -43,6 +44,7 @@ thread_local! {
 }
 
 const RESOURCE_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+const AUTO_ROTATION_SETTLE_DELAY: Duration = Duration::from_millis(400);
 
 #[derive(Clone, Copy)]
 struct ProcessMemorySample {
@@ -444,7 +446,8 @@ pub enum KoboPowerMessage {
 /// Input behavior for Kobo's physical page-turn buttons.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PageButtonBehavior {
-    /// Scroll by one receiving viewport, independently of keyboard focus.
+    /// Offer pageup/pagedown to the focused control, then scroll one viewport
+    /// if it does not handle the key.
     Scroll,
     /// Emit left/right keystrokes, reusing the desktop reader's existing key bindings.
     ///
@@ -888,7 +891,7 @@ impl KoboWindow {
         };
         let result = callback(input);
         self.0.input.set(Some(callback));
-        !result.propagate
+        !result.propagate || result.default_prevented
     }
 
     fn take_update(&self) -> Option<FrameUpdate> {
@@ -1122,10 +1125,14 @@ impl PlatformWindow for KoboWindow {
 #[derive(Clone, Copy, Default)]
 struct TouchAccumulator {
     origin: Point<Pixels>,
-    last_y: Option<f32>,
+    last_position: Option<Point<Pixels>>,
     scroll_y: f32,
     exit_candidate: bool,
+    long_press_deadline: Option<Instant>,
+    claimed: bool,
 }
+
+const TOUCH_SLOP: f32 = 12.0;
 
 const EXIT_BUTTON_WIDTH: f32 = 116.0;
 const EXIT_BUTTON_HEIGHT: f32 = 48.0;
@@ -1290,6 +1297,7 @@ pub struct KoboPlatform {
     clipboard: Mutex<Option<ClipboardItem>>,
     run_state: Cell<Option<KoboRunState>>,
     auto_rotate: Cell<bool>,
+    pending_auto_rotation: Cell<Option<(u8, Instant)>>,
     display_geometry_refresh_requested: Cell<bool>,
     queued_events: Cell<VecDeque<RuntimeEvent>>,
     quit_callback: Cell<Option<Box<dyn FnMut()>>>,
@@ -1334,6 +1342,7 @@ impl KoboPlatform {
     }
 
     fn set_auto_rotation(&self, auto_rotate: bool) {
+        self.pending_auto_rotation.set(None);
         self.auto_rotate.set(auto_rotate);
         if auto_rotate {
             self.display_geometry_refresh_requested.set(true);
@@ -1400,6 +1409,7 @@ impl KoboPlatform {
             options,
             logical_size: Cell::new(logical_size),
             auto_rotate: Cell::new(options.auto_rotate),
+            pending_auto_rotation: Cell::new(None),
             dispatcher,
             background_executor,
             foreground_executor,
@@ -1509,6 +1519,7 @@ impl KoboPlatform {
     }
 
     fn apply_experience_mode(&self, state: &mut KoboRunState, experience_mode: KoboExperienceMode) {
+        self.cancel_touch(state);
         let started = Instant::now();
         let previous = self.experience_mode.replace(experience_mode);
         let scale_factor = experience_mode.scale_factor(self.native_scale_factor);
@@ -1532,7 +1543,6 @@ impl KoboPlatform {
         for window in windows {
             KoboWindow(window).reconfigure_scale_factor(scale_factor);
         }
-        state.touch = TouchAccumulator::default();
         self.full_gc16_requested.set(true);
         println!(
             "KOBO_EXPERIENCE transition={previous:?}->{experience_mode:?} logical={}x{} framebuffer={}x{} scale={} render={render_mode:?} reset_windows=true elapsed_ms={}",
@@ -1612,10 +1622,12 @@ impl KoboPlatform {
     }
 
     fn suspend_session(&self, state: &mut KoboRunState) -> Result<()> {
+        self.pending_auto_rotation.set(None);
         let handler = self
             .options
             .power_button_handler
             .ok_or_else(|| anyhow!("Kobo application did not install a power-button handler"))?;
+        self.cancel_touch(state);
         let mut frame = self
             .last_frame()
             .ok_or_else(|| anyhow!("Kobo sleep requested before the first frame"))?;
@@ -1737,13 +1749,17 @@ impl KoboPlatform {
     }
 
     fn apply_display_geometry(&self, state: &mut KoboRunState, geometry: &crate::ScreenGeometry) {
+        let logical_size = inferred_logical_size(geometry, self.native_scale_factor);
+        self.cancel_touch(state);
         let Some(runtime) = state.runtime.as_mut() else {
             return;
         };
         runtime.update_geometry(geometry);
 
-        let logical_size = inferred_logical_size(geometry, self.native_scale_factor);
         self.full_repaint_requested.set(true);
+        // A half-turn keeps the same image and dimensions, so damage tracking
+        // cannot detect that the physical display needs to be repainted.
+        self.full_gc16_requested.set(true);
         if logical_size != self.logical_size() {
             let (canvas_width, canvas_height) =
                 canvas_dimensions(logical_size, self.scale_factor.get());
@@ -1972,21 +1988,34 @@ impl KoboPlatform {
         let dispatch_started = Instant::now();
         let logical_size = self.logical_size();
         let position = point(logical_size.width / 2.0, logical_size.height / 2.0);
-        window.dispatch_input(
-            PlatformInput::ScrollWheel(ScrollWheelEvent {
-                position,
-                // The receiving surface resolves this against its own viewport.
-                delta: ScrollDelta::Pages(point(0.0, page_delta_y)),
-                touch_phase: gpui::TouchPhase::Ended,
-                ..Default::default()
+        let key = if page_delta_y > 0.0 { "pageup" } else { "pagedown" };
+        let key_handled = window.dispatch_input(
+            PlatformInput::KeyDown(KeyDownEvent {
+                keystroke: Keystroke::parse(key)
+                    .map_err(|error| anyhow!("invalid Kobo page key {key}: {error}"))?,
+                key_location: KeyLocation::Standard,
+                is_held: false,
+                prefer_character_input: false,
             }),
             position,
         );
+        if !key_handled {
+            window.dispatch_input(
+                PlatformInput::ScrollWheel(ScrollWheelEvent {
+                    position,
+                    // The receiving surface resolves this against its own viewport.
+                    delta: ScrollDelta::Pages(point(0.0, page_delta_y)),
+                    touch_phase: gpui::TouchPhase::Ended,
+                    ..Default::default()
+                }),
+                position,
+            );
+        }
         let dispatch_ms = dispatch_started.elapsed().as_millis();
         let frame_started = Instant::now();
         let result = self.request_and_present(state, true, false);
         println!(
-            "GPUI scroll timing: pages={page_delta_y:.2} dispatch_ms={dispatch_ms} frame_ms={} total_ms={}",
+            "GPUI scroll timing: pages={page_delta_y:.2} dispatch_ms={dispatch_ms} frame_ms={} total_ms={} key_handled={key_handled}",
             frame_started.elapsed().as_millis(),
             dispatch_started.elapsed().as_millis()
         );
@@ -2035,49 +2064,67 @@ impl KoboPlatform {
             px(mapped.x / self.scale_factor.get()),
             px(mapped.y / self.scale_factor.get()),
         );
-        let logical_y = mapped.y / self.scale_factor.get();
         match mapped.phase {
             TouchPhase::Down => {
+                self.cancel_touch(state);
                 state.touch = TouchAccumulator {
                     origin: position,
-                    last_y: Some(logical_y),
+                    last_position: Some(position),
                     scroll_y: 0.0,
                     exit_candidate: self.exit_button_hit(mapped.x, mapped.y),
+                    long_press_deadline: Some(Instant::now() + LONG_PRESS_DELAY),
+                    claimed: false,
                 };
-                return Ok(());
             }
-            TouchPhase::Move => {
-                if let Some(last_y) = state.touch.last_y {
-                    state.touch.scroll_y += logical_y - last_y;
-                }
-                state.touch.last_y = Some(logical_y);
+            TouchPhase::Move | TouchPhase::Up | TouchPhase::Cancel => {
+                let Some(last_position) = state.touch.last_position else { return Ok(()) };
+                state.touch.scroll_y += f32::from(position.y - last_position.y);
+                state.touch.last_position = Some(position);
                 state.touch.exit_candidate &= self.exit_button_hit(mapped.x, mapped.y);
-                return Ok(());
+                if f32::from(position.x - state.touch.origin.x)
+                    .hypot(f32::from(position.y - state.touch.origin.y)) >= TOUCH_SLOP
+                {
+                    state.touch.long_press_deadline = None;
+                }
             }
-            TouchPhase::Cancel => {
-                state.touch = TouchAccumulator::default();
-                return Ok(());
-            }
-            TouchPhase::Up => {}
         }
 
-        let mut touch = state.touch;
-        if let Some(last_y) = touch.last_y {
-            touch.scroll_y += logical_y - last_y;
-        }
-        let scroll_y = touch.scroll_y;
-        let exit_requested = touch.exit_candidate && self.exit_button_hit(mapped.x, mapped.y);
-        state.touch = TouchAccumulator::default();
-        if exit_requested && !matches!(gesture, Some(Gesture::Swipe { .. })) {
-            self.request_quit();
-            return self.present_return_screen(state);
-        }
         let Some(window) = self.window() else {
+            state.touch = TouchAccumulator::default();
             return Ok(());
         };
         let dispatched_window_id = window.handle().window_id();
-        let scrolling = matches!(gesture, Some(Gesture::Swipe { .. }))
-            || gesture.is_none() && scroll_y.abs() >= 12.0;
+        state.touch.claimed |= window.dispatch_input(
+            PlatformInput::Touch(TouchEvent {
+                id: TouchId(0),
+                phase: match mapped.phase {
+                    TouchPhase::Down => gpui::TouchPhase::Started,
+                    TouchPhase::Move => gpui::TouchPhase::Moved,
+                    TouchPhase::Up => gpui::TouchPhase::Ended,
+                    TouchPhase::Cancel => gpui::TouchPhase::Cancelled,
+                },
+                position,
+                force: None,
+            }),
+            position,
+        );
+        if state.touch.claimed {
+            state.touch.long_press_deadline = None;
+        }
+        let released = matches!(mapped.phase, TouchPhase::Up | TouchPhase::Cancel);
+        let touch = if released {
+            std::mem::take(&mut state.touch)
+        } else {
+            state.touch
+        };
+        let synthesize_gesture = mapped.phase == TouchPhase::Up && !touch.claimed;
+        if synthesize_gesture && touch.exit_candidate && !matches!(gesture, Some(Gesture::Swipe { .. })) {
+            self.request_quit();
+            return self.present_return_screen(state);
+        }
+        let scrolling = synthesize_gesture
+            && (matches!(gesture, Some(Gesture::Swipe { .. }))
+                || gesture.is_none() && touch.scroll_y.abs() >= TOUCH_SLOP);
         if scrolling {
             window.dispatch_input(
                 PlatformInput::ScrollWheel(ScrollWheelEvent {
@@ -2086,14 +2133,14 @@ impl KoboPlatform {
                         Some(Gesture::Swipe { dx, dy }) if dx.abs() > dy.abs() => {
                             point(dx.signum(), 0.0)
                         }
-                        _ => point(0.0, scroll_y.signum()),
+                        _ => point(0.0, touch.scroll_y.signum()),
                     }),
                     touch_phase: gpui::TouchPhase::Ended,
                     ..Default::default()
                 }),
                 touch.origin,
             );
-        } else {
+        } else if synthesize_gesture {
             let button = if matches!(gesture, Some(Gesture::LongPress { .. })) {
                 MouseButton::Right
             } else {
@@ -2123,15 +2170,7 @@ impl KoboPlatform {
                 dispatch_started.elapsed().as_millis(),
             );
         }
-        window.dispatch_input(
-            PlatformInput::Touch(TouchEvent {
-                id: TouchId(0),
-                phase: gpui::TouchPhase::Ended,
-                position,
-                force: None,
-            }),
-            position,
-        );
+        let frame_requested = window.0.frame_requested.get();
         // A mouse callback can remove its own GPUI window. Release the platform
         // window before resolving the next active window so a previous logical
         // window (for example, the library behind a reader) can be promoted.
@@ -2141,7 +2180,12 @@ impl KoboPlatform {
             .window()
             .is_some_and(|window| window.handle().window_id() != dispatched_window_id);
         if active_window_changed {
+            state.touch = TouchAccumulator::default();
             println!("Kobo logical window changed; forcing promoted window frame");
+        }
+
+        if !released && !touch.claimed && !frame_requested && !active_window_changed {
+            return Ok(());
         }
 
         if active_window_changed && self.full_repaint_requested.get() {
@@ -2154,6 +2198,37 @@ impl KoboPlatform {
         } else {
             self.request_and_present(state, scrolling, active_window_changed)
         }
+    }
+
+    fn cancel_touch(&self, state: &mut KoboRunState) {
+        let touch = std::mem::take(&mut state.touch);
+        let Some(position) = touch.last_position else { return };
+        if let Some(window) = self.window() {
+            window.dispatch_input(
+                PlatformInput::Touch(TouchEvent {
+                    id: TouchId(0),
+                    phase: gpui::TouchPhase::Cancelled,
+                    position,
+                    force: None,
+                }),
+                position,
+            );
+        }
+    }
+
+    fn dispatch_long_press(&self, state: &mut KoboRunState) {
+        if !state.touch.long_press_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return;
+        }
+        state.touch.long_press_deadline = None;
+        let Some(window) = self.window() else { return };
+        let position = state.touch.origin;
+        let handled = window.dispatch_input(
+            PlatformInput::LongPress(LongPressEvent { id: TouchId(0), position }),
+            position,
+        );
+        state.touch.claimed |= handled;
+        println!("GPUI long-press dispatch: position={position:?} handled={handled}");
     }
 
     fn dispatch_button(&self, state: &mut KoboRunState, event: ButtonEvent) -> Result<()> {
@@ -2251,6 +2326,48 @@ impl KoboPlatform {
         rotation: u8,
         from_gyro: bool,
     ) -> Result<()> {
+        if !from_gyro {
+            self.pending_auto_rotation.set(None);
+            return self.apply_rotation(state, rotation, false);
+        }
+        if !self.auto_rotate.get() {
+            return Ok(());
+        }
+        let Some(presenter) = state.presenter.as_ref() else {
+            return Ok(());
+        };
+        let rotation = rotation % 4;
+        if rotation == presenter.geometry().current_rotation {
+            self.pending_auto_rotation.set(None);
+        } else if !self
+            .pending_auto_rotation
+            .get()
+            .is_some_and(|(pending, _)| pending == rotation)
+        {
+            // Repeated reports of the candidate do not restart its deadline.
+            // A conflicting orientation starts a new settling period.
+            self.pending_auto_rotation
+                .set(Some((rotation, Instant::now() + AUTO_ROTATION_SETTLE_DELAY)));
+        }
+        Ok(())
+    }
+
+    fn apply_pending_rotation(&self, state: &mut KoboRunState) -> Result<()> {
+        if let Some((rotation, deadline)) = self.pending_auto_rotation.get()
+            && Instant::now() >= deadline
+        {
+            self.pending_auto_rotation.set(None);
+            self.apply_rotation(state, rotation, true)?;
+        }
+        Ok(())
+    }
+
+    fn apply_rotation(
+        &self,
+        state: &mut KoboRunState,
+        rotation: u8,
+        from_gyro: bool,
+    ) -> Result<()> {
         // Manual rotation remains available while the lock is enabled, but
         // gyro-driven geometry changes must be ignored when auto-rotation is
         // disabled.
@@ -2267,18 +2384,18 @@ impl KoboPlatform {
             } else {
                 rotation % 4
             };
-            if presenter.geometry().current_rotation != next_rotation {
-                println!(
-                    "Kobo rotation change: {} -> {} (from_gyro={})",
-                    native_rotation,
-                    next_rotation,
-                    from_gyro,
-                );
+            if native_rotation == next_rotation {
+                return Ok(());
             }
+            println!(
+                "Kobo rotation change: {} -> {} (from_gyro={})",
+                native_rotation,
+                next_rotation,
+                from_gyro,
+            );
             presenter.set_current_rotation(next_rotation)?;
             presenter.geometry().clone()
         };
-        self.full_gc16_requested.set(false);
         self.apply_display_geometry(state, &geometry);
         Ok(())
     }
@@ -2386,6 +2503,7 @@ impl KoboPlatform {
                 if self.quit.get() { break; }
             }
             self.dispatcher.run_pending();
+            self.dispatch_long_press(state);
             if self.display_geometry_refresh_requested.replace(false) && self.auto_rotate.get() {
                 let geometry = state
                     .presenter
@@ -2414,6 +2532,8 @@ impl KoboPlatform {
                 idle_deadline,
                 power_off_deadline,
                 state.scheduler.idle_cleanup_deadline(),
+                state.touch.long_press_deadline,
+                self.pending_auto_rotation.get().map(|(_, deadline)| deadline),
                 state.resource_monitor.enabled.then_some(state.resource_monitor.next_sample_at),
             ].into_iter().flatten() {
                 next_check = next_check.min(candidate);
@@ -2425,6 +2545,7 @@ impl KoboPlatform {
                 .ok_or_else(|| anyhow!("interactive Kobo platform has no input runtime"))?;
             let event = runtime.wait_for_event(remaining, self.dispatcher.wake_rx.as_raw_fd())?;
             self.process_event(state, event)?;
+            self.apply_pending_rotation(state)?;
             self.present_pending_full_repaint(state)?;
             state.resource_monitor.sample_if_due(Instant::now());
         }

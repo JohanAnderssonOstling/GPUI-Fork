@@ -2594,6 +2594,7 @@ dependencies = [
  "log",
  "parking_lot",
  "raw-window-handle",
+ "tempfile",
  "uuid",
  "wgpu",
 ]

@@ -958,21 +958,24 @@ impl KoboRenderer {
         let mut target = recycled
             .map(|entry| entry.image)
             .unwrap_or_else(|| GrayImage::new(width, height));
-        if let Some(previous) = previous.filter(|image| image.dimensions() == (width, height)) {
-            let synchronized = recycled_generation.is_some_and(|generation| {
-                synchronize_recycled_frame(
-                    &mut target,
-                    generation,
-                    self.frame_generation,
-                    previous,
-                    &self.damage_history,
-                )
-            });
-            if !synchronized {
-                target.as_mut().copy_from_slice(previous.as_raw());
+        // Full repaint regions are cleared below, so their old pixels are never read.
+        if regions.as_slice() != [full] {
+            if let Some(previous) = previous.filter(|image| image.dimensions() == (width, height)) {
+                let synchronized = recycled_generation.is_some_and(|generation| {
+                    synchronize_recycled_frame(
+                        &mut target,
+                        generation,
+                        self.frame_generation,
+                        previous,
+                        &self.damage_history,
+                    )
+                });
+                if !synchronized {
+                    target.as_mut().copy_from_slice(previous.as_raw());
+                }
+            } else {
+                target.as_mut().fill(255);
             }
-        } else {
-            target.as_mut().fill(255);
         }
         let buffer_us = buffer_started.map_or(0, |started| started.elapsed().as_micros());
         let raster_started = profile_enabled.then(Instant::now);
@@ -1418,22 +1421,27 @@ pub fn changed_pixel_bounds_in(
     for y in candidate.y..candidate.y + candidate.height {
         let start = y as usize * stride + candidate.x as usize;
         let end = start + candidate.width as usize;
-        for (offset, (&old, &new)) in before.as_raw()[start..end]
+        let before_row = &before.as_raw()[start..end];
+        let after_row = &after.as_raw()[start..end];
+        let Some(first) = before_row
             .iter()
-            .zip(&after.as_raw()[start..end])
-            .enumerate()
-        {
-            if old == new {
-                continue;
-            }
-            let pixel = PixelRect {
-                x: candidate.x + offset as u32,
-                y,
-                width: 1,
-                height: 1,
-            };
-            damage = Some(damage.map_or(pixel, |damage| union_pixel_rect(damage, pixel)));
-        }
+            .zip(after_row)
+            .position(|(old, new)| old != new)
+        else {
+            continue;
+        };
+        let last = before_row
+            .iter()
+            .zip(after_row)
+            .rposition(|(old, new)| old != new)
+            .unwrap_or(first);
+        let row_damage = PixelRect {
+            x: candidate.x + first as u32,
+            y,
+            width: (last - first + 1) as u32,
+            height: 1,
+        };
+        damage = Some(damage.map_or(row_damage, |damage| union_pixel_rect(damage, row_damage)));
     }
     damage
 }
@@ -1827,6 +1835,9 @@ fn fill_clipped_gray(
     gray: u8,
     alpha: f32,
 ) {
+    if alpha <= 0.0 {
+        return;
+    }
     if alpha >= 1.0 {
         let stride = target.width() as usize;
         let width = (x1 - x0) as usize;
@@ -1911,9 +1922,15 @@ fn draw_mask(
             let width = (x1 - x0) as usize;
             let source_row = &mask_pixels[source_start..source_start + width];
             let target_row = &mut target.as_mut()[target_start..target_start + width];
-            for (pixel, &coverage) in target_row.iter_mut().zip(source_row) {
-                let alpha = ((u16::from(coverage) * color_alpha + 127) / 255) as u8;
-                blend_gray_channel(pixel, gray, alpha);
+            if color_alpha == 255 {
+                for (pixel, &coverage) in target_row.iter_mut().zip(source_row) {
+                    blend_gray_channel(pixel, gray, coverage);
+                }
+            } else {
+                for (pixel, &coverage) in target_row.iter_mut().zip(source_row) {
+                    let alpha = ((u16::from(coverage) * color_alpha + 127) / 255) as u8;
+                    blend_gray_channel(pixel, gray, alpha);
+                }
             }
         }
         return Ok(());

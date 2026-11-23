@@ -17,6 +17,8 @@ use std::{
 };
 
 mod actions;
+mod stage;
+pub use stage::Stage;
 pub mod startup;
 pub mod input_frame;
 #[cfg(feature = "profiler")]

@@ -1,9 +1,13 @@
+#include <errno.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "fbink.h"
+
+enum { GPUI_FBINK_NEEDS_PACKED_ROWS = 1 };
 
 typedef struct {
     uint32_t view_width;
@@ -80,11 +84,85 @@ int gpui_fbink_reinit(int fd, GpuiFbInkState *state) {
     return result;
 }
 
+static bool write_gray32(
+    int fd,
+    const unsigned char *data,
+    int width,
+    int height,
+    size_t source_stride,
+    int target_x,
+    int target_y,
+    const FBInkConfig *config,
+    FBInkRect *region
+) {
+    if (data == NULL || width <= 0 || height <= 0 || width > SHRT_MAX || height > SHRT_MAX ||
+        target_x < 0 || target_y < 0 || target_x > SHRT_MAX || target_y > SHRT_MAX) {
+        return false;
+    }
+
+    FBInkState state;
+    fbink_get_state(config, &state);
+    if (state.bpp != 32 || state.is_sunxi || state.is_ntx_quirky_landscape ||
+        (state.pixel_format != FBINK_PXFMT_BGRA && state.pixel_format != FBINK_PXFMT_RGBA &&
+         state.pixel_format != FBINK_PXFMT_BGR32 && state.pixel_format != FBINK_PXFMT_RGB32)) {
+        return false;
+    }
+
+    struct fb_var_screeninfo variable_info;
+    struct fb_fix_screeninfo fixed_info;
+    fbink_get_fb_info(&variable_info, &fixed_info);
+    if (variable_info.xoffset != 0 || variable_info.yoffset != 0 ||
+        fixed_info.type != FB_TYPE_PACKED_PIXELS) {
+        return false;
+    }
+
+    const int left = target_x + state.view_hori_origin;
+    // Match FBInk's image placement: row zero ignores the text baseline offset.
+    const int top = target_y + state.view_vert_origin - state.view_vert_offset;
+    if (left > SHRT_MAX || top < 0 || top > SHRT_MAX ||
+        (uint32_t) left + (uint32_t) width > state.screen_width ||
+        (uint32_t) top + (uint32_t) height > state.screen_height ||
+        state.scanline_stride % sizeof(uint32_t) != 0 ||
+        ((uint64_t) left + (uint32_t) width) * sizeof(uint32_t) > state.scanline_stride) {
+        return false;
+    }
+
+    // A complete overwrite makes the preliminary clear redundant.
+    if (config->is_cleared && (left != 0 || top != 0 ||
+        (uint32_t) width != state.screen_width || (uint32_t) height != state.screen_height)) {
+        return false;
+    }
+
+    size_t buffer_size;
+    unsigned char *framebuffer = fbink_get_fb_pointer(fd, &buffer_size);
+    const uint64_t end_offset = ((uint64_t) top + (uint32_t) height - 1) * state.scanline_stride +
+        ((uint64_t) left + (uint32_t) width) * sizeof(uint32_t);
+    if (framebuffer == NULL || (uintptr_t) framebuffer % sizeof(uint32_t) != 0 || end_offset > buffer_size) {
+        return false;
+    }
+
+    for (int row = 0; row < height; row++) {
+        const unsigned char *source = data + (size_t) row * source_stride;
+        uint32_t *destination = (uint32_t *) (framebuffer + (size_t) (top + row) * state.scanline_stride) + left;
+        for (int column = 0; column < width; column++) {
+            // Grayscale has identical RGB/BGR channels; the fourth byte is opaque.
+            destination[column] = 0xFF000000U | (uint32_t) source[column] * 0x010101U;
+        }
+    }
+
+    region->left = (unsigned short int) left;
+    region->top = (unsigned short int) top;
+    region->width = (unsigned short int) width;
+    region->height = (unsigned short int) height;
+    return true;
+}
+
 int gpui_fbink_present_gray(
     int fd,
-    unsigned char *data,
+    const unsigned char *data,
     int source_width,
     int source_height,
+    size_t source_stride,
     size_t length,
     int target_x,
     int target_y,
@@ -92,10 +170,19 @@ int gpui_fbink_present_gray(
     int target_height,
     int refresh_mode
 ) {
+    if (data == NULL || source_width <= 0 || source_height <= 0 ||
+        source_stride < (size_t) source_width ||
+        (size_t) (source_height - 1) > (SIZE_MAX - (size_t) source_width) / source_stride ||
+        length < (size_t) (source_height - 1) * source_stride + (size_t) source_width) {
+        return -EINVAL;
+    }
     FBInkConfig config;
     quiet_config(&config);
-    config.scaled_width = (short int) target_width;
-    config.scaled_height = (short int) target_height;
+    // FBInk treats nonzero dimensions as a rescale request, even at 1:1.
+    if (source_width != target_width || source_height != target_height) {
+        config.scaled_width = (short int) target_width;
+        config.scaled_height = (short int) target_height;
+    }
     bool is_monochrome = refresh_mode == 0 || refresh_mode == 3 || refresh_mode == 4 || refresh_mode == 5;
     bool is_full = refresh_mode == 2 || refresh_mode == 4;
     if (refresh_mode == 0) {
@@ -108,23 +195,34 @@ int gpui_fbink_present_gray(
     config.dithering_mode = is_monochrome ? HWD_QUANT_ONLY : HWD_PASSTHROUGH;
     config.is_flashing = is_full || refresh_mode == 5 || refresh_mode == 6;
     config.is_cleared = is_full;
-    int result = fbink_print_raw_data(
-        fd,
-        data,
-        source_width,
-        source_height,
-        length,
-        (short int) target_x,
-        (short int) target_y,
-        &config
-    );
+    int result;
+    FBInkRect region;
+    if (source_width == target_width && source_height == target_height &&
+        write_gray32(fd, data, source_width, source_height, source_stride, target_x, target_y, &config, &region)) {
+        result = fbink_refresh_rect(fd, &region, &config);
+    } else {
+        // FBInk's fallback accepts packed rows only. Ask Rust to pack its reused buffer.
+        if (source_height > 1 && source_stride != (size_t) source_width) {
+            return GPUI_FBINK_NEEDS_PACKED_ROWS;
+        }
+        result = fbink_print_raw_data(
+            fd,
+            data,
+            source_width,
+            source_height,
+            (size_t) source_width * (size_t) source_height,
+            (short int) target_x,
+            (short int) target_y,
+            &config
+        );
+    }
     if (result >= 0 && config.is_flashing) {
         int wait_result = fbink_wait_for_complete(fd, LAST_MARKER);
         if (wait_result < 0) {
             return wait_result;
         }
     }
-    return result;
+    return result < 0 ? result : 0;
 }
 
 int gpui_fbink_close(int fd) {

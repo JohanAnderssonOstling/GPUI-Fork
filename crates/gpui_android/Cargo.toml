@@ -28,6 +28,8 @@ uuid.workspace = true
 wgpu.workspace = true
 
 [dev-dependencies]
+log.workspace = true
+tempfile.workspace = true
 anyhow.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 uuid.workspace = true

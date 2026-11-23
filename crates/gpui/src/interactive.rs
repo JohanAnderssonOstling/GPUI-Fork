@@ -1,8 +1,12 @@
+#[cfg(target_arch = "wasm32")]
+use crate::SelectedFile;
 use crate::{
     Bounds, Capslock, Context, Empty, IntoElement, Keystroke, Modifiers, Pixels, Point, Render, Size,
     Window, point, seal::Sealed,
 };
 use smallvec::SmallVec;
+#[cfg(target_arch = "wasm32")]
+use std::sync::{Arc, Mutex};
 use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf};
 
 /// An event from a platform input source.
@@ -741,6 +745,40 @@ impl ExternalPaths {
     }
 }
 
+/// Files provided by a browser drop, consumed once by the receiving view.
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Default)]
+pub struct ExternalFiles(Arc<Mutex<Vec<SelectedFile>>>);
+
+#[cfg(target_arch = "wasm32")]
+impl ExternalFiles {
+    /// Retains file capabilities without reading their contents.
+    pub fn new(files: Vec<SelectedFile>) -> Self {
+        Self(Arc::new(Mutex::new(files)))
+    }
+
+    /// Transfers the files to the accepted drop handler.
+    pub fn take(&self) -> Vec<SelectedFile> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(|error| error.into_inner()))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Debug for ExternalFiles {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExternalFiles")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Render for ExternalFiles {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
 /// Data offered to the platform when an internal drag leaves the window and is
 /// promoted to a native drag session.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -808,6 +846,14 @@ impl Render for ExternalPaths {
 /// A file drop event from the platform, generated when files are dragged and dropped onto the window.
 #[derive(Debug, Clone)]
 pub enum FileDropEvent {
+    /// Browser file capabilities entered or became available at drop time.
+    #[cfg(target_arch = "wasm32")]
+    FilesEntered {
+        /// Pointer position relative to the window.
+        position: Point<Pixels>,
+        /// Files available to the receiving view.
+        files: ExternalFiles,
+    },
     /// The files have entered the window.
     Entered {
         /// The position of the mouse relative to the window.

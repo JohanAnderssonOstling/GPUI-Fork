@@ -220,6 +220,8 @@ pub struct GestureTracker {
     long_press_after: Duration,
 }
 
+pub(crate) const LONG_PRESS_DELAY: Duration = Duration::from_millis(650);
+
 impl Default for GestureTracker {
     fn default() -> Self {
         Self::new(24.0)
@@ -233,7 +235,7 @@ impl GestureTracker {
             last: None,
             threshold,
             started_at: None,
-            long_press_after: Duration::from_millis(650),
+            long_press_after: LONG_PRESS_DELAY,
         }
     }
 
