@@ -4601,7 +4601,7 @@ impl ScrollHandle {
     /// momentum. Custom scroll masks can use this before consuming the event.
     /// Returns `None` for mouse wheels and trackpads, and otherwise whether
     /// this handle owns the touch gesture.
-    pub fn scroll_by_touch(&self, axis: Axis, window: &mut Window, cx: &mut App) -> Option<bool> {
+    pub fn scroll_by_touch(&self, axis: Axis, view: EntityId, window: &mut Window, cx: &mut App) -> Option<bool> {
         let event = window.touch_scroll_event()?.clone();
         let state = self.0.borrow();
         let target_id = Rc::as_ptr(&state.offset) as usize;
@@ -4639,7 +4639,7 @@ impl ScrollHandle {
             window.claim_touch_scroll(target_id);
         }
         if owned || *offset != previous {
-            cx.notify(window.current_view());
+            cx.notify(view);
         }
         Some(owned)
     }
