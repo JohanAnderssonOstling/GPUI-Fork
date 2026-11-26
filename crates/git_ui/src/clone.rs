@@ -15,6 +15,7 @@ pub fn clone_and_open(
     >,
 ) {
     let destination_prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
+        directory: None,
         files: false,
         directories: true,
         multiple: false,

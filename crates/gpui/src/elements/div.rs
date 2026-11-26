@@ -3007,6 +3007,25 @@ impl Interactivity {
             }
         }
 
+        if let Some(hover_state) = element_state
+            .as_ref()
+            .and_then(|state| state.hover_state.as_ref())
+            .cloned()
+        {
+            let current_view = window.current_view();
+            // A window exit need not include a final move, which normally clears these caches.
+            window.on_mouse_event(move |_: &MouseExitEvent, phase, _, cx| {
+                if phase == DispatchPhase::Capture {
+                    let mut state = hover_state.borrow_mut();
+                    if state.element || state.group {
+                        state.element = false;
+                        state.group = false;
+                        cx.notify(current_view);
+                    }
+                }
+            });
+        }
+
         let drag_cursor_style = self.base_style.as_ref().mouse_cursor;
 
         let mut drag_listener = mem::take(&mut self.drag_listener);

@@ -295,6 +295,7 @@ pub fn init(cx: &mut App) {
 
             let paths = workspace.prompt_for_open_path(
                 PathPromptOptions {
+                    directory: None,
                     files: true,
                     directories: true,
                     multiple: false,
@@ -2080,6 +2081,7 @@ fn open_local_project(
     let paths = workspace.update(cx, |workspace, cx| {
         workspace.prompt_for_open_path(
             PathPromptOptions {
+                directory: None,
                 files: true,
                 directories: true,
                 multiple: true,

@@ -1625,6 +1625,7 @@ impl MessageEditor {
         let workspace = self.workspace.clone();
 
         let paths_receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            directory: None,
             files: true,
             directories: false,
             multiple: true,

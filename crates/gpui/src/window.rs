@@ -896,6 +896,9 @@ impl HitboxId {
     }
 
     fn hit_test(self, window: &Window) -> bool {
+        if !window.hovered.get() {
+            return false;
+        }
         let hit_test = &window.mouse_hit_test;
         for id in hit_test.ids.iter().take(hit_test.hover_hitbox_count) {
             if self == *id {
@@ -6000,16 +6003,25 @@ impl Window {
             // Track the mouse position with our own state, since accessing the platform
             // API for the mouse position can only occur on the main thread.
             PlatformInput::MouseMove(mouse_move) => {
+                self.hovered.set(
+                    Bounds::new(Point::default(), self.viewport_size).contains(&mouse_move.position),
+                );
                 self.mouse_position = mouse_move.position;
                 self.modifiers = mouse_move.modifiers;
                 PlatformInput::MouseMove(mouse_move)
             }
             PlatformInput::MouseDown(mouse_down) => {
+                self.hovered.set(
+                    Bounds::new(Point::default(), self.viewport_size).contains(&mouse_down.position),
+                );
                 self.mouse_position = mouse_down.position;
                 self.modifiers = mouse_down.modifiers;
                 PlatformInput::MouseDown(mouse_down)
             }
             PlatformInput::MouseUp(mouse_up) => {
+                self.hovered.set(
+                    Bounds::new(Point::default(), self.viewport_size).contains(&mouse_up.position),
+                );
                 self.mouse_position = mouse_up.position;
                 self.modifiers = mouse_up.modifiers;
                 PlatformInput::MouseUp(mouse_up)
@@ -6018,7 +6030,10 @@ impl Window {
                 PlatformInput::MousePressure(mouse_pressure)
             }
             PlatformInput::MouseExited(mouse_exited) => {
+                self.hovered.set(false);
+                self.mouse_position = mouse_exited.position;
                 self.modifiers = mouse_exited.modifiers;
+                self.refresh();
                 PlatformInput::MouseExited(mouse_exited)
             }
             PlatformInput::ModifiersChanged(modifiers_changed) => {

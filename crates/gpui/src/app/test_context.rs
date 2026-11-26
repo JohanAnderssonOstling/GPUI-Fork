@@ -1303,6 +1303,7 @@ mod tests {
 
         let receiver = cx.update(|cx| {
             cx.prompt_for_paths(PathPromptOptions {
+                directory: None,
                 files: false,
                 directories: true,
                 multiple: true,
@@ -1329,6 +1330,7 @@ mod tests {
     async fn test_simulate_path_prompt_cancellation(cx: &mut TestAppContext) {
         let receiver = cx.update(|cx| {
             cx.prompt_for_paths(PathPromptOptions {
+                directory: None,
                 files: true,
                 directories: false,
                 multiple: false,

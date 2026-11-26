@@ -795,6 +795,7 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
             prompt_and_open_paths(
                 app_state,
                 PathPromptOptions {
+                    directory: None,
                     files: true,
                     directories: true,
                     multiple: true,
@@ -815,6 +816,7 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
             prompt_and_open_paths(
                 app_state,
                 PathPromptOptions {
+                    directory: None,
                     files: true,
                     directories,
                     multiple: true,
@@ -3983,6 +3985,7 @@ impl Workspace {
         }
         let paths = self.prompt_for_open_path(
             PathPromptOptions {
+                directory: None,
                 files: false,
                 directories: true,
                 multiple: true,

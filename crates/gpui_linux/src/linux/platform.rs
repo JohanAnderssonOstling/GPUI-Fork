@@ -423,13 +423,26 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
                     "Open File"
                 };
 
-                let mut request_builder = ashpd::desktop::file_chooser::OpenFileRequest::default()
+                let request_builder = ashpd::desktop::file_chooser::OpenFileRequest::default()
                     .identifier(identifier.await)
                     .modal(true)
                     .title(title)
                     .accept_label(options.prompt.as_ref().map(gpui::SharedString::as_str))
                     .multiple(options.multiple)
-                    .directory(options.directories);
+                    .directory(options.directories)
+                    .current_folder::<PathBuf>(options.directory);
+
+                let mut request_builder = match request_builder {
+                    Ok(request_builder) => request_builder,
+                    Err(error) => {
+                        if done_tx.send(Err(error.into())).is_err() {
+                            log::debug!(
+                                "File picker closed before its initial folder was validated"
+                            );
+                        }
+                        return;
+                    }
+                };
 
                 for filter in &filters {
                     let mut portal_filter =

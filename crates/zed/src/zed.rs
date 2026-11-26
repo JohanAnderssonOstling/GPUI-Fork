@@ -1084,6 +1084,7 @@ fn register_actions(
                 workspace,
                 workspace.app_state().clone(),
                 PathPromptOptions {
+                    directory: None,
                     files: true,
                     directories: true,
                     multiple: true,
@@ -1105,6 +1106,7 @@ fn register_actions(
                 workspace,
                 workspace.app_state().clone(),
                 PathPromptOptions {
+                    directory: None,
                     files: true,
                     directories,
                     multiple: true,
@@ -1133,6 +1135,7 @@ fn register_actions(
             telemetry::event!("Project Opened");
             let paths = workspace.prompt_for_open_path(
                 PathPromptOptions {
+                    directory: None,
                     files: true,
                     directories: true,
                     multiple: true,

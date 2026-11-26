@@ -2304,6 +2304,9 @@ pub enum TextRenderingMode {
 /// The options that can be configured for a file dialog prompt
 #[derive(Clone, Debug)]
 pub struct PathPromptOptions {
+    /// Initial folder for native pickers. Platforms without filesystem browsing
+    /// may ignore it.
+    pub directory: Option<PathBuf>,
     /// Should the prompt allow files to be selected?
     pub files: bool,
     /// Should the prompt allow directories to be selected?

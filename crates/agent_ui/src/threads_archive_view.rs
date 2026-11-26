@@ -1256,6 +1256,7 @@ impl ProjectPickerDelegate {
 
     fn open_local_folder(&mut self, window: &mut Window, cx: &mut Context<Picker<Self>>) {
         let paths_receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            directory: None,
             files: false,
             directories: true,
             multiple: false,

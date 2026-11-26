@@ -3647,6 +3647,7 @@ impl ProjectPanel {
         let workspace = self.workspace.clone();
 
         let destination_dir = cx.prompt_for_paths(PathPromptOptions {
+            directory: None,
             files: false,
             directories: true,
             multiple: false,

@@ -1245,6 +1245,14 @@ fn file_open_dialog(
     unsafe {
         folder_dialog.SetOptions(dialog_options)?;
 
+        if let Some(directory) = &options.directory {
+            let directory = directory.canonicalize()?;
+            let directory = dunce::simplified(&directory);
+            let path_item: IShellItem =
+                SHCreateItemFromParsingName(&HSTRING::from(directory.as_os_str()), None)?;
+            folder_dialog.SetFolder(&path_item)?;
+        }
+
         if !filter_specs.is_empty() {
             folder_dialog.SetFileTypes(&filter_specs)?;
         }

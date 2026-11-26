@@ -171,6 +171,7 @@ pub fn init(cx: &mut App) {
                 let store = ExtensionStore::global(cx);
                 let prompt = workspace.prompt_for_open_path(
                     gpui::PathPromptOptions {
+                        directory: None,
                         files: false,
                         directories: true,
                         multiple: false,
