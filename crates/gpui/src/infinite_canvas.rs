@@ -427,6 +427,7 @@ impl RenderOnce for InfiniteCanvasView {
                         canvas.zoom_at(event.position, zoom);
                         cx.notify();
                     });
+                    cx.stop_propagation();
                 }
             })
             .child(
